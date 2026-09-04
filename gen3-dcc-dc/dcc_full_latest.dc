@@ -1580,25 +1580,16 @@ let rec cm_asm st cid_tbl ar_tbl sc ns pat reg flbl = case pat of
       let td = ts_load_const tc 10 ((256 * (1 + len ps)) + tag_tuple) in
       let te = ts_cmp_reg td 9 10 in
       let tf = ts_bcond te c_ne flbl in
-      let rec fld t j cur_sc cur_ns rest_ps = case rest_ps of
-          [] -> (t, cur_sc, cur_ns)
-        | p2 :: rest2 ->
-            let tg = ts_ldr_slot t 9 sv in
-            let th = ts_ldr_off tg 9 9 (8 * (j + 1)) in
-            let (t2, sc3, ns3) =
-              cm_asm th cid_tbl ar_tbl cur_sc cur_ns p2 9 flbl in
-            fld t2 (j + 1) sc3 ns3 rest2
-      in
-      fld tf 0 sc (ns + 1) ps
+      fld_ptup tf 0 sc (ns + 1) ps sv cid_tbl ar_tbl flbl
 
   | PCtor nm ps ->
       let ar = assoc_ikey nm ar_tbl in
       if ar == 0 then
         let cid = assoc_ikey nm cid_tbl in
         let sym_lbl = "_ctorinst_" ++ nm in
-        let s2 = a_inst st ("adrp x9, " ++ sym_lbl ++ "@GOTPAGE") in
-        let s3 = a_inst s2 ("ldr x9, [x9, " ++ sym_lbl ++ "@GOTPAGEOFF]") in
-        let s4 = ts_cmp_reg s3 reg 9 in
+        let s2 = a_inst st ("adrp x10, " ++ sym_lbl ++ "@GOTPAGE") in
+        let s3 = a_inst s2 ("ldr x10, [x10, " ++ sym_lbl ++ "@GOTPAGEOFF]") in
+        let s4 = ts_cmp_reg s3 reg 10 in
         (ts_bcond s4 c_ne flbl, sc, ns)
       else
         let cid = assoc_ikey nm cid_tbl in
@@ -1616,16 +1607,25 @@ let rec cm_asm st cid_tbl ar_tbl sc ns pat reg flbl = case pat of
         let ti = ts_load_const th 10 cid in
         let tj = ts_cmp_reg ti 9 10 in
         let tk = ts_bcond tj c_ne flbl in
-        let rec fld t j cur_sc cur_ns rest_ps = case rest_ps of
-            [] -> (t, cur_sc, cur_ns)
-          | p2 :: rest2 ->
-              let tl = ts_ldr_slot t 9 sv in
-              let tm = ts_ldr_off tl 9 9 (8 * (j + 2)) in
-              let (t2, sc3, ns3) =
-                cm_asm tm cid_tbl ar_tbl cur_sc cur_ns p2 9 flbl in
-              fld t2 (j + 1) sc3 ns3 rest2
-        in
-        fld tk 0 sc (ns + 1) ps
+        fld_pctor tk 0 sc (ns + 1) ps sv cid_tbl ar_tbl flbl
+
+and fld_ptup t j cur_sc cur_ns rest_ps sv cid_tbl ar_tbl flbl = case rest_ps of
+    [] -> (t, cur_sc, cur_ns)
+  | p2 :: rest2 ->
+      let tg = ts_ldr_slot t 9 sv in
+      let th = ts_ldr_off tg 9 9 (8 * (j + 1)) in
+      let (t2, sc3, ns3) =
+        cm_asm th cid_tbl ar_tbl cur_sc cur_ns p2 9 flbl in
+      fld_ptup t2 (j + 1) sc3 ns3 rest2 sv cid_tbl ar_tbl flbl
+
+and fld_pctor t j cur_sc cur_ns rest_ps sv cid_tbl ar_tbl flbl = case rest_ps of
+    [] -> (t, cur_sc, cur_ns)
+  | p2 :: rest2 ->
+      let tl = ts_ldr_slot t 9 sv in
+      let tm = ts_ldr_off tl 9 9 (8 * (j + 2)) in
+      let (t2, sc3, ns3) =
+        cm_asm tm cid_tbl ar_tbl cur_sc cur_ns p2 9 flbl in
+      fld_pctor t2 (j + 1) sc3 ns3 rest2 sv cid_tbl ar_tbl flbl
 
 and cmf_asm st cid_tbl ar_tbl sc ns ps reg flbl base = case ps of
     [] -> (st, sc, ns)
@@ -1680,12 +1680,7 @@ let rec fv_expr e bound = case e of
   | EIf c t el ->
       union_str (union_str (fv_expr c bound) (fv_expr t bound)) (fv_expr el bound)
   | ECase scr brs ->
-      let rec go_br bs ac = case bs of
-          [] -> ac
-        | br :: rest -> case br of
-            | (p, b) ->
-                go_br rest (union_str ac (diff_str (fv_expr b bound) (pat_bound p [])))
-      in go_br brs (fv_expr scr bound)
+      go_br_fv brs (fv_expr scr bound) bound
   | ELet isrec nm rhs body ->
       union_str (fv_expr rhs bound) (diff_str (fv_expr body (nm :: bound)) [])
   | ELam p b -> diff_str (fv_expr b (union_str (pat_bound p []) bound)) []
@@ -1694,6 +1689,29 @@ let rec fv_expr e bound = case e of
 and fv_list es bound = case es of
     [] -> []
   | e :: rest -> union_str (fv_expr e bound) (fv_list rest bound)
+
+and go_br_fv bs ac bound = case bs of
+    [] -> ac
+  | br :: rest -> case br of
+      | (p, b) ->
+          go_br_fv rest (union_str ac (diff_str (fv_expr b bound) (pat_bound p []))) bound
+
+-- ---------- closure helpers (top-level: explicit params, no captures) ----------
+let rec pick_sc acc fs sc = case fs of
+    [] -> rev_list acc []
+  | fv :: rest ->
+      let sl = assoc_ikey fv sc in
+      pick_sc (if sl == (0 - 1) then acc else (fv, sl) :: acc) rest sc
+
+let rec ld_env_ns tt j cs ns2 = case cs of
+    [] -> tt
+  | kv :: rest ->
+      let ta = ts_ldr_off tt 9 0 (24 + (8 * j)) in
+      ld_env_ns (ts_str_slot ta 9 (ns2 + j)) (j + 1) rest ns2
+
+let rec find_idx_z n xs i = case xs of
+    [] -> 0 - 1
+  | h :: rest -> if h == n then i else find_idx_z n rest (i + 1)
 
 -- ---------- expression compiler ----------
 -- State threading convention: AS holds REVERSED lines; every nested compile
@@ -1760,19 +1778,23 @@ let rec ce st cid_tbl ar_tbl sc ns e = case e of
       let sa = ts_str_slot s0 0 ns in
       go_cases sa cid_tbl ar_tbl sc (ns + 1) ns branches 0 end_lbl
   | ELet true name rhs body ->
-      -- local let rec: bind the name to a FRESH GLOBAL SLOT so recursive
-      -- self-references resolve via dc_gget at run time (after the closure
-      -- has been stored). Frame-slot binding would break captures.
-      -- live in a high slot region far away from real def slots.
-      -- draw ids from the label counter so a_nglob (def slots) stays put
-      let (st0b, uid) = a_fresh_id st in
-      let gslot = 30000 + uid in
-      let stB = a_set_globs st0b ((name, gslot) :: a_globs st0b) in
-      let (s1, sc1, ns1) = ce stB cid_tbl ar_tbl sc ns rhs in
-      let s2 = ts_mov_rr s1 1 0 in
-      let s3 = ts_load_const s2 0 gslot in
-      let s4 = a_call_rt s3 "dc_gset" in
-      ce s4 cid_tbl ar_tbl sc1 ns1 body
+      -- lexical let rec via frame slot + self backpatch (no globals, so
+      -- nested same-name recs resolve lexically and cannot clobber each other).
+      -- (1) reserve frame slot + scope; (2) compile rhs (its captures see it);
+      -- (3) store value; (4) patch self into env hole (ELam rhs only).
+      let slot = ns in
+      let s_sc = ((name, slot) :: sc) in
+      let (s1, _, _) = ce st cid_tbl ar_tbl s_sc ns rhs in
+      let s2 = ts_str_slot s1 0 slot in
+      let selfnames = case rhs of
+          | ELam p b -> map_fst (pick_sc [] (fv_expr b (pat_bound p [])) s_sc)
+          | _ -> [] in
+      let sidx = find_idx_z name selfnames 0 in
+      let s3 = if sidx == (0 - 1) then s2
+        else
+          let pa = ts_ldr_slot s2 9 slot in
+          ts_str_off pa 9 0 (24 + (8 * sidx)) in
+      ce s3 cid_tbl ar_tbl s_sc (ns + 1) body
   | ELet false name rhs body ->
         let (s1, _, _) = ce st cid_tbl ar_tbl sc ns rhs in
         let slot = ns in
@@ -1790,13 +1812,7 @@ let rec ce st cid_tbl ar_tbl sc ns e = case e of
           | PVar n -> "VAR:" ++ n
           | _ -> "OTHER" in
       let fvs = fv_expr body (pat_bound pat []) in
-      let rec pick acc fs = case fs of
-          [] -> rev_list acc []
-        | fv :: rest ->
-            let sl = assoc_ikey fv sc in
-            pick (if sl == (0 - 1) then acc else (fv, sl) :: acc) rest
-      in
-      let caps = pick [] fvs in
+      let caps = pick_sc [] fvs sc in
       let nc = len caps in
       -- Out-of-line placement: lines are PREPENDED, so emit in reverse of
       -- program order. Desired layout: [alloc][b skip][fn body][skip:]
@@ -1811,13 +1827,7 @@ let rec ce st cid_tbl ar_tbl sc ns e = case e of
       let flbl = "Lpfail" ++ int_to_string eno in
       let (t5, sc2, ns2) = cm_asm t4 cid_tbl ar_tbl [] 0 pat 1 flbl in
       -- load captured env words into frame slots ns2..ns2+nc-1
-      let rec ld_env tt j cs = case cs of
-          [] -> tt
-        | kv :: rest ->
-            let ta = ts_ldr_off tt 9 0 (24 + (8 * j)) in
-            ld_env (ts_str_slot ta 9 (ns2 + j)) (j + 1) rest
-      in
-      let t6 = ld_env t5 0 caps in
+      let t6 = ld_env_ns t5 0 caps ns2 in
       let sc4 = app_list sc2 (zip_ids2_z (map_fst caps) ns2) in
       let (t7, _, _) = ce t6 cid_tbl ar_tbl sc4 (ns2 + nc) body in
       let t8 = a_inst t7 ("add sp, sp, #" ++ int_to_string frame_bytes) in
@@ -1834,14 +1844,7 @@ let rec ce st cid_tbl ar_tbl sc ns e = case e of
       -- side effects fire in order and callers that ignore the value are
       -- unaffected)
       let cnt = len es in
-      let rec go t2 idx slts es2 = case es2 of
-          [] -> (t2, rev_list slts [])
-        | e :: rest ->
-            let (t3, _, _) = ce t2 cid_tbl ar_tbl sc (ns + idx) e in
-            let t4 = ts_str_slot t3 0 (ns + idx) in
-            go t4 (idx + 1) ((ns + idx) :: slts) rest
-      in
-      let (sa, slots_rev) = go st 0 [] es in
+      let (sa, slots_rev) = go_tup st 0 [] es ns cid_tbl ar_tbl sc in
       let slots = slots_rev in
       let s1 = ts_load_const sa 0 ((1 + cnt) * 8) in
       let s2 = a_call_rt s1 "dacelo_alloc" in
@@ -2000,6 +2003,13 @@ else
     let s2 = ts_str_slot s1 0 sa in
     let (s3, _, _) = ce s2 cid_tbl ar_tbl sc (ns + 1) r in
     (ts_load_const s3 0 1, sc, ns)
+
+and go_tup t2 idx slts es2 ns cid_tbl ar_tbl sc = case es2 of
+    [] -> (t2, rev_list slts [])
+  | e :: rest ->
+      let (t3, _, _) = ce t2 cid_tbl ar_tbl sc (ns + idx) e in
+      let t4 = ts_str_slot t3 0 (ns + idx) in
+      go_tup t4 (idx + 1) ((ns + idx) :: slts) rest ns cid_tbl ar_tbl sc
 -- ---------- program driver ----------
 let d_name3 d = case d of | Def3 _ n _ -> n
 let d_rhs3 d = case d of | Def3 _ _ b -> b
@@ -2033,6 +2043,17 @@ let rec pv_names_upto ps n = case ps of
       let nm = pat_var_opt p in
       (if nm == "" then pv_names_upto rest (n - 1) else nm :: pv_names_upto rest (n - 1))
 
+-- look up each name's slot in order (param order must match ld_prev
+-- env layout at the next level; scope-list order is NOT binding order)
+let rec slots_of_names sc nms = case nms of
+    [] -> []
+  | nm :: rest -> assoc_ikey nm sc :: slots_of_names sc rest
+
+let rec ld_prev_np tt j np = if j == np then tt
+  else
+    let ta = ts_ldr_off tt 9 0 (24 + (8 * j)) in
+    ld_prev_np (ts_str_slot ta 9 j) (j + 1) np
+
 let rec emit_fn_level t cid_tbl ar_tbl name idx k pats body =
   let flbl = "_fn_" ++ name ++ "_" ++ int_to_string idx in
   let t0 = a_line t ".p2align 2" in
@@ -2044,12 +2065,7 @@ let rec emit_fn_level t cid_tbl ar_tbl name idx k pats body =
   -- copy env words [x0+24..] into frame slots and expose them in scope.
   let prev_names = pv_names_upto pats (idx - 1) in
   let np = len prev_names in
-  let rec ld_prev tt j = if j == np then tt
-    else
-      let ta = ts_ldr_off tt 9 0 (24 + (8 * j)) in
-      ld_prev (ts_str_slot ta 9 j) (j + 1)
-  in
-  let t4b = ld_prev t4 0 in
+  let t4b = ld_prev_np t4 0 np in
   let (t4c, fid) = a_fresh_id t4b in
   let fail_lbl = "Lpfail" ++ int_to_string fid in
   let pat = nth_pat pats (idx - 1) in
@@ -2061,8 +2077,8 @@ let rec emit_fn_level t cid_tbl ar_tbl name idx k pats body =
     let (tb, _, _) = ce t5 cid_tbl ar_tbl sc2 ns2 body in tb
   else
     let next_lbl = "_fn_" ++ name ++ "_" ++ int_to_string (idx + 1) in
-    let caps = rev_list sc2 [] in
-    let slots = map_snd caps in
+    let next_names = pv_names_upto pats idx in
+    let slots = slots_of_names sc2 next_names in
     let tb = mk_closure_seq t5 next_lbl slots in tb
   in
   let t7 = a_inst t6 ("add sp, sp, #" ++ int_to_string frame_bytes) in

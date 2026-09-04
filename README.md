@@ -18,7 +18,7 @@ Dacelo(ワライカワセミ属)— ML 系静的型付け関数型言語。自�
 | Gen 0 | `gen0-interp-rs` — Rust 製ツリーウォーク インタプリタ | Rust | **完了** ✅ |
 | Gen 1 | `gen1-interp-dc` — dacelo 製インタプリタ(dacelo 上で動作)| dacelo | **完了** ✅ |
 | Gen 2 | `gen2-dcc-rs` — Rust 製コンパイラ(ARM64 直接コード生成)| Rust | **完了** ✅ |
-| Gen 3 | `gen3-dcc-dc` — dacelo 製コンパイラ(自己コンパイル)| dacelo | **着手中** 🚧 |
+| Gen 3 | `gen3-dcc-dc` — dacelo 製コンパイラ(自己コンパイル)| dacelo | **完了** ✅ |
 
 ## Gen 0 の現状
 
@@ -71,7 +71,7 @@ dacelo gen1-interp-dc/interp.dc gen1-interp-dc/interp.dc examples/hello.dc   # �
   ターゲットを argv 1 として見せ、子には 1 ずらした argv を見せる)
 - 検証: `zsh gen1-interp-dc/test.sh`
 
-### ゴール(Gen 3 完了条件)
+### ゴール(Gen 3 完了条件) — 達成 ✅
 
 ```
 dcc-rs -o dcc_1 dcc.dc     # Rust 製コンパイラで dacelo 製コンパイラをビルド
@@ -79,16 +79,17 @@ dcc-rs -o dcc_1 dcc.dc     # Rust 製コンパイラで dacelo 製コンパイ�
 # dcc_1 と dcc_2 が同一挙動 → セルフホスト達成
 ```
 
+達成内容: `dcc_1` が自分自身をコンパイルした `dcc_2` が完全動作し、
+`dcc_2` が生成した `dcc_3` とバイト一致(`diff dcc_2.s dcc_3.s` 差分 0 行)
+= 不動点に到達。全サンプルがインタプリタと出力一致。検証: `zsh gen3-dcc-dc/test.sh`。
+
 ## ステータス
 
 Gen 0〜2 完了(ネイティブコンパイラ動作、全サンプル出力がインタプリタと一致)。
 
-**Gen 3 着手中**: `gen3-dcc-dc/dcc.dc` — dacelo 自身で書かれたコンパイラ。
-フロントエンド(Gen 1 の lexer/parser を再利用)とコード生成バックエンドの
-基盤(エミッタ状態・データセクション・パターンマッチコンパイル)まで実装済みで
-型検査通過(1066 行)。残作業はファイル末尾の RESUME POINT コメントに詳細を記録:
-式コンパイル本体、thunk/init/user_main、2 パスドライバ、Mach-O ライタ、cc リンク。
-完成後のゴール:
+**Gen 3 完了**: `gen3-dcc-dc/` — dacelo 自身で書かれたコンパイラが
+自分自身をコンパイルして完全動作する `dcc_2` を生成し、`dcc_2` の
+自己コンパイル出力とバイト一致する不動点に到達。完成後のゴール:
 
 ```
 dcc-rs  gen3-dcc-dc/dcc.dc -o dcc_1        # ホストが dacelo 製コンパイラをビルド

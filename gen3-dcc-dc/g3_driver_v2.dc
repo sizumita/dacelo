@@ -31,6 +31,17 @@ let rec pv_names_upto ps n = case ps of
       let nm = pat_var_opt p in
       (if nm == "" then pv_names_upto rest (n - 1) else nm :: pv_names_upto rest (n - 1))
 
+-- look up each name's slot in order (param order must match ld_prev
+-- env layout at the next level; scope-list order is NOT binding order)
+let rec slots_of_names sc nms = case nms of
+    [] -> []
+  | nm :: rest -> assoc_ikey nm sc :: slots_of_names sc rest
+
+let rec ld_prev_np tt j np = if j == np then tt
+  else
+    let ta = ts_ldr_off tt 9 0 (24 + (8 * j)) in
+    ld_prev_np (ts_str_slot ta 9 j) (j + 1) np
+
 let rec emit_fn_level t cid_tbl ar_tbl name idx k pats body =
   let flbl = "_fn_" ++ name ++ "_" ++ int_to_string idx in
   let t0 = a_line t ".p2align 2" in
@@ -42,12 +53,7 @@ let rec emit_fn_level t cid_tbl ar_tbl name idx k pats body =
   -- copy env words [x0+24..] into frame slots and expose them in scope.
   let prev_names = pv_names_upto pats (idx - 1) in
   let np = len prev_names in
-  let rec ld_prev tt j = if j == np then tt
-    else
-      let ta = ts_ldr_off tt 9 0 (24 + (8 * j)) in
-      ld_prev (ts_str_slot ta 9 j) (j + 1)
-  in
-  let t4b = ld_prev t4 0 in
+  let t4b = ld_prev_np t4 0 np in
   let (t4c, fid) = a_fresh_id t4b in
   let fail_lbl = "Lpfail" ++ int_to_string fid in
   let pat = nth_pat pats (idx - 1) in
@@ -59,8 +65,8 @@ let rec emit_fn_level t cid_tbl ar_tbl name idx k pats body =
     let (tb, _, _) = ce t5 cid_tbl ar_tbl sc2 ns2 body in tb
   else
     let next_lbl = "_fn_" ++ name ++ "_" ++ int_to_string (idx + 1) in
-    let caps = rev_list sc2 [] in
-    let slots = map_snd caps in
+    let next_names = pv_names_upto pats idx in
+    let slots = slots_of_names sc2 next_names in
     let tb = mk_closure_seq t5 next_lbl slots in tb
   in
   let t7 = a_inst t6 ("add sp, sp, #" ++ int_to_string frame_bytes) in

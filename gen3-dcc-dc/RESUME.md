@@ -648,3 +648,56 @@ cd gen0-interp-rs && ./target/release/dacelo /tmp/dcc_full.dc --types   # 型検
 ```
 現在の合格状況: interp-path で hello/fib/tree がリファレンス一致。
 list_ops/closures は B-1''、dcc_1 経路は追加で B-2' を抱える。
+
+## 2026-09-05: B-4 解決 + self-hosting fixpoint 達成 (dcc_2/dcc_3 完全動作)
+
+### B-4 (dcc_2 が 10B の .s しか出さない) の原因と修正
+- 直接原因: `g3_pm_v2.dc` cm_asm の nullary-ctor 分岐が `adrp/ldr x9` で
+  scrutinee (x9, ネスト時) を潰し `cmp x9,x9` が恒真 → `only :: []` が
+  全リストにマッチし先頭行だけ返していた。PUnit 同様 x10 使用に修正。
+- 検証: 修正後 dcc_2.s に `cmp x9, x9` が 0 件、`cmp x9, x10` に正規化。
+
+### 第二乖離 (~81 slot-only hunks + dcc_3 SEGV) の原因と修正
+- nested `let rec` (cm_asm の PTup/PCtor 両 `fld`、ETup の `go` 等) が
+  ELet-true の global slot 機構で解決されるため、同名・同ノードの
+  ネスト起動が global cell を上書きし、外側の再帰呼び出しが内側
+  クロージャに誤解決 (`only :: []` 類似の系統的 +1/+2 slot ずれ)。
+  加えて pick/ld_env 等の capture が target-scope 依存で stale になり得る。
+- 修正 (lambda-lifting, いずれもセマンティクス保存の純粋な引数化):
+  - g3_pm_v2.dc: 両 `fld` を top-level `fld_ptup`/`fld_pctor` に昇格
+    (sv, cid_tbl, ar_tbl, flbl を明示param化、9引数カリー化)。
+  - g3_ce_v2.dc: `go_br`→`go_br_fv` (+bound)、`pick`→`pick_sc` (+sc)、
+    `ld_env`→`ld_env_ns` (+ns2)、ETup `go`→`go_tup` (+ns,cid_tbl,ar_tbl,sc)。
+  - g3_driver_v2.dc: `ld_prev`→`ld_prev_np` (+np)。
+  - dcc_full_latest.dc を連結再生成。
+- 結果: `diff dcc_2.s dcc_3.s` が 336行 → 40行 → **0行 (バイト一致)**。
+  dcc_3 が 5 examples 全 PASS + v6 一致。test.sh 5/5 PASS。
+
+### 既知の残存潜在バグ (別件, 未修正)
+- t_overwrite 型 (同名 nested let-rec + activation毎に異なる capture 値):
+  interp は 200 400 だが全コンパイラ (Gen2/dcc_1/dcc_2/dcc_3) が 300 400。
+  ELet-true global 方式の lexical-unsoundness が根因。
+  本格修正は ce-ELet-true の frame-slot 化+backpatch (要設計・回帰注意)。
+  self-hosting fixpoint には影響なし (examples に該当形状なし)。
+- `go` (emit_ctor_names 内), `emit_levels` は capture ありだが逐次・pure
+  のため現状問題なし。挙動変化が出たら同様に lift すること。
+
+## 2026-09-05 (続): ce-ELet-true の lexical 化 + t_overwrite 修正
+
+### 残存潜在バグの本修正 (frame-slot lexical rec + backpatch)
+- t_overwrite 型 (nested same-node let-rec、activation 毎に capture 値が
+  異なる) が interp と不一致 (200 400 vs 300 400、全コンパイラ) の根因:
+  ce の `ELet true` が再帰名を GLOBAL slot (30000+uid) に束縛していたため、
+  ネスト起動が同一 static cell を上書きし、外側の再帰呼び出しが内側
+  クロージャに誤解決 (lexically unsound)。
+- 修正 (g3_ce_v2.dc の ELet-true 分岐のみ):
+  (1) frame slot 予約 + scope 登録、(2) rhs をその scope で展開
+  (囲み frame の値は env にコピーされる)、(3) closure を slot に格納、
+  (4) ELam rhs 時の capture 順 (pick_sc 再計算) から self の env index を
+  求め backpatch (`str x9,[x0,#24+8*idx]`)。非 ELam rhs・非自己参照は
+  patch 不要パス。body は frame束縛 (shadowing 正常) で展開。
+- top-level `let rec` (emit_fn_level/thunk) は不変。Gen2-Rust は不変
+  (bootstrap のみ、dcc_1 は新 ce 論理で動くため影響なし)。
+- 検証: t_overwrite が dcc_1/dcc_2/dcc_3 全てで 200 400 (interp 一致)。
+  t_shadow2 (旧 SEGV) を含む全ミニテスト PASS。examples 5/5 PASS (×3世代)。
+  test.sh 5/5 PASS。`diff dcc_2.s dcc_3.s` は 0行のまま (fixpoint 維持)。

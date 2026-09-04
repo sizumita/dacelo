@@ -46,25 +46,16 @@ let rec cm_asm st cid_tbl ar_tbl sc ns pat reg flbl = case pat of
       let td = ts_load_const tc 10 ((256 * (1 + len ps)) + tag_tuple) in
       let te = ts_cmp_reg td 9 10 in
       let tf = ts_bcond te c_ne flbl in
-      let rec fld t j cur_sc cur_ns rest_ps = case rest_ps of
-          [] -> (t, cur_sc, cur_ns)
-        | p2 :: rest2 ->
-            let tg = ts_ldr_slot t 9 sv in
-            let th = ts_ldr_off tg 9 9 (8 * (j + 1)) in
-            let (t2, sc3, ns3) =
-              cm_asm th cid_tbl ar_tbl cur_sc cur_ns p2 9 flbl in
-            fld t2 (j + 1) sc3 ns3 rest2
-      in
-      fld tf 0 sc (ns + 1) ps
+      fld_ptup tf 0 sc (ns + 1) ps sv cid_tbl ar_tbl flbl
 
   | PCtor nm ps ->
       let ar = assoc_ikey nm ar_tbl in
       if ar == 0 then
         let cid = assoc_ikey nm cid_tbl in
         let sym_lbl = "_ctorinst_" ++ nm in
-        let s2 = a_inst st ("adrp x9, " ++ sym_lbl ++ "@GOTPAGE") in
-        let s3 = a_inst s2 ("ldr x9, [x9, " ++ sym_lbl ++ "@GOTPAGEOFF]") in
-        let s4 = ts_cmp_reg s3 reg 9 in
+        let s2 = a_inst st ("adrp x10, " ++ sym_lbl ++ "@GOTPAGE") in
+        let s3 = a_inst s2 ("ldr x10, [x10, " ++ sym_lbl ++ "@GOTPAGEOFF]") in
+        let s4 = ts_cmp_reg s3 reg 10 in
         (ts_bcond s4 c_ne flbl, sc, ns)
       else
         let cid = assoc_ikey nm cid_tbl in
@@ -82,16 +73,25 @@ let rec cm_asm st cid_tbl ar_tbl sc ns pat reg flbl = case pat of
         let ti = ts_load_const th 10 cid in
         let tj = ts_cmp_reg ti 9 10 in
         let tk = ts_bcond tj c_ne flbl in
-        let rec fld t j cur_sc cur_ns rest_ps = case rest_ps of
-            [] -> (t, cur_sc, cur_ns)
-          | p2 :: rest2 ->
-              let tl = ts_ldr_slot t 9 sv in
-              let tm = ts_ldr_off tl 9 9 (8 * (j + 2)) in
-              let (t2, sc3, ns3) =
-                cm_asm tm cid_tbl ar_tbl cur_sc cur_ns p2 9 flbl in
-              fld t2 (j + 1) sc3 ns3 rest2
-        in
-        fld tk 0 sc (ns + 1) ps
+        fld_pctor tk 0 sc (ns + 1) ps sv cid_tbl ar_tbl flbl
+
+and fld_ptup t j cur_sc cur_ns rest_ps sv cid_tbl ar_tbl flbl = case rest_ps of
+    [] -> (t, cur_sc, cur_ns)
+  | p2 :: rest2 ->
+      let tg = ts_ldr_slot t 9 sv in
+      let th = ts_ldr_off tg 9 9 (8 * (j + 1)) in
+      let (t2, sc3, ns3) =
+        cm_asm th cid_tbl ar_tbl cur_sc cur_ns p2 9 flbl in
+      fld_ptup t2 (j + 1) sc3 ns3 rest2 sv cid_tbl ar_tbl flbl
+
+and fld_pctor t j cur_sc cur_ns rest_ps sv cid_tbl ar_tbl flbl = case rest_ps of
+    [] -> (t, cur_sc, cur_ns)
+  | p2 :: rest2 ->
+      let tl = ts_ldr_slot t 9 sv in
+      let tm = ts_ldr_off tl 9 9 (8 * (j + 2)) in
+      let (t2, sc3, ns3) =
+        cm_asm tm cid_tbl ar_tbl cur_sc cur_ns p2 9 flbl in
+      fld_pctor t2 (j + 1) sc3 ns3 rest2 sv cid_tbl ar_tbl flbl
 
 and cmf_asm st cid_tbl ar_tbl sc ns ps reg flbl base = case ps of
     [] -> (st, sc, ns)
