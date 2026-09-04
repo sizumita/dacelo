@@ -1,0 +1,12 @@
+-- dacelo: naive fibonacci
+
+let rec fib n =
+  if n < 2 then n else fib (n - 1) + fib (n - 2)
+
+let main () =
+  print_string "fib 20 = " ;
+  print_int (fib 20) ;
+  print_string "\n" ;
+  print_string "fib 30 = " ;
+  print_int (fib 30) ;
+  print_string "\n"

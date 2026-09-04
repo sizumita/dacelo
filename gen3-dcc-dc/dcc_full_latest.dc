@@ -1,0 +1,2333 @@
+-- ============================================================
+-- dcc.dc -- the dacelo compiler, written in dacelo (Gen 3)
+--
+-- bootstrap:
+--   dcc-rs  gen3-dcc-dc/dcc.dc -o dcc_1          # host compiles this file
+--   ./dcc_1 gen3-dcc-dc/dcc.dc rt/rt.c dcc_2     # dcc_1 compiles itself
+--
+-- usage: dcc_<n> <in.dc> <rt.c> <out>
+-- pipeline: lex -> parse -> ARM64 codegen -> Mach-O object -> cc link
+-- ============================================================
+
+-- ============================================================
+-- interp.dc -- a dacelo interpreter written in dacelo
+--
+-- runs on: dacelo (gen0-interp-rs)
+-- usage:   dacelo interp.dc <target.dc>
+--
+-- This file must only use features that IT implements itself,
+-- because we test it by interpreting its own source:
+--   dacelo interp.dc interp.dc <target.dc>
+-- ============================================================
+
+-- ---------- generic list helpers ----------
+
+let rec rev_acc onto xs = case xs of
+    [] -> onto
+  | h :: rest -> rev_acc (h :: onto) rest
+
+let rec mem_str x xs = case xs of
+    [] -> false
+  | h :: rest -> h == x || mem_str x rest
+
+let rec len xs = case xs of
+    [] -> 0
+  | _ :: rest -> 1 + len rest
+
+let rec app_list xs ys = case xs of
+    [] -> ys
+  | h :: rest -> h :: app_list rest ys
+
+let rec join sep xs = case xs of
+    [] -> ""
+  | h :: [] -> h
+  | h :: rest -> h ++ sep ++ join sep rest
+
+-- ---------- tokens ----------
+
+type Tok =
+  | TInt Int
+  | TStr String
+  | TIdent String
+  | TUpper String
+  | TKw String
+  | TSym String
+
+-- ---------- AST ----------
+
+type Pat =
+  | PWild
+  | PVar String
+  | PInt Int
+  | PBool Bool
+  | PStr String
+  | PUnit
+  | PTup (List Pat)
+  | PCtor String (List Pat)
+
+type Expr =
+  | EInt Int
+  | EBool Bool
+  | EStr String
+  | EUnit
+  | EVar String
+  | ECtor String
+  | ELam Pat Expr
+  | EApp Expr Expr
+  | EBin String Expr Expr
+  | EIf Expr Expr Expr
+  | ECase Expr (List (Pat, Expr))
+  | ELet Bool String Expr Expr
+  | ETup (List Expr)
+
+-- ---------- definitions ----------
+
+type Def3 = Def3 Bool String Expr
+type Group = Group (List Def3)
+type Prog = Prog (List (String, Int)) (List Group)
+
+-- ---------- runtime values ----------
+
+type Val =
+  | VInt Int
+  | VBool Bool
+  | VStr String
+  | VUnit
+  | VTup (List Val)
+  | VLam Pat Expr (List (String, Val))
+  | VRecLam String Pat Expr (List (String, Val))
+  | VPrim String Int (List Val)
+  | VCtorF String Int (List Val)
+  | VAdt String (List Val)
+
+-- ============================================================
+-- LEXER
+-- ============================================================
+
+let sget s i = string_get s i
+
+let is_digit c = 48 <= c && c <= 57
+let is_lowerc c = 97 <= c && c <= 122
+let is_upperc c = 65 <= c && c <= 90
+let is_wordch c = is_digit c || is_lowerc c || is_upperc c || c == 95 || c == 39
+
+let rec skip_line_comment s i =
+  let c = sget s i in
+  if c == -1 then i
+  else if c == 10 then skip_ws s (i + 1)
+  else skip_line_comment s (i + 1)
+
+and skip_ws s i =
+  let c = sget s i in
+  if c == -1 then i
+  else if c == 32 || c == 9 || c == 10 || c == 13 then skip_ws s (i + 1)
+  else if c == 45 && sget s (i + 1) == 45 then skip_line_comment s (i + 2)
+  else i
+
+let rec scan_int_run s i acc =
+  let c = sget s i in
+  if is_digit c then scan_int_run s (i + 1) (acc * 10 + (c - 48))
+  else (acc, i)
+
+let rec word_end s i =
+  let c = sget s i in
+  if is_wordch c then word_end s (i + 1) else i
+
+let keywords = ["let", "rec", "and", "in", "if", "then", "else", "case", "of",
+                "fun", "true", "false", "type"]
+
+let sym2s = ["->", "==", "!=", "<=", ">=", "&&", "||", "++", "::"]
+
+let sub_or_empty s i n =
+  if i + n <= string_length s then substring s i n else ""
+
+let is_sym1 c =
+  c == 40 || c == 41 || c == 91 || c == 93 || c == 44 || c == 59 ||
+  c == 58 || c == 124 || c == 60 || c == 62 || c == 61 || c == 43 ||
+  c == 45 || c == 42 || c == 47 || c == 37
+
+let escape_code c = case c of
+    110 -> 10
+  | 116 -> 9
+  | 114 -> 13
+  | 92  -> 92
+  | 34  -> 34
+  | 48  -> 0
+  | _   -> error "interp: bad escape sequence in string literal"
+
+let rec chars_str cs = case cs of
+    [] -> ""
+  | c :: rest -> chr c ++ chars_str rest
+
+let rec scan_string s i acc =
+  let c = sget s i in
+  if c == -1 then error "interp: unterminated string literal"
+  else if c == 34 then (chars_str (rev_acc [] acc), i + 1)
+  else if c == 92 then
+    let e = sget s (i + 1) in
+    if e == -1 then error "interp: unterminated string literal"
+    else scan_string s (i + 2) (escape_code e :: acc)
+  else scan_string s (i + 1) (c :: acc)
+
+let rec lex_loop s i acc =
+  let j = skip_ws s i in
+  let c = sget s j in
+  if c == -1 then rev_acc [] acc
+  else if is_digit c then
+    let (n, k) = scan_int_run s j 0 in
+    lex_loop s k (TInt n :: acc)
+  else if c == 34 then
+    let (t, k) = scan_string s (j + 1) [] in
+    lex_loop s k (TStr t :: acc)
+  else if is_lowerc c || c == 95 then
+    let k = word_end s j in
+    let w = substring s j (k - j) in
+    if mem_str w keywords
+    then lex_loop s k (TKw w :: acc)
+    else lex_loop s k (TIdent w :: acc)
+  else if is_upperc c then
+    let k = word_end s j in
+    let w = substring s j (k - j) in
+    lex_loop s k (TUpper w :: acc)
+  else
+    let two = sub_or_empty s j 2 in
+    if mem_str two sym2s
+    then lex_loop s (j + 2) (TSym two :: acc)
+    else if is_sym1 c
+    then lex_loop s (j + 1) (TSym (chr c) :: acc)
+    else error ("interp: unexpected character (code " ++ int_to_string c ++ ")")
+
+let lex_all src = lex_loop src 0 []
+
+-- ============================================================
+-- PARSER (token stream passing)
+-- ============================================================
+
+let is_sym q toks = case toks of
+  | TSym x :: _ -> x == q
+  | _ -> false
+
+let is_kw q toks = case toks of
+  | TKw x :: _ -> x == q
+  | _ -> false
+
+let drop1 toks = case toks of
+  | _ :: rest -> rest
+  | [] -> []
+
+let expect_sym q toks =
+  if is_sym q toks then drop1 toks
+  else error ("interp: expected `" ++ q ++ "`")
+
+let expect_kw q toks =
+  if is_kw q toks then drop1 toks
+  else error ("interp: expected keyword `" ++ q ++ "`")
+
+let take_ident toks = case toks of
+  | TIdent n :: rest -> (n, rest)
+  | _ -> error "interp: expected identifier"
+
+let take_upper toks = case toks of
+  | TUpper n :: rest -> (n, rest)
+  | _ -> error "interp: expected constructor name"
+
+let starts_tyatom toks = case toks of
+  | TIdent _ :: _ -> true
+  | TUpper _ :: _ -> true
+  | TSym "(" :: _ -> true
+  | TSym "[" :: _ -> true
+  | _ -> false
+
+let rec ptyatom toks = case toks of
+  | TIdent _ :: rest -> rest
+  | TUpper _ :: rest -> rest
+  | TSym "(" :: rest ->
+      if is_sym ")" rest then drop1 rest
+      else
+        let t1 = ptype rest in
+        let t2 = pmore_tytuple t1 in
+        expect_sym ")" t2
+  | TSym "[" :: rest ->
+      let t1 = ptype rest in
+      expect_sym "]" t1
+  | _ -> error "interp: expected type"
+
+and pmore_tytuple toks =
+  if is_sym "," toks then pmore_tytuple (ptype (drop1 toks))
+  else toks
+
+and ptyapp toks =
+  let t1 = ptyatom toks in
+  if starts_tyatom t1 then ptyapp t1 else t1
+
+and ptype toks =
+  let t1 = ptyapp toks in
+  if is_sym "->" t1 then ptype (drop1 t1) else t1
+
+let eat_ann_opt toks =
+  if is_sym ":" toks then ptype (drop1 toks) else toks
+
+-- ---- expressions ----
+
+let starts_atom toks = case toks of
+  | TInt _ :: _ -> true
+  | TStr _ :: _ -> true
+  | TIdent _ :: _ -> true
+  | TUpper _ :: _ -> true
+  | TKw "true" :: _ -> true
+  | TKw "false" :: _ -> true
+  | TSym "(" :: _ -> true
+  | TSym "[" :: _ -> true
+  | _ -> false
+
+let rec wrap_lams ps body = case ps of
+    [] -> body
+  | p :: rest -> ELam p (wrap_lams rest body)
+
+-- standalone parser helpers
+type OptS = None2 | Some2 String
+
+
+let cmp_op_of toks = case toks of
+  | TSym "==" :: _ -> Some2 "=="
+  | TSym "!=" :: _ -> Some2 "!="
+  | TSym "<" :: _ -> Some2 "<"
+  | TSym ">" :: _ -> Some2 ">"
+  | TSym "<=" :: _ -> Some2 "<="
+  | TSym ">=" :: _ -> Some2 ">="
+  | _ -> None2
+
+
+let mk_cons l r = EApp (EApp (ECtor "Cons") l) r
+
+
+let rec build_cons xs = case xs of
+    [] -> ECtor "Nil"
+  | h :: rest -> mk_cons h (build_cons rest)
+
+
+let pat_nil = PCtor "Nil" []
+
+
+let rec build_pcons xs = case xs of
+    [] -> pat_nil
+  | h :: rest -> PCtor "Cons" [h, build_pcons rest]
+
+
+let starts_pat_atom toks = case toks of
+  | TInt _ :: _ -> true
+  | TStr _ :: _ -> true
+  | TIdent _ :: _ -> true
+  | TUpper _ :: _ -> true
+  | TKw "true" :: _ -> true
+  | TKw "false" :: _ -> true
+  | TSym "(" :: _ -> true
+  | TSym "[" :: _ -> true
+  | _ -> false
+
+let rec pmany_param toks acc = case toks of
+  | TIdent _ :: _ -> let (p, t) = ppat_atom toks in pmany_param t (p :: acc)
+  | TSym "_" :: _ -> let (p, t) = ppat_atom toks in pmany_param t (p :: acc)
+  | TSym "(" :: _ -> let (p, t) = ppat_atom toks in pmany_param t (p :: acc)
+  | _ -> (rev_acc [] acc, toks)
+
+and plist_elems toks acc =
+  let (e, t1) = pexpr toks in
+  let acc2 = e :: acc in
+  if is_sym "," t1 then plist_elems (drop1 t1) acc2
+  else
+    let t2 = expect_sym "]" t1 in
+    (build_cons (rev_acc [] acc2), t2)
+
+and plist_pats toks acc =
+  let (p, t1) = ppattern toks in
+  let acc2 = p :: acc in
+  if is_sym "," t1 then plist_pats (drop1 t1) acc2
+  else
+    let t2 = expect_sym "]" t1 in
+    (build_pcons (rev_acc [] acc2), t2)
+
+and ptuple_more toks acc =
+  let (e, t1) = pexpr toks in
+  let acc2 = e :: acc in
+  if is_sym "," t1 then ptuple_more (drop1 t1) acc2
+  else
+    let t2 = expect_sym ")" t1 in
+    (ETup (rev_acc [] acc2), t2)
+
+and ptuple_pats_more toks acc =
+  let (p, t1) = ppattern toks in
+  let acc2 = p :: acc in
+  if is_sym "," t1 then ptuple_pats_more (drop1 t1) acc2
+  else
+    let t2 = expect_sym ")" t1 in
+    (PTup (rev_acc [] acc2), t2)
+
+and patom toks = case toks of
+  | TInt n :: rest -> (EInt n, rest)
+  | TStr s :: rest -> (EStr s, rest)
+  | TKw "true" :: rest -> (EBool true, rest)
+  | TKw "false" :: rest -> (EBool false, rest)
+  | TIdent n :: rest -> (EVar n, rest)
+  | TUpper c :: rest -> (ECtor c, rest)
+  | TSym "-" :: TInt n :: rest -> (EInt (0 - n), rest)
+  | TSym "(" :: rest ->
+      if is_sym ")" rest then (EUnit, drop1 rest)
+      else
+        let (e, t1) = pexpr rest in
+        if is_sym "," t1 then ptuple_more (drop1 t1) [e]
+        else (e, expect_sym ")" t1)
+  | TSym "[" :: rest ->
+      if is_sym "]" rest then (ECtor "Nil", drop1 rest)
+      else plist_elems rest []
+  | _ -> error "interp: expected expression"
+
+and papp_loop f toks =
+  if starts_atom toks then
+    let (a, t1) = patom toks in
+    papp_loop (EApp f a) t1
+  else (f, toks)
+
+and papp toks =
+  let (a, t1) = patom toks in
+  papp_loop a t1
+
+and pmul_loop l toks =
+  if is_sym "*" toks then
+    let (r, t1) = papp (drop1 toks) in pmul_loop (EBin "*" l r) t1
+  else if is_sym "/" toks then
+    let (r, t1) = papp (drop1 toks) in pmul_loop (EBin "/" l r) t1
+  else if is_sym "%" toks then
+    let (r, t1) = papp (drop1 toks) in pmul_loop (EBin "%" l r) t1
+  else (l, toks)
+
+and pmul toks =
+  let (l, t1) = papp toks in pmul_loop l t1
+
+and padd_loop l toks =
+  if is_sym "+" toks then
+    let (r, t1) = pmul (drop1 toks) in padd_loop (EBin "+" l r) t1
+  else if is_sym "-" toks then
+    let (r, t1) = pmul (drop1 toks) in padd_loop (EBin "-" l r) t1
+  else (l, toks)
+
+and padd toks =
+  let (l, t1) = pmul toks in padd_loop l t1
+
+and pcons toks =
+  let (l, t1) = padd toks in
+  if is_sym "::" t1 then
+    let (r, t2) = pcons (drop1 t1) in
+    (mk_cons l r, t2)
+  else if is_sym "++" t1 then
+    let (r, t2) = pcons (drop1 t1) in
+    (EBin "++" l r, t2)
+  else (l, t1)
+
+and pcmp toks =
+  let (l, t1) = pcons toks in
+  case cmp_op_of t1 of
+    | None2 -> (l, t1)
+    | Some2 op ->
+        let (r, t2) = pcons (drop1 t1) in
+        (EBin op l r, t2)
+
+and pand_loop l toks =
+  if is_sym "&&" toks then
+    let (r, t1) = pcmp (drop1 toks) in pand_loop (EBin "&&" l r) t1
+  else (l, toks)
+
+and pand toks =
+  let (l, t1) = pcmp toks in pand_loop l t1
+
+and por_loop l toks =
+  if is_sym "||" toks then
+    let (r, t1) = pand (drop1 toks) in por_loop (EBin "||" l r) t1
+  else (l, toks)
+
+and por toks =
+  let (l, t1) = pand toks in por_loop l t1
+
+and pann toks =
+  let (l, t1) = por toks in
+  if is_sym ":" t1 then (l, ptype (drop1 t1))
+  else (l, t1)
+
+and pseq toks =
+  let (l, t1) = pann toks in
+  if is_sym ";" t1 then
+    let (r, t2) = pexpr (drop1 t1) in
+    (ELet false "_" l r, t2)
+  else (l, t1)
+
+and pplet toks =
+  let (p, t1) = ppat_atom toks in
+  let t2 = expect_sym "=" t1 in
+  let (rhs, t3) = pexpr t2 in
+  let t4 = expect_kw "in" t3 in
+  let (body, t5) = pexpr t4 in
+  (ECase rhs [(p, body)], t5)
+
+and pbranches toks acc =
+  let (p, t1) = ppattern toks in
+  let t2 = expect_sym "->" t1 in
+  let (b, t3) = pexpr t2 in
+  let acc2 = (p, b) :: acc in
+  if is_sym "|" t3 then pbranches (drop1 t3) acc2
+  else (rev_acc [] acc2, t3)
+
+and pexpr toks =
+  if is_kw "fun" toks then
+    let (ps, t1) = pmany_param (drop1 toks) [] in
+    let t2 = expect_sym "->" t1 in
+    let (b, t3) = pexpr t2 in
+    (wrap_lams ps b, t3)
+  else if is_kw "if" toks then
+    let (c, t1) = pexpr (drop1 toks) in
+    let t2 = expect_kw "then" t1 in
+    let (th, t3) = pexpr t2 in
+    let t4 = expect_kw "else" t3 in
+    let (el, t5) = pexpr t4 in
+    (EIf c th el, t5)
+  else if is_kw "case" toks then
+    let (sc, t1) = pexpr (drop1 toks) in
+    let t2 = expect_kw "of" t1 in
+    let t3 = (case t2 of | TSym "|" :: rest -> rest | _ -> t2) in
+    let (brs, t4) = pbranches t3 [] in
+    (ECase sc brs, t4)
+  else if is_kw "let" toks then
+    (case drop1 toks of
+       | TSym "(" :: _ -> pplet (drop1 toks)
+       | _ -> plocal_let (drop1 toks))
+  else pseq toks
+
+and plocal_let toks =
+  let (isrec, t1) = (case toks of
+                         | TKw "rec" :: rest -> (true, rest)
+                         | r -> (false, r)) in
+  let (name, t2) = take_ident t1 in
+  let (params, t3) = pmany_param t2 [] in
+  let t4 = eat_ann_opt t3 in
+  let t5 = expect_sym "=" t4 in
+  let (rhs, t6) = pexpr t5 in
+  let t7 = expect_kw "in" t6 in
+  let (body, t8) = pexpr t7 in
+  (ELet isrec name (wrap_lams params rhs) body, t8)
+
+-- ---- patterns ----
+
+and ppat_atom toks = case toks of
+  | TIdent "_" :: rest -> (PWild, rest)
+  | TIdent n :: rest -> (PVar n, rest)
+  | TInt n :: rest -> (PInt n, rest)
+  | TStr s :: rest -> (PStr s, rest)
+  | TKw "true" :: rest -> (PBool true, rest)
+  | TKw "false" :: rest -> (PBool false, rest)
+  | TSym "(" :: rest ->
+      if is_sym ")" rest then (PUnit, drop1 rest)
+      else
+        let (p, t1) = ppattern rest in
+        if is_sym "," t1 then ptuple_pats_more (drop1 t1) [p]
+        else (p, expect_sym ")" t1)
+  | TSym "[" :: rest ->
+      if is_sym "]" rest then (pat_nil, drop1 rest)
+      else plist_pats rest []
+  | _ -> error "interp: expected pattern"
+
+and ppat_app toks = case toks of
+  | TUpper c :: rest ->
+      let (args, t1) = pmany_pat_atom rest [] in
+      (PCtor c args, t1)
+  | _ -> ppat_atom toks
+
+and pmany_pat_atom toks acc =
+  if starts_pat_atom toks then
+    let (p, t1) = ppat_atom toks in
+    pmany_pat_atom t1 (p :: acc)
+  else (rev_acc [] acc, toks)
+
+and ppattern toks =
+  let (l, t1) = ppat_app toks in
+  if is_sym "::" t1 then
+    let (r, t2) = ppattern (drop1 t1) in
+    (PCtor "Cons" [l, r], t2)
+  else (l, t1)
+
+-- ---- top-level items ----
+
+let rec pparams_only toks acc = case toks of
+  | TIdent _ :: _ -> let (n, t) = take_ident toks in pparams_only t (n :: acc)
+  | _ -> (rev_acc [] acc, toks)
+
+let pdef_tail isrec toks =
+  let (name, t1) = take_ident toks in
+  let (params, t2) = pmany_param t1 [] in
+  let t3 = eat_ann_opt t2 in
+  let t4 = expect_sym "=" t3 in
+  let (rhs, t5) = pexpr t4 in
+  (Def3 isrec name (wrap_lams params rhs), t5)
+
+let rec pctrs toks acc =
+  let (cname, t1) = take_upper toks in
+  let (fields, t2) = ptyapp_count t1 0 in
+  let acc2 = (cname, fields) :: acc in
+  if is_sym "|" t2 then pctrs (drop1 t2) acc2
+  else (acc2, t2)
+
+and ptyapp_count toks n =
+  if starts_tyatom toks then
+    let t1 = ptyatom toks in
+    if starts_tyatom t1 then ptyapp_count t1 (n + 1) else (n + 1, t1)
+  else (n, toks)
+
+let ptydef toks = case toks of
+  | TUpper name :: rest ->
+      let (_, t1) = pparams_only rest [] in
+      let t2 = expect_sym "=" t1 in
+      let t3 = (case t2 of | TSym "|" :: r -> r | _ -> t2) in
+      let (cds, t4) = pctrs t3 [] in
+      ((name, rev_acc [] cds), t4)
+  | _ -> error "interp: expected type name"
+
+let next_is_and toks = case toks of
+  | TKw "and" :: _ -> true
+  | _ -> false
+
+let rec push_pairs xs acc = case xs of
+    [] -> acc
+  | h :: rest -> push_pairs rest (h :: acc)
+
+let rec pand_chain toks acc =
+  let t0 = expect_kw "and" toks in
+  let (d, t1) = pdef_tail true t0 in
+  let acc2 = d :: acc in
+  if next_is_and t1 then pand_chain t1 acc2
+  else (Group (rev_acc [] acc2), t1)
+
+let pand_chain_cont toks first =
+  let (grp_d, t1) = pand_chain toks [first] in
+  (grp_d, t1)
+
+let rec pitems toks ctors groups = case toks of
+  | [] -> (Prog (rev_acc [] ctors) (rev_acc [] groups), [])
+  | TKw "type" :: rest ->
+      let ((_, cds), t1) = ptydef rest in
+      pitems t1 (push_pairs cds ctors) groups
+  | TKw "let" :: rest ->
+      let (isrec, t1) = (case rest of
+                           | TKw "rec" :: r -> (true, r)
+                           | r -> (false, r)) in
+      let (d, t2) = pdef_tail isrec t1 in
+      if next_is_and t2 && isrec then
+        let (grp, t3) = pand_chain_cont t2 d in
+        pitems t3 ctors (grp :: groups)
+      else if next_is_and t2 then
+        error "interp: `and` is only allowed after `let rec`"
+      else
+        pitems t2 ctors (Group [d] :: groups)
+  | _ -> error "interp: expected top-level item (`let` or `type`)"
+
+let parse_prog toks =
+  let (prog, rest) = pitems toks [] [] in
+  case rest of
+    | [] -> prog
+    | _ -> error "interp: trailing tokens after program"
+
+-- ============================================================
+-- CODEGEN BACKEND
+-- ============================================================
+
+-- builtin indices -- must match rt.c enum order
+let builtins = ["print_int", "print_string", "int_to_string", "bool_to_string",
+                "string_length", "str_concat", "read_file", "write_file",
+                "exit", "chr", "ord", "string_get", "substring",
+                "string_to_int", "error", "show", "argv", "system"]
+
+let frame_bytes = 4032
+
+-- value block headers: hdr(tag)(size) = size*256 + tag
+let tag_string = 1
+let tag_tuple  = 2
+let tag_adt    = 3
+let tag_closure= 4
+
+let hdr_w tg sz = sz * 256 + tg
+
+-- instruction word bases (decimal encodings of the A64 opcodes)
+let w_orr_mov = 2852126720
+let w_add_imm = 2432696320
+let w_sub_imm = 3506438144
+let w_cmp_imm = 4043309056
+let w_add_reg = 2332033024
+let w_sub_reg = 3405774848
+let w_cmp_reg = 3942645760
+let w_mul     = 2600500224
+let w_msub    = 2600501248
+let w_sdiv    = 2596277248
+let w_asr     = 2470445056
+let w_cset    = 2592080896
+let w_ldr     = 4181721088
+let w_str     = 4177526784
+let w_stp_fl  = 2847898621
+let w_ldp_ret = 2831252477
+let w_ret     = 3596551104
+let w_blr     = 3594452992
+let w_b       = 335544320
+let w_bl      = 2483027968
+let w_bcond   = 1409286144
+let w_adrp    = 2415919104
+
+-- condition codes
+let c_eq = 0
+let c_ne = 1
+let c_lt = 11
+let c_gt = 12
+let c_le = 13
+let c_ge = 10
+
+let xzr = 31
+let rsp = 31
+let xfp = 29
+
+-- register x0/x1 are 0/1
+
+-- ---------- emitter state ----------
+-- (pass, pos, bytes-reversed, label-offsets, next-label-id,
+--  label-names, data-rev, dlen, data-syms, data-relocs,
+--  text-relocs, externs, strmap, globals, nglobals, lam-counter, pending)
+-- pending items: Pend(labels, syms, captured-names, params, body)
+
+let s_pass s  = case s of | (a, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _) -> a
+let s_pos s   = case s of | (_, b, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _) -> b
+let s_bytes s = case s of | (_, _, c, _, _, _, _, _, _, _, _, _, _, _, _, _, _) -> c
+let s_labels s= case s of | (_, _, _, d, _, _, _, _, _, _, _, _, _, _, _, _, _) -> d
+let s_lid s   = case s of | (_, _, _, _, e, _, _, _, _, _, _, _, _, _, _, _, _) -> e
+let s_lnames s= case s of | (_, _, _, _, _, f, _, _, _, _, _, _, _, _, _, _, _) -> f
+let s_data s  = case s of | (_, _, _, _, _, _, g, _, _, _, _, _, _, _, _, _, _) -> g
+let s_dlen s  = case s of | (_, _, _, _, _, _, _, h, _, _, _, _, _, _, _, _, _) -> h
+let s_dsms s  = case s of | (_, _, _, _, _, _, _, _, i, _, _, _, _, _, _, _, _) -> i
+let s_drel s  = case s of | (_, _, _, _, _, _, _, _, _, j, _, _, _, _, _, _, _) -> j
+let s_trel s  = case s of | (_, _, _, _, _, _, _, _, _, _, k, _, _, _, _, _, _) -> k
+let s_exts s  = case s of | (_, _, _, _, _, _, _, _, _, _, _, l, _, _, _, _, _) -> l
+let s_smap s  = case s of | (_, _, _, _, _, _, _, _, _, _, _, _, m, _, _, _, _) -> m
+let s_globs s = case s of | (_, _, _, _, _, _, _, _, _, _, _, _, _, n, _, _, _) -> n
+let s_nglob s = case s of | (_, _, _, _, _, _, _, _, _, _, _, _, _, _, o, _, _) -> o
+let s_lamc s  = case s of | (_, _, _, _, _, _, _, _, _, _, _, _, _, _, _, p, _) -> p
+let s_pend s  = case s of | (_, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, q) -> q
+
+let es_set_bytes s bs = case s of
+  | (a, b, _, d, e, f, g, h, i, j, k, l, m, n, o, p2, q) -> (a, b, bs, d, e, f, g, h, i, j, k, l, m, n, o, p2, q)
+let es_set_pos s v = case s of
+  | (a, _, c, d, e, f, g, h, i, j, k, l, m, n, o, p2, q) -> (a, v, c, d, e, f, g, h, i, j, k, l, m, n, o, p2, q)
+let es_set_labels s v = case s of
+  | (a, b, c, _, e, f, g, h, i, j, k, l, m, n, o, p2, q) -> (a, b, c, v, e, f, g, h, i, j, k, l, m, n, o, p2, q)
+let es_set_lid s v = case s of
+  | (a, b, c, d, _, f, g, h, i, j, k, l, m, n, o, p2, q) -> (a, b, c, d, v, f, g, h, i, j, k, l, m, n, o, p2, q)
+let es_set_lnames s v = case s of
+  | (a, b, c, d, e, _, g, h, i, j, k, l, m, n, o, p2, q) -> (a, b, c, d, e, v, g, h, i, j, k, l, m, n, o, p2, q)
+let es_set_data s v = case s of
+  | (a, b, c, d, e, f, _, h, i, j, k, l, m, n, o, p2, q) -> (a, b, c, d, e, f, v, h, i, j, k, l, m, n, o, p2, q)
+let es_set_dlen s v = case s of
+  | (a, b, c, d, e, f, g, _, i, j, k, l, m, n, o, p2, q) -> (a, b, c, d, e, f, g, v, i, j, k, l, m, n, o, p2, q)
+let es_set_dsms s v = case s of
+  | (a, b, c, d, e, f, g, h, _, j, k, l, m, n, o, p2, q) -> (a, b, c, d, e, f, g, h, v, j, k, l, m, n, o, p2, q)
+let es_set_drel s v = case s of
+  | (a, b, c, d, e, f, g, h, i, _, k, l, m, n, o, p2, q) -> (a, b, c, d, e, f, g, h, i, v, k, l, m, n, o, p2, q)
+let es_set_trel s v = case s of
+  | (a, b, c, d, e, f, g, h, i, j, _, l, m, n, o, p2, q) -> (a, b, c, d, e, f, g, h, i, j, v, l, m, n, o, p2, q)
+let es_set_exts s v = case s of
+  | (a, b, c, d, e, f, g, h, i, j, k, _, m, n, o, p2, q) -> (a, b, c, d, e, f, g, h, i, j, k, v, m, n, o, p2, q)
+let es_set_smap s v = case s of
+  | (a, b, c, d, e, f, g, h, i, j, k, l, _, n, o, p2, q) -> (a, b, c, d, e, f, g, h, i, j, k, l, v, n, o, p2, q)
+let es_set_globs s v = case s of
+  | (a, b, c, d, e, f, g, h, i, j, k, l, m, _, o, p2, q) -> (a, b, c, d, e, f, g, h, i, j, k, l, m, v, o, p2, q)
+let es_set_nglob s v = case s of
+  | (a, b, c, d, e, f, g, h, i, j, k, l, m, n, _, p2, q) -> (a, b, c, d, e, f, g, h, i, j, k, l, m, n, v, p2, q)
+let es_set_lamc s v = case s of
+  | (a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, _, q) -> (a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, v, q)
+let es_set_pend s v = case s of
+  | (a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p2, _) -> (a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p2, v)
+
+let es_new pass = (pass, 0, [], [], 0, [], [], 0, [], [], [], [], [], [], 0, 0, [])
+
+-- push one byte onto reversed stream
+let es_byte s b =
+  let pos = s_pos s in
+  let bs = if s_pass s == 1 then s_bytes s else b :: s_bytes s in
+  es_set_pos (es_set_bytes s bs) (pos + 1)
+
+let es_word32 s w =
+  let b0 = w % 256 in
+  let r1 = w / 256 in
+  let b1 = r1 % 256 in
+  let r2 = r1 / 256 in
+  let b2 = r2 % 256 in
+  let b3 = r2 / 256 in
+  es_byte (es_byte (es_byte (es_byte s b0) b1) b2) b3
+
+let es_here s = s_pos s
+
+let es_bind_label s lid =
+  let lm = (lid, s_pos s) :: s_labels s in
+  es_set_labels s lm
+
+let rec assoc_int lid lm = case lm of
+    [] -> 0 - 1
+  | kv :: rest -> case kv of
+      | (k2, v2) -> if k2 == lid then v2 else assoc_int lid rest
+
+let rec assoc_str key lm = case lm of
+    [] -> ""
+  | kv :: rest -> case kv of
+      | (k2, v2) -> if k2 == key then v2 else assoc_str key rest
+
+let rec assoc_ikey name lm = case lm of
+    [] -> 0 - 1
+  | kv :: rest -> case kv of
+      | (k2, v2) -> if k2 == name then v2 else assoc_ikey name rest
+
+let rec mem_assoc_str key lm = case lm of
+    [] -> false
+  | kv :: rest -> case kv of
+      | (k2, _) -> if k2 == key then true else mem_assoc_str key rest
+
+-- signed field encoders via double-mod
+let fld26 d = (((d % 67108864) + 67108864) % 67108864)
+let fld19 d = (((d % 524288) + 524288) % 524288)
+
+let es_b s target =
+  let delta = (assoc_int target (s_labels s) - s_pos s) / 4 in
+  es_word32 s (w_b + fld26 delta)
+
+let es_bl s target =
+  let delta = (assoc_int target (s_labels s) - s_pos s) / 4 in
+  es_word32 s (w_bl + fld26 delta)
+
+let es_bcond s cond target =
+  let delta = (assoc_int target (s_labels s) - s_pos s) / 4 in
+  es_word32 s (w_bcond + fld19 delta * 32 + cond)
+
+let es_blr s rn = es_word32 s (w_blr + rn * 32)
+
+let es_ret s = es_word32 s w_ret
+
+-- load 64-bit constant into rd (movz + movk chain)
+let w_movz = 3531603968
+let w_movk = 4068474880
+
+let es_load_const s rd v =
+  let lo = v % 65536 in
+  let s1 = es_word32 s (w_movz + lo * 32 + rd) in
+  let k1 = v / 65536 % 65536 in
+  let s2 = if v / 65536 != 0 then es_word32 s1 (w_movk + 2097152 + k1 * 32 + rd) else s1 in
+  let k2 = v / 4294967296 % 65536 in
+  let s3 = if v / 4294967296 != 0 then es_word32 s2 (w_movk + 4194304 + k2 * 32 + rd) else s2 in
+  let k3 = v / 281474976710656 % 65536 in
+  if v / 281474976710656 != 0
+  then es_word32 s3 (w_movk + 6291456 + k3 * 32 + rd)
+  else s3
+
+-- frame / data access (slots are sp-relative positive offsets)
+let es_str_slot s reg slot = es_word32 s (w_str + slot * 1024 + 31 * 32 + reg)
+let es_ldr_slot s reg slot = es_word32 s (w_ldr + slot * 1024 + 31 * 32 + reg)
+
+let es_str_off s rt rn boff = es_word32 s (w_str + (boff / 8) * 1024 + rn * 32 + rt)
+let es_ldr_off s rt rn boff = es_word32 s (w_ldr + (boff / 8) * 1024 + rn * 32 + rt)
+
+let rec es_copy_captures s i captured =
+  if i < captured
+  then
+    let s1 = es_ldr_off s 9 0 (24 + 8 * i) in
+    let s2 = es_str_slot s1 9 i in
+    es_copy_captures s2 (i + 1) captured
+  else s
+
+-- closure layout: [hdr@0][code@8][env-size@16][env words @24..]
+let es_prologue s captured =
+  let s1 = es_word32 s w_stp_fl in
+  let s2 = es_word32 s1 (w_add_imm + xfp * 32 + rsp * 1024) in
+  let s3 = es_word32 s2 (w_sub_imm + frame_bytes * 1024 + rsp * 32 + rsp) in
+  es_copy_captures s3 0 captured
+
+let es_epilogue s =
+  let s1 = es_word32 s (w_add_imm + frame_bytes * 1024 + rsp * 32 + rsp) in
+  es_word32 s1 w_ldp_ret
+
+-- call runtime helper by mangled symbol through @got adrp+ldr pair
+let es_got_ldr s sym reg =
+  let pos = s_pos s in
+  let trel = (pos, 5, sym) :: (pos + 4, 6, sym) :: s_trel s in
+  let s2 = es_set_trel s trel in
+  let s3 = es_word32 s2 w_adrp in
+  es_word32 s3 (w_ldr + reg * 32 + reg)
+
+let use_extern s sym =
+  let exts = s_exts s in
+  if mem_str sym exts then s else es_set_exts s (sym :: exts)
+
+let es_call_rt s name =
+  let sym = "_" ++ name in
+  let s1 = use_extern s sym in
+  let s2 = es_got_ldr s1 sym 9 in
+  es_blr s2 9
+
+-- reference a local label address through @got (closure code pointers)
+let es_load_code_addr s sym =
+  let key = "L:" ++ sym in
+  let pos = s_pos s in
+  let trel = (pos, 5, key) :: (pos + 4, 6, key) :: s_trel s in
+  let s2 = es_set_trel s trel in
+  let s3 = es_word32 s2 w_adrp in
+  es_word32 s3 (w_ldr + 9 * 32 + 9)
+
+-- ---------- data section ----------
+
+let d_byte s b =
+  let d = if s_pass s == 1 then s_data s else b :: s_data s in
+  es_set_dlen (es_set_data s d) (s_dlen s + 1)
+
+let d_word64 s w =
+  let b0 = w % 256 in
+  let r1 = w / 256 in
+  let b1 = r1 % 256 in
+  let r2 = r1 / 256 in
+  let b2 = r2 % 256 in
+  let b3 = r2 / 256 in
+  d_byte (d_byte (d_byte (d_byte s b0) b1) b2) b3
+
+let rec d_pad s = if s_dlen s % 8 == 0 then s else d_pad (d_byte s 0)
+
+let string_get_i str i = ord (substring str i 1)
+
+-- bytes of a string as a reversed list of byte values
+let rec bytes_of_str str i n acc =
+  if i < n
+  then bytes_of_str str (i + 1) n ((string_get_i str i) :: acc)
+  else acc
+
+-- emit a reversed byte list in original order
+let rec emit_bytes_rev s bs = case bs of
+    [] -> s
+  | b :: rest -> emit_bytes_rev (d_byte s b) rest
+
+let rec push_n_zeros s k =
+  if k == 0 then s else push_n_zeros (d_word64 s 0) (k - 1)
+
+let intern_str s str =
+  let hit = assoc_str str (s_smap s) in
+  if hit != "" then (s, hit)
+  else
+    let sym = "_str" ++ int_to_string (len (s_smap s)) in
+    let n = string_length str in
+    let words = 2 + (n + 7) / 8 in
+    let off = s_dlen s in
+    let s1 = d_word64 s (hdr_w tag_string words) in
+    let s2 = d_word64 s1 n in
+    let s3 = emit_bytes_rev s2 (bytes_of_str str 0 n []) in
+    let s4 = d_pad s3 in
+    let s5 = es_set_dsms s4 ((sym, off) :: s_dsms s4) in
+    let s6 = es_set_smap s5 ((str, sym) :: s_smap s5) in
+    (s6, sym)
+
+let intern_nullary_ctor s name id =
+  let probe = "_ctorinst_" ++ name in
+  if mem_assoc_str probe (s_dsms s) then (s, probe)
+  else
+    let off = s_dlen s in
+    let s1 = d_word64 s (hdr_w tag_adt 2) in
+    let s2 = d_word64 s1 id in
+    let s3 = es_set_dsms s2 ((probe, off) :: s_dsms s2) in
+    (s3, probe)
+
+-- ctor names table for the runtime show(): quads first, bytes after
+let emit_ctor_names s names =
+  let base = s_dlen s in
+  let s0 = push_n_zeros s (len names) in
+  let rec go s i names2 = case names2 of
+      [] -> es_set_dsms s (("_dc_ctor_names", base) :: s_dsms s)
+    | nm :: rest ->
+        let nm_sym = "_nm" ++ int_to_string i in
+        let noff = s_dlen s in
+        let s2 = emit_bytes_rev s (bytes_of_str nm 0 (string_length nm) []) in
+        let s3 = d_pad (d_byte s2 0) in
+        let s4 = es_set_dsms s3 ((nm_sym, noff) :: s_dsms s3) in
+        let s5 = es_set_drel s4 ((base + 8 * i, nm_sym) :: s_drel s4) in
+        go s5 (i + 1) rest
+  in go s0 0 names
+
+-- ---------- globals table ----------
+-- slots: builtins first, then partial ctors (arity > 0), then user defs
+
+let alloc_global s name =
+  let slot = s_nglob s in
+  let s1 = es_set_globs s ((name, slot) :: s_globs s) in
+  es_set_nglob s1 (slot + 1)
+
+let rec alloc_many_globals s names = case names of
+    [] -> s
+  | nm :: rest -> alloc_many_globals (alloc_global s nm) rest
+-- ---------- variable / constructor loads ----------
+
+let emit_gget s slot =
+  let s1 = es_load_const s 0 slot in
+  es_call_rt s1 "dc_gget"
+
+let fill_global s slot =
+  let s1 = es_word32 s (w_orr_mov + 0 * 65536 + 31 * 32 + 1) in
+  let s2 = es_load_const s1 0 slot in
+  es_call_rt s2 "dc_gset"
+
+let load_ctor_value s ct_id ct_ar name =
+  let arity = assoc_ikey name ct_ar in
+  if arity == 0 then
+    let cid = assoc_ikey name ct_id in
+    let (s1, sym) = intern_nullary_ctor s name cid in
+    es_got_ldr s1 sym 0
+  else
+    let slot = assoc_ikey name (s_globs s) in
+    emit_gget s slot
+
+let load_var s sc gname name =
+  let slot = assoc_ikey name sc in
+  if slot != (0 - 1) then es_ldr_slot s 0 slot
+  else
+    let g = assoc_ikey name gname in
+    if g != (0 - 1) then emit_gget s g
+    else
+      -- unbound: abort loudly through rt
+      let s1 = es_load_const s 1 0 in
+      let s2 = es_got_ldr s1 "_dc_unit_block" 1 in
+      es_call_rt s2 "dc_match_fail"
+
+let fst2 t = case t of | (a, b) -> a
+let snd2 t = case t of | (a, b) -> a
+
+-- ---------- pattern matching ----------
+-- CC = (ctor-id assoc, ctor-arity assoc); threaded compile context
+
+let rec c_match s cc sc ns pat reg fail =
+  -- anchor: force the fail label to be Int (avoids stray generalization)
+  let _anch = 0 + fail in
+  case pat of
+    PWild -> (s, sc, ns)
+  | PVar n ->
+      let slot = ns in
+      let s1 = es_str_slot s reg slot in
+      (s1, (n, slot) :: sc, ns + 1)
+  | PInt k ->
+      let s1 = es_load_const s 9 ((k * 4) + 1) in
+      let s2 = es_word32 s1 (w_cmp_reg + reg * 1024 + 9 * 32) in
+      (es_bcond s2 c_ne fail, sc, ns)
+  | PBool b ->
+      let s1 = es_load_const s 9 (if b then 7 else 3) in
+      let s2 = es_word32 s1 (w_cmp_reg + reg * 1024 + 9 * 32) in
+      (es_bcond s2 c_ne fail, sc, ns)
+  | PStr str ->
+      let (s1, sym) = intern_str s str in
+      let s2 = es_got_ldr s1 sym 9 in
+      let s3 = es_word32 s2 (w_cmp_reg + reg * 1024 + 9 * 32) in
+      (es_bcond s3 c_ne fail, sc, ns)
+  | PUnit ->
+      let s1 = use_extern s "_dc_unit_block" in
+      let s2 = es_got_ldr s1 "_dc_unit_block" 9 in
+      let s3 = es_word32 s2 (w_cmp_reg + reg * 1024 + 9 * 32) in
+      (es_bcond s3 c_ne fail, sc, ns)
+  | PTup ps ->
+      let s1 = es_ldr_off s 9 reg 0 in
+      let s2 = es_load_const s1 10 (hdr_w tag_tuple (1 + len ps)) in
+      let s3 = es_word32 s2 (w_cmp_reg + 9 * 1024 + 10 * 32) in
+      let s4 = es_bcond s3 c_ne fail in
+      c_match_fields s cc sc ns ps reg fail 1
+  | PCtor name ps ->
+      let arity = assoc_ikey name (snd2 cc) in
+      if arity == 0 then
+        let cid = assoc_ikey name (fst2 cc) in
+        let (s1, sym) = intern_nullary_ctor s name cid in
+        let s2 = es_got_ldr s1 sym 9 in
+        let s3 = es_word32 s2 (w_cmp_reg + reg * 1024 + 9 * 32) in
+        (es_bcond s3 c_ne fail, sc, ns)
+      else
+        let cid = assoc_ikey name (fst2 cc) in
+        let s1 = es_ldr_off s 9 reg 0 in
+        let s2 = es_load_const s1 10 (hdr_w tag_adt (2 + arity)) in
+        let s3 = es_word32 s2 (w_cmp_reg + 9 * 1024 + 10 * 32) in
+        let s4 = es_bcond s3 c_ne fail in
+        let s5 = es_ldr_off s4 9 reg 8 in
+        let s6 = es_load_const s5 10 cid in
+        let s7 = es_word32 s6 (w_cmp_reg + 9 * 1024 + 10 * 32) in
+        let s8 = es_bcond s7 c_ne fail in
+        c_match_fields s8 cc sc ns ps reg fail 2
+
+and c_match_fields s cc sc ns ps reg fail base = case ps of
+    [] -> (s, sc, ns)
+  | p :: rest ->
+      let s1 = es_ldr_off s 9 reg (8 * base) in
+      let (s2, sc2, ns2) = c_match s1 cc sc ns p 9 fail in
+      c_match_fields s2 cc sc2 ns2 rest reg fail (base + 1)
+
+
+
+-- ============================================================
+-- CODEGEN BACKEND PART B: expression compilation
+-- ============================================================
+
+-- F = (scope assoc newest-first, next-slot); expression result: x0
+let f_scope f = case f of | (a, b) -> a
+let f_ns f = case f of | (a, b) -> b
+
+let f_spill f = case f of
+    | (sc, n) -> ((sc, n + 1), n)
+
+let es_anon_label s =
+  let id = s_lid s in
+  let nm = "_L" ++ int_to_string id in
+  let s1 = es_set_lid s (id + 1) in
+  let s2 = es_set_lnames s1 ((id, (nm, false)) :: s_lnames s1) in
+  (s2, id, nm)
+
+let es_named_label s name exported =
+  let id = s_lid s in
+  let s1 = es_set_lid s (id + 1) in
+  let s2 = es_set_lnames s1 ((id, (name, exported)) :: s_lnames s1) in
+  (s2, id, name)
+
+let rec es_copy_env s i srcs = case srcs of
+    [] -> s
+  | src :: rest ->
+      let s1 = es_ldr_slot s 9 src in
+      let s2 = es_str_off s1 9 0 (24 + 8 * i) in
+      es_copy_env s2 (i + 1) rest
+
+-- allocate closure {code=csym, env=srcs}; result x0
+let es_make_closure s csym srcs =
+  let n = len srcs in
+  let words = 3 + n in
+  let s1 = es_load_const s 0 (words * 8) in
+  let s2 = es_call_rt s1 "dacelo_alloc" in
+  let s3 = es_load_const s2 9 (hdr_w tag_closure words) in
+  let s4 = es_str_off s3 9 0 0 in
+  let s5 = es_load_code_addr s4 csym in
+  let s6 = es_str_off s5 9 0 8 in
+  let s7 = es_load_const s6 9 n in
+  let s8 = es_str_off s7 9 0 16 in
+  es_copy_env s8 0 srcs
+
+let es_mov_rr s rd rn =
+  es_word32 s (w_orr_mov + rn * 65536 + 31 * 32 + rd)
+
+let es_cmp_imm s rn imm =
+  es_word32 s (w_cmp_imm + imm * 1024 + rn * 32 + 31)
+
+let es_cmp_reg s rn rm =
+  es_word32 s (w_cmp_reg + rm * 65536 + rn * 32 + 31)
+
+let es_add_imm_rd s rd rn imm =
+  es_word32 s (w_add_imm + imm * 1024 + rn * 32 + rd)
+
+let es_sub_imm_rd s rd rn imm =
+  es_word32 s (w_sub_imm + imm * 1024 + rn * 32 + rd)
+
+-- rd = (rd << 2) | 1
+let es_retag s rd =
+  let s1 = es_word32 s (w_add_reg + rd * 65536 + 2048 + 31 * 32 + rd) in
+  es_add_imm_rd s1 rd rd 1
+
+-- cset result (0/1) in rd -> bool immediate
+let es_boolify s rd =
+  let s1 = es_word32 s (w_add_reg + rd * 65536 + 2048 + 31 * 32 + rd) in
+  es_add_imm_rd s1 rd rd 3
+
+let es_asr s rd rn sh =
+  es_word32 s (w_asr + sh * 65536 + 63 * 1024 + rn * 32 + rd)
+
+let es_sdiv s rd rn rm =
+  es_word32 s (w_sdiv + rm * 65536 + rn * 32 + rd)
+
+let es_mul s rd rn rm =
+  es_word32 s (w_mul + rm * 65536 + rn * 32 + rd)
+
+let es_msub s rd rn rm ra =
+  es_word32 s (w_msub + rm * 65536 + ra * 1024 + rn * 32 + rd)
+
+let es_add_rr s rd rn rm sh =
+  es_word32 s (w_add_reg + rm * 65536 + sh * 1024 + rn * 32 + rd)
+
+let es_inv_cond cond =
+  if cond - (cond / 2) * 2 == 0 then cond + 1 else cond - 1
+
+let es_cset s rd cond =
+  es_word32 s (w_cset + (es_inv_cond cond) * 4096 + rd)
+
+-- deferred lambda worklist entry
+type Pend = Pend (List Int) (List String) (List String) (List Pat) Expr
+
+let p_labels p = case p of | Pend a _ _ _ _ -> a
+let p_syms p = case p of | Pend _ a _ _ _ -> a
+let p_caps p = case p of | Pend _ _ a _ _ -> a
+let p_params p = case p of | Pend _ _ _ a _ -> a
+let p_body p = case p of | Pend _ _ _ _ a -> a
+
+-- capture-list helpers (env order = oldest-first)
+let rec rev_list xs acc = case xs of
+    [] -> acc
+  | h :: t -> rev_list t (h :: acc)
+
+let rec map_fst sc = case sc of
+    [] -> []
+  | kv :: rest -> case kv of
+      | (n2, _) -> n2 :: map_fst rest
+
+let rec map_snd sc = case sc of
+    [] -> []
+  | kv :: rest -> case kv of
+      | (_, v2) -> v2 :: map_snd rest
+
+let cap_names sc = rev_list (map_fst sc) []
+let cap_slots sc = rev_list (map_snd sc) []
+
+let rec zip_scopes names off acc = case names of
+    [] -> acc
+
+let rec nth_i xs i = case xs of
+    [] -> 0 - 1
+  | h :: rest -> if i == 0 then h else nth_i rest (i - 1)
+
+let rec nth_str xs i = case xs of
+    [] -> ""
+  | h :: rest -> if i == 0 then h else nth_str rest (i - 1)
+
+let head_str xs = case xs of
+    [] -> "_dead"
+  | h :: _ -> h
+
+let rec seq_list m acc = if m == 0 then acc else seq_list (m - 1) (m - 1 :: acc)
+
+let rec nth_pat ps i = case ps of
+    [] -> PWild
+  | p :: rest -> if i == 0 then p else nth_pat rest (i - 1)
+
+let pat_var_opt p = case p of
+    | PVar nm -> nm
+    | _ -> ""
+
+-- ---------- the mutually recursive compiler core ----------
+-- force compile-context components to concrete types (works around
+-- accidental generalization leakage in large and-groups)
+let cc_anchor cc =
+  let i0 = case fst2 cc of [] -> 0 - 1 | kv :: _ -> case kv of | (_, v) -> v in
+  let a0 = case snd2 cc of [] -> 0 - 1 | kv :: _ -> case kv of | (_, v) -> v in
+  let _a = 0 + i0 + a0 in
+  ()
+
+
+-- NOTE: with the step-3 leak fixed in the host checker, same-named
+-- parameters across members no longer poison each other.
+
+
+-- ============================================================
+-- ASSEMBLY TEXT EMISSION
+-- We emit ARM64 assembly text; the system assembler/linker handles
+-- encoding, layout, and relocations. This is the same architecture
+-- as GCC/Clang — all compiler decisions are self-hosted.
+-- ============================================================
+
+-- state: (reversed-lines, pending-lambdas, globals, next-global-slot,
+--          lambda-counter)
+type AS = AS (List String) (List Pend) (List (String, Int)) Int Int
+
+let a_lines t = case t of | AS a _ _ _ _ -> a
+let a_pend t = case t of | AS _ a _ _ _ -> a
+let a_globs t = case t of | AS _ _ a _ _ -> a
+let a_nglob t = case t of | AS _ _ _ a _ -> a
+let a_lamc t = case t of | AS _ _ _ _ a -> a
+
+let a_set_lines t v = case t of | AS _ b c d e -> AS v b c d e
+let a_set_pend t v = case t of | AS a _ c d e -> AS a v c d e
+let a_set_globs t v = case t of | AS a b _ d e -> AS a b v d e
+let a_set_nglob t v = case t of | AS a b c _ e -> AS a b c v e
+let a_set_lamc t v = case t of | AS a b c d _ -> AS a b c d v
+
+-- globally unique label id: immune to state rewinds anywhere in the pipeline
+let a_fresh_id t = let v = a_lamc t in (a_set_lamc t (v + 1), v)
+
+let as_new = AS [] [] [] 0 0
+
+let a_line t s2 = a_set_lines t (s2 :: a_lines t)
+let a_inst t i = a_line t ("  " ++ i)
+let a_label t nm = a_line t (nm ++ ":")
+let a_globl t nm = a_line t (".globl " ++ nm)
+
+-- F = (scope assoc newest-first, next-slot); result x0
+let af_scope f2 = case f2 of | (a, b) -> a
+let af_ns f2 = case f2 of | (a, b) -> b
+
+let af_spill f2 = case f2 of
+    | (sc, n) -> ((sc, n + 1), n)
+
+-- load 64-bit constant into register rd.
+-- negatives: MOVN covers [-65536,-1]; anything wider is built from the
+-- four unsigned 16-bit limbs of the two's complement (movz + movk chain).
+let ts_load_const t rd v =
+  if v >= 0 && v <= 65535 then
+    a_inst t ("mov x" ++ int_to_string rd ++ ", #" ++ int_to_string v)
+  else if v < 0 && v >= -65536 then
+    a_inst t ("movn x" ++ int_to_string rd ++ ", #" ++
+              int_to_string ((0 - v) - 1))
+  else
+    let r0 = v % 65536 in
+    let r0 = if r0 < 0 then r0 + 65536 else r0 in
+    let w1 = (v - r0) / 65536 in
+    let r1 = w1 % 65536 in
+    let r1 = if r1 < 0 then r1 + 65536 else r1 in
+    let w2 = (w1 - r1) / 65536 in
+    let r2 = w2 % 65536 in
+    let r2 = if r2 < 0 then r2 + 65536 else r2 in
+    let w3 = (w2 - r2) / 65536 in
+    let r3 = w3 % 65536 in
+    let r3 = if r3 < 0 then r3 + 65536 else r3 in
+    let s1 = a_inst t ("movz x" ++ int_to_string rd ++ ", #" ++
+                        int_to_string r0) in
+    let s2 = if r1 != 0 then a_inst s1 ("movk x" ++ int_to_string rd ++
+              ", #" ++ int_to_string r1 ++ ", lsl #16") else s1 in
+    let s3 = if r2 != 0 then a_inst s2 ("movk x" ++ int_to_string rd ++
+              ", #" ++ int_to_string r2 ++ ", lsl #32") else s2 in
+    let s4 = if r3 != 0 then a_inst s3 ("movk x" ++ int_to_string rd ++
+              ", #" ++ int_to_string r3 ++ ", lsl #48") else s3 in
+    s4
+
+let ts_str_slot t reg slot =
+  a_inst t ("str x" ++ int_to_string reg ++ ", [sp, #" ++
+            int_to_string (8 * slot) ++ "]")
+
+let ts_ldr_slot t reg slot =
+  a_inst t ("ldr x" ++ int_to_string reg ++ ", [sp, #" ++
+            int_to_string (8 * slot) ++ "]")
+
+let ts_ldr_off t reg base off =
+  a_inst t ("ldr x" ++ int_to_string reg ++ ", [x" ++
+            int_to_string base ++ ", #" ++ int_to_string off ++ "]")
+
+let ts_str_off t reg base off =
+  a_inst t ("str x" ++ int_to_string reg ++ ", [x" ++
+            int_to_string base ++ ", #" ++ int_to_string off ++ "]")
+
+let ts_mov_rr t rd rn =
+  a_inst t ("mov x" ++ int_to_string rd ++ ", x" ++ int_to_string rn)
+
+let ts_cmp_imm t rn imm =
+  a_inst t ("cmp x" ++ int_to_string rn ++ ", #" ++ int_to_string imm)
+
+let ts_cmp_reg t rn rm =
+  a_inst t ("cmp x" ++ int_to_string rn ++ ", x" ++ int_to_string rm)
+
+let ts_add_imm t rd rn imm =
+  a_inst t ("add x" ++ int_to_string rd ++ ", x" ++ int_to_string rn ++
+            ", #" ++ int_to_string imm)
+
+let ts_sub_imm t rd rn imm =
+  a_inst t ("sub x" ++ int_to_string rd ++ ", x" ++ int_to_string rn ++
+            ", #" ++ int_to_string imm)
+
+let ts_retag t rd =
+  let s1 = a_inst t ("add x" ++ int_to_string rd ++ ", xzr, x" ++
+                     int_to_string rd ++ ", lsl #2") in
+  a_inst s1 ("add x" ++ int_to_string rd ++ ", x" ++ int_to_string rd ++
+             ", #1")
+
+let ts_boolify t rd =
+  let s1 = a_inst t ("add x" ++ int_to_string rd ++ ", xzr, x" ++
+                     int_to_string rd ++ ", lsl #2") in
+  a_inst s1 ("add x" ++ int_to_string rd ++ ", x" ++ int_to_string rd ++
+             ", #3")
+
+let ts_asr t rd rn sh =
+  a_inst t ("asr x" ++ int_to_string rd ++ ", x" ++ int_to_string rn ++
+            ", #" ++ int_to_string sh)
+
+let ts_sdiv t rd rn rm =
+  a_inst t ("sdiv x" ++ int_to_string rd ++ ", x" ++ int_to_string rn ++
+            ", x" ++ int_to_string rm)
+
+let ts_mul t rd rn rm =
+  a_inst t ("mul x" ++ int_to_string rd ++ ", x" ++ int_to_string rn ++
+            ", x" ++ int_to_string rm)
+
+let ts_msub t rd rn rm ra =
+  a_inst t ("msub x" ++ int_to_string rd ++ ", x" ++ int_to_string rn ++
+            ", x" ++ int_to_string rm ++ ", x" ++ int_to_string ra)
+
+let ts_add_rr t rd rn rm =
+  a_inst t ("add x" ++ int_to_string rd ++ ", x" ++ int_to_string rn ++
+            ", x" ++ int_to_string rm)
+
+let ts_cset t rd cond =
+  let inv = if cond - (cond / 2) * 2 == 0 then cond + 1 else cond - 1 in
+  let cc_name = if inv == 0 then "eq" else if inv == 1 then "ne"
+                else if inv == 10 then "ge" else if inv == 11 then "lt"
+                else if inv == 12 then "gt" else "le" in
+  a_inst t ("cset x" ++ int_to_string rd ++ ", " ++ cc_name)
+
+let ts_b t target = a_inst t ("b " ++ target)
+let ts_bcond t cond target =
+  let cn = if cond == 0 then "eq" else if cond == 1 then "ne"
+           else if cond == 10 then "ge" else if cond == 11 then "lt"
+           else if cond == 12 then "gt" else "le" in
+  a_inst t ("b." ++ cn ++ " " ++ target)
+let ts_blr t reg = a_inst t ("blr x" ++ int_to_string reg)
+let ts_bl t target = a_inst t ("bl " ++ target)
+
+let a_call_rt t name = a_inst t ("bl _" ++ name)
+
+let rec es_copy_env_asm t i srcs = case srcs of
+    [] -> t
+  | src :: rest ->
+      let s1 = ts_ldr_slot t 9 src in
+      let s2 = ts_str_off s1 9 0 (24 + 8 * i) in
+      es_copy_env_asm s2 (i + 1) rest
+
+-- allocate closure {code=csym, env=srcs}; result x0
+let a_make_closure t csym srcs =
+  let n = len srcs in
+  let words = 3 + n in
+  let t1 = ts_load_const t 0 (words * 8) in
+  let t2 = a_call_rt t1 "dacelo_alloc" in
+  let t3 = ts_load_const t2 9 ((256 * words) + tag_closure) in
+  let t4 = ts_str_off t3 9 0 0 in
+  let t5 = a_inst t4 ("adrp x9, " ++ csym ++ "@GOTPAGE") in
+  let t6 = a_inst t5 ("ldr x9, [x9, " ++ csym ++ "@GOTPAGEOFF]") in
+  let t7 = ts_str_off t6 9 0 8 in
+  let t8 = ts_load_const t7 9 n in
+  let t9 = ts_str_off t8 9 0 16 in
+  es_copy_env_asm t9 0 srcs
+
+-- allocate closure {code=lbl, env=capture slots}; result x0.
+-- layout: [hdr@0][code@8][env_size@16][env words @24..]
+let rec mk_closure_seq t lbl caps =
+  let n = len caps in
+  let s1 = ts_load_const t 0 ((3 + n) * 8) in
+  let s2 = a_call_rt s1 "dc_alloc_bytes" in
+  let s3 = ts_load_const s2 9 ((256 * (3 + n)) + tag_closure) in
+  let s4 = ts_str_off s3 9 0 0 in
+  let s5 = a_inst s4 ("adrp x9, " ++ lbl ++ "@GOTPAGE") in
+  let s6 = a_inst s5 ("ldr x9, [x9, " ++ lbl ++ "@GOTPAGEOFF]") in
+  let s7 = ts_str_off s6 9 0 8 in
+  let s8 = ts_load_const s7 9 n in
+  let s9 = ts_str_off s8 9 0 16 in
+  let rec copy_env t10 j cs = case cs of
+      [] -> t10
+    | slot :: rest ->
+        let ta = ts_ldr_slot t10 9 slot in
+        copy_env (ts_str_off ta 9 0 (24 + (8 * j))) (j + 1) rest
+  in
+  copy_env s9 0 caps
+
+
+
+-- intern a string constant into .data; returns its label
+let a_intern_str t str =
+  let lbl = "_astr" ++ int_to_string (len (a_lines t)) in
+  let n = string_length str in
+  let words = 2 + (n + 7) / 8 in
+  let t0 = a_inst t ".section __DATA,__data" in
+  let t0b = a_inst t0 ".p2align 3" in
+  let t1 = a_line t0b (lbl ++ ":") in
+  let t2 = a_inst t1 (".quad " ++ int_to_string ((words * 256) + tag_string)) in
+  let t3 = a_inst t2 (".quad " ++ int_to_string n) in
+  let bs = rev_list (bytes_of_str str 0 n []) [] in
+  let rec emit_bs t4 bs2 = case bs2 of
+      [] -> t4
+    | b :: rest -> emit_bs (a_inst t4 (".byte " ++ int_to_string b)) rest
+  in
+  let t5 = emit_bs t3 bs in
+  let t6 = a_inst t5 ".p2align 3" in
+  let t7 = a_inst t6 ".section __TEXT,__text,regular,pure_instructions" in
+  (t7, lbl)
+
+let a_intern_nullary t name cid =
+  let reg_key = "_nullreg_" ++ name in
+  let prev = assoc_ikey reg_key (a_globs t) in
+  if prev != (0 - 1) then (t, "_ctorinst_" ++ name)
+  else
+  let lbl = "_ctorinst_" ++ name in
+  let t0 = a_inst t ".section __DATA,__data" in
+  let t0b = a_inst t0 ".p2align 3" in
+  let t1 = a_label t0b lbl in
+  let t2 = a_inst t1 (".quad " ++ int_to_string ((2 * 256) + tag_adt)) in
+  let t3 = a_inst t2 (".quad " ++ int_to_string cid) in
+  let t4 = a_inst t3 ".p2align 3" in
+  let t5 = a_inst t4 ".section __TEXT,__text,regular,pure_instructions" in
+  let t6 = a_set_globs t5 ((reg_key, 1) :: a_globs t5) in
+  (t6, lbl)
+
+let alloc_global_a t name =
+  let slot = a_nglob t in
+  let t1 = a_set_globs t ((name, slot) :: a_globs t) in
+  a_set_nglob t1 (slot + 1)
+-- ---------- pattern matching compilation (assembly text) ----------
+
+-- ============================================================
+-- COMPLETE COMPILER CORE (assembly text output)
+-- ============================================================
+
+-- ---------- pattern test emitter ----------
+-- Standalone: does NOT call ce (avoids mutual recursion complexity).
+-- Emits comparison + branch instructions for one pattern level.
+-- Returns updated state. Binds variables by storing to new slots.
+
+let rec pm_emit st ct_id ct_ar sc ns pat reg flbl = case pat of
+    PWild -> (st, sc, ns)
+  | PVar n ->
+      let s1 = ts_str_slot st reg ns in
+      (s1, (n, ns) :: sc, ns + 1)
+  | PInt k ->
+      let s1 = ts_load_const st 9 ((k * 4) + 1) in
+      let s2 = ts_cmp_reg s1 0 9 in
+      (ts_bcond s2 c_ne flbl, sc, ns)
+  | PBool b ->
+      let s1 = ts_load_const st 9 (if b then 7 else 3) in
+      let s2 = ts_cmp_reg s1 0 9 in
+      (ts_bcond s2 c_ne flbl, sc, ns)
+  | PStr str ->
+      let (s1, lbl) = a_intern_str st str in
+      let s2 = a_inst s1 ("adrp x9, " ++ lbl ++ "@GOTPAGE") in
+      let s3 = a_inst s2 ("ldr x9, [x9, " ++ lbl ++ "@GOTPAGEOFF]") in
+      let s4 = ts_cmp_reg s3 0 9 in
+      (ts_bcond s4 c_ne flbl, sc, ns)
+  | PUnit ->
+      let s1 = a_inst st ("adrp x9, _dc_unit_block@GOTPAGE") in
+      let s2 = a_inst s1 ("ldr x9, [x9, _dc_unit_block@GOTPAGEOFF]") in
+      let s3 = ts_cmp_reg s2 0 9 in
+      (ts_bcond s3 c_ne flbl, sc, ns)
+  | PTup ps ->
+      let s1 = ts_load_const st 10 ((256 * (1 + len ps)) + tag_tuple) in
+      let s2 = ts_ldr_off s1 9 reg 0 in
+      let s3 = ts_cmp_reg s2 0 10 in
+      let s4 = ts_bcond s3 c_ne flbl in
+      pm_fields st ct_id ct_ar sc ns ps reg flbl 1
+  | PCtor nm ps ->
+      let ar = assoc_ikey nm ct_ar in
+      if ar == 0 then
+        let cid = assoc_ikey nm ct_id in
+        let (s1, lbl) = a_intern_nullary st nm cid in
+        let s2 = a_inst s1 ("adrp x9, " ++ lbl ++ "@GOTPAGE") in
+        let s3 = a_inst s2 ("ldr x9, [x9, " ++ lbl ++ "@GOTPAGEOFF]") in
+        let s4 = ts_cmp_reg s3 0 9 in
+        (ts_bcond s4 c_ne flbl, sc, ns)
+      else
+        let cid = assoc_ikey nm ct_id in
+        let s1 = ts_load_const st 10 ((256 * (2 + ar)) + tag_adt) in
+        let s2 = ts_ldr_off s1 9 reg 0 in
+        let s3 = ts_cmp_reg s2 0 10 in
+        let s4 = ts_bcond s3 c_ne flbl in
+        let s5 = ts_ldr_off s4 9 reg 8 in
+        let s6 = ts_load_const s5 10 cid in
+        let s7 = ts_cmp_reg s6 0 10 in
+        let s8 = ts_bcond s7 c_ne flbl in
+        pm_fields s8 ct_id ct_ar sc ns ps reg flbl 2
+
+and pm_fields st ct_id ct_ar sc ns ps reg flbl base = case ps of
+    [] -> (st, sc, ns)
+  | p :: rest ->
+      let s1 = ts_ldr_off st 9 reg (8 * base) in
+      let (s2, sc2, ns2) = pm_emit s1 ct_id ct_ar sc ns p 9 flbl in
+      pm_fields s2 ct_id ct_ar sc2 ns2 rest reg flbl (base + 1)
+
+
+-- ---------- pattern matching compiler ----------
+-- Convention: the value being matched arrives in register `reg`.
+-- Compound patterns (PTup / PCtor) immediately spill it to a fresh frame
+-- slot and reload through that slot, so nested matches (which reuse x9 as
+-- scratch) can never clobber the base pointer.
+
+let rec cm_asm st cid_tbl ar_tbl sc ns pat reg flbl = case pat of
+    PWild -> (st, sc, ns)
+  | PVar n ->
+      let s1 = ts_str_slot st reg ns in
+      (s1, (n, ns) :: sc, ns + 1)
+  | PInt k ->
+      let s1 = ts_load_const st 10 ((k * 4) + 1) in
+      let s2 = ts_cmp_reg s1 reg 10 in
+      (ts_bcond s2 c_ne flbl, sc, ns)
+  | PBool b ->
+      let s1 = ts_load_const st 10 (if b then 7 else 3) in
+      let s2 = ts_cmp_reg s1 reg 10 in
+      (ts_bcond s2 c_ne flbl, sc, ns)
+  | PStr str ->
+      -- string literals must be compared by CONTENT: lexer tokens are fresh
+      -- heap objects that can never be pointer-equal to the interned static.
+      -- dc_val_eq is a C call, so keep the scrutinee in a spill slot.
+      let (s1, lbl) = a_intern_str st str in
+      let sv = ns in
+      let s2 = ts_str_slot s1 reg sv in
+      let s3 = a_inst s2 ("adrp x0, " ++ lbl ++ "@GOTPAGE") in
+      let s4 = a_inst s3 ("ldr x0, [x0, " ++ lbl ++ "@GOTPAGEOFF]") in
+      let s5 = ts_ldr_slot s4 1 sv in
+      let s6 = a_call_rt s5 "dc_val_eq" in
+      let s7 = ts_cmp_imm s6 0 7 in
+      (ts_bcond s7 c_ne flbl, sc, ns)
+  | PUnit ->
+      let s1 = a_inst st ("adrp x10, _dc_unit_block@GOTPAGE") in
+      let s2 = a_inst s1 ("ldr x10, [x10, _dc_unit_block@GOTPAGEOFF]") in
+      let s3 = ts_cmp_reg s2 reg 10 in
+      (ts_bcond s3 c_ne flbl, sc, ns)
+
+  | PTup ps ->
+      let sv = ns in
+      let ta = ts_str_slot st reg sv in
+      -- header check: words = 1 + len(ps), tag_tuple
+      let tb = ts_ldr_slot ta 9 sv in
+      let tc = ts_ldr_off tb 9 9 0 in
+      let td = ts_load_const tc 10 ((256 * (1 + len ps)) + tag_tuple) in
+      let te = ts_cmp_reg td 9 10 in
+      let tf = ts_bcond te c_ne flbl in
+      let rec fld t j cur_sc cur_ns rest_ps = case rest_ps of
+          [] -> (t, cur_sc, cur_ns)
+        | p2 :: rest2 ->
+            let tg = ts_ldr_slot t 9 sv in
+            let th = ts_ldr_off tg 9 9 (8 * (j + 1)) in
+            let (t2, sc3, ns3) =
+              cm_asm th cid_tbl ar_tbl cur_sc cur_ns p2 9 flbl in
+            fld t2 (j + 1) sc3 ns3 rest2
+      in
+      fld tf 0 sc (ns + 1) ps
+
+  | PCtor nm ps ->
+      let ar = assoc_ikey nm ar_tbl in
+      if ar == 0 then
+        let cid = assoc_ikey nm cid_tbl in
+        let sym_lbl = "_ctorinst_" ++ nm in
+        let s2 = a_inst st ("adrp x9, " ++ sym_lbl ++ "@GOTPAGE") in
+        let s3 = a_inst s2 ("ldr x9, [x9, " ++ sym_lbl ++ "@GOTPAGEOFF]") in
+        let s4 = ts_cmp_reg s3 reg 9 in
+        (ts_bcond s4 c_ne flbl, sc, ns)
+      else
+        let cid = assoc_ikey nm cid_tbl in
+        let sv = ns in
+        let ta = ts_str_slot st reg sv in
+        -- header check: words = 2 + arity, tag_adt
+        let tb = ts_ldr_slot ta 9 sv in
+        let tc = ts_ldr_off tb 9 9 0 in
+        let td = ts_load_const tc 10 ((256 * (2 + ar)) + tag_adt) in
+        let te = ts_cmp_reg td 9 10 in
+        let tf = ts_bcond te c_ne flbl in
+        -- ctor id check: block[1]
+        let tg = ts_ldr_slot tf 9 sv in
+        let th = ts_ldr_off tg 9 9 8 in
+        let ti = ts_load_const th 10 cid in
+        let tj = ts_cmp_reg ti 9 10 in
+        let tk = ts_bcond tj c_ne flbl in
+        let rec fld t j cur_sc cur_ns rest_ps = case rest_ps of
+            [] -> (t, cur_sc, cur_ns)
+          | p2 :: rest2 ->
+              let tl = ts_ldr_slot t 9 sv in
+              let tm = ts_ldr_off tl 9 9 (8 * (j + 2)) in
+              let (t2, sc3, ns3) =
+                cm_asm tm cid_tbl ar_tbl cur_sc cur_ns p2 9 flbl in
+              fld t2 (j + 1) sc3 ns3 rest2
+        in
+        fld tk 0 sc (ns + 1) ps
+
+and cmf_asm st cid_tbl ar_tbl sc ns ps reg flbl base = case ps of
+    [] -> (st, sc, ns)
+  | p :: rest ->
+      let s1 = ts_ldr_off st 9 reg (8 * base) in
+      let (s2, sc2, ns2) = cm_asm s1 cid_tbl ar_tbl sc ns p 9 flbl in
+      cmf_asm s2 cid_tbl ar_tbl sc2 ns2 rest reg flbl (base + 1)
+
+
+let rec zip_ids2_z names i = case names of
+    [] -> []
+  | nm :: rest -> (nm, i) :: zip_ids2_z rest (i + 1)
+
+-- ---------- free variables & pattern helpers ----------
+let rec mem_str_z x xs = case xs of
+    [] -> false
+  | h :: rest -> if h == x then true else mem_str_z x rest
+
+let rec union_str a b = case a of
+    [] -> b
+  | h :: rest -> if mem_str_z h b then union_str rest b else union_str rest (h :: b)
+
+let rec diff_str a b = case a of
+    [] -> []
+  | h :: rest -> if mem_str_z h b then diff_str rest b else h :: diff_str rest b
+
+let rec pat_bound p acc = case p of
+    PWild -> acc
+  | PVar n -> n :: acc
+  | PInt k -> acc
+  | PBool b -> acc
+  | PStr s -> acc
+  | PUnit -> acc
+  | PTup ps -> pv_list ps acc
+  | PCtor nm ps -> pv_list ps acc
+
+and pv_list ps acc = case ps of
+    [] -> acc
+  | p :: rest -> pv_list rest (pat_bound p acc)
+
+-- Free variables in BOUND-SET style: fv_expr e bound = names mentioned in e
+-- that are not covered by `bound` (params/lets/lambdas extend bound going down).
+let rec fv_expr e bound = case e of
+    EInt n -> []
+  | EBool b -> []
+  | EStr s -> []
+  | EUnit -> []
+  | ECtor nm -> []
+  | EVar n -> if mem_str_z n bound then [] else n :: []
+  | EApp f a -> union_str (fv_expr f bound) (fv_expr a bound)
+  | EBin op l r -> union_str (fv_expr l bound) (fv_expr r bound)
+  | EIf c t el ->
+      union_str (union_str (fv_expr c bound) (fv_expr t bound)) (fv_expr el bound)
+  | ECase scr brs ->
+      let rec go_br bs ac = case bs of
+          [] -> ac
+        | br :: rest -> case br of
+            | (p, b) ->
+                go_br rest (union_str ac (diff_str (fv_expr b bound) (pat_bound p [])))
+      in go_br brs (fv_expr scr bound)
+  | ELet isrec nm rhs body ->
+      union_str (fv_expr rhs bound) (diff_str (fv_expr body (nm :: bound)) [])
+  | ELam p b -> diff_str (fv_expr b (union_str (pat_bound p []) bound)) []
+  | ETup es -> fv_list es bound
+
+and fv_list es bound = case es of
+    [] -> []
+  | e :: rest -> union_str (fv_expr e bound) (fv_list rest bound)
+
+-- ---------- expression compiler ----------
+-- State threading convention: AS holds REVERSED lines; every nested compile
+-- call must receive the LATEST state so instructions keep program order.
+-- Spill/frame slots come from the ns counter; labels use len(a_lines).
+
+let rec ce st cid_tbl ar_tbl sc ns e = case e of
+    EInt n -> (ts_load_const st 0 ((n * 4) + 1), sc, ns)
+  | EBool b -> (ts_load_const st 0 (if b then 7 else 3), sc, ns)
+  | EStr str ->
+      let (s1, lbl) = a_intern_str st str in
+      let s2 = a_inst s1 ("adrp x0, " ++ lbl ++ "@GOTPAGE") in
+      (a_inst s2 ("ldr x0, [x0, " ++ lbl ++ "@GOTPAGEOFF]"), sc, ns)
+  | EUnit ->
+      let s1 = a_inst st ("adrp x0, _dc_unit_block@GOTPAGE") in
+      (a_inst s1 ("ldr x0, [x0, _dc_unit_block@GOTPAGEOFF]"), sc, ns)
+  | EVar n ->
+      let slot = assoc_ikey n sc in
+      if slot != (0 - 1) then (ts_ldr_slot st 0 slot, sc, ns)
+      else
+        let g = assoc_ikey n (a_globs st) in
+        if g != (0 - 1) then
+          let s2 = ts_load_const st 0 g in
+          (a_call_rt s2 "dc_gget", sc, ns)
+        else (st, sc, ns)
+  | ECtor nm ->
+      let ar = assoc_ikey nm ar_tbl in
+      if ar == 0 then
+        let cid = assoc_ikey nm cid_tbl in
+        let (s1, lbl) = a_intern_nullary st nm cid in
+        let s2 = a_inst s1 ("adrp x0, " ++ lbl ++ "@GOTPAGE") in
+        (a_inst s2 ("ldr x0, [x0, " ++ lbl ++ "@GOTPAGEOFF]"), sc, ns)
+      else
+        let slot = assoc_ikey nm (a_globs st) in
+        let s1 = ts_load_const st 0 slot in
+        (a_call_rt s1 "dc_gget", sc, ns)
+  | EApp fe ae ->
+      let (s1, _, _) = ce st cid_tbl ar_tbl sc ns fe in
+      let sp_slot = ns in
+      let s2 = ts_str_slot s1 0 sp_slot in
+      let (s3, _, _) = ce s2 cid_tbl ar_tbl sc (ns + 1) ae in
+      let s4 = ts_mov_rr s3 1 0 in
+      let s5 = ts_ldr_slot s4 0 sp_slot in
+      let s6 = ts_ldr_off s5 9 0 8 in
+      (ts_blr s6 9, sc, ns)
+  | EBin op l r -> c_binop st cid_tbl ar_tbl sc ns op l r
+  | EIf c th el ->
+      let (st0, eno) = a_fresh_id st in
+      let else_lbl = "Lelse" ++ int_to_string eno in
+      let end_lbl = "Lendif" ++ int_to_string eno in
+      let (s1, _, _) = ce st0 cid_tbl ar_tbl sc ns c in
+      let s2 = ts_cmp_imm s1 0 7 in
+      let s3 = ts_bcond s2 c_ne else_lbl in
+      let (s4, _, _) = ce s3 cid_tbl ar_tbl sc ns th in
+      let s5 = ts_b s4 end_lbl in
+      let s6 = a_label s5 else_lbl in
+      let (s7, _, _) = ce s6 cid_tbl ar_tbl sc ns el in
+      (a_label s7 end_lbl, sc, ns)
+  | ECase scrut branches ->
+      let (st0, eno) = a_fresh_id st in
+      let end_lbl = "Lcend" ++ int_to_string eno in
+      let (s0, _, _) = ce st0 cid_tbl ar_tbl sc ns scrut in
+      -- spill scrutinee once: individual branch checks clobber x0
+      let sa = ts_str_slot s0 0 ns in
+      go_cases sa cid_tbl ar_tbl sc (ns + 1) ns branches 0 end_lbl
+  | ELet true name rhs body ->
+      -- local let rec: bind the name to a FRESH GLOBAL SLOT so recursive
+      -- self-references resolve via dc_gget at run time (after the closure
+      -- has been stored). Frame-slot binding would break captures.
+      -- live in a high slot region far away from real def slots.
+      -- draw ids from the label counter so a_nglob (def slots) stays put
+      let (st0b, uid) = a_fresh_id st in
+      let gslot = 30000 + uid in
+      let stB = a_set_globs st0b ((name, gslot) :: a_globs st0b) in
+      let (s1, sc1, ns1) = ce stB cid_tbl ar_tbl sc ns rhs in
+      let s2 = ts_mov_rr s1 1 0 in
+      let s3 = ts_load_const s2 0 gslot in
+      let s4 = a_call_rt s3 "dc_gset" in
+      ce s4 cid_tbl ar_tbl sc1 ns1 body
+  | ELet false name rhs body ->
+        let (s1, _, _) = ce st cid_tbl ar_tbl sc ns rhs in
+        let slot = ns in
+        let s2 = ts_str_slot s1 0 slot in
+        ce s2 cid_tbl ar_tbl ((name, slot) :: sc) (ns + 1) body
+  | ELam pat body ->
+      -- anonymous lambda: allocate closure capturing free vars from frame.
+      -- caps is a list of (name, enclosing-frame-slot) pairs; names that are
+      -- actually globals (top-level defs/builtins) are NOT captured — the
+      -- body resolves them via dc_gget at run time like any other EVar.
+      let (st0, eno) = a_fresh_id st in
+      let lbl = "_lam" ++ int_to_string eno in
+      let patdbg = case pat of
+          | PWild -> "WILD"
+          | PVar n -> "VAR:" ++ n
+          | _ -> "OTHER" in
+      let fvs = fv_expr body (pat_bound pat []) in
+      let rec pick acc fs = case fs of
+          [] -> rev_list acc []
+        | fv :: rest ->
+            let sl = assoc_ikey fv sc in
+            pick (if sl == (0 - 1) then acc else (fv, sl) :: acc) rest
+      in
+      let caps = pick [] fvs in
+      let nc = len caps in
+      -- Out-of-line placement: lines are PREPENDED, so emit in reverse of
+      -- program order. Desired layout: [alloc][b skip][fn body][skip:]
+      let skip_lbl = "Lamskip" ++ int_to_string eno in
+      let s_bra = a_inst st0 ("b " ++ skip_lbl) in
+      let t0 = a_line s_bra ".p2align 2" in
+      let t1 = a_label t0 lbl in
+      let t1b = a_inst t1 ("// LAM " ++ lbl ++ " pat=" ++ patdbg) in
+      let t2 = a_line t1b "  stp x29, x30, [sp, #-16]!" in
+      let t3 = a_inst t2 "mov x29, sp" in
+      let t4 = a_inst t3 ("sub sp, sp, #" ++ int_to_string frame_bytes) in
+      let flbl = "Lpfail" ++ int_to_string eno in
+      let (t5, sc2, ns2) = cm_asm t4 cid_tbl ar_tbl [] 0 pat 1 flbl in
+      -- load captured env words into frame slots ns2..ns2+nc-1
+      let rec ld_env tt j cs = case cs of
+          [] -> tt
+        | kv :: rest ->
+            let ta = ts_ldr_off tt 9 0 (24 + (8 * j)) in
+            ld_env (ts_str_slot ta 9 (ns2 + j)) (j + 1) rest
+      in
+      let t6 = ld_env t5 0 caps in
+      let sc4 = app_list sc2 (zip_ids2_z (map_fst caps) ns2) in
+      let (t7, _, _) = ce t6 cid_tbl ar_tbl sc4 (ns2 + nc) body in
+      let t8 = a_inst t7 ("add sp, sp, #" ++ int_to_string frame_bytes) in
+      let t9 = a_line t8 "  ldp x29, x30, [sp], #16" in
+      let t10 = a_line t9 "  ret" in
+      let t11 = a_label t10 flbl in
+      let t12 = a_call_rt t11 "dc_match_fail" in
+      let t13 = a_label (a_line t12 "  ret") skip_lbl in
+      -- closure allocation prepended last => executes FIRST
+      (mk_closure_seq t13 lbl (map_snd caps), sc, ns)
+  | ETup es ->
+      -- tuple CONSTRUCTION: evaluate every element, then allocate a block
+      -- [hdr][e1][e2].. (the `;` sequencing reading of source is compatible:
+      -- side effects fire in order and callers that ignore the value are
+      -- unaffected)
+      let cnt = len es in
+      let rec go t2 idx slts es2 = case es2 of
+          [] -> (t2, rev_list slts [])
+        | e :: rest ->
+            let (t3, _, _) = ce t2 cid_tbl ar_tbl sc (ns + idx) e in
+            let t4 = ts_str_slot t3 0 (ns + idx) in
+            go t4 (idx + 1) ((ns + idx) :: slts) rest
+      in
+      let (sa, slots_rev) = go st 0 [] es in
+      let slots = slots_rev in
+      let s1 = ts_load_const sa 0 ((1 + cnt) * 8) in
+      let s2 = a_call_rt s1 "dacelo_alloc" in
+      let s3 = ts_load_const s2 9 ((256 * (1 + cnt)) + tag_tuple) in
+      let s4 = ts_str_off s3 9 0 0 in
+      let rec fill t5 j cs = case cs of
+          [] -> t5
+        | slotv :: rest ->
+            let ta = ts_ldr_slot t5 9 slotv in
+            fill (ts_str_off ta 9 0 (8 * (j + 1))) (j + 1) rest
+      in
+      (fill s4 0 slots, sc, ns)
+
+and seq_exprs st cid_tbl ar_tbl sc ns es = case es of
+    [] -> (ts_load_const st 0 1, sc, ns)
+  | e :: [] -> ce st cid_tbl ar_tbl sc ns e
+  | e :: rest ->
+      let (s1, _, _) = ce st cid_tbl ar_tbl sc ns e in
+      seq_exprs s1 cid_tbl ar_tbl sc ns rest
+
+and go_cases st cid_tbl ar_tbl sc ns base branches idx end_lbl =
+  case branches of
+    [] -> (a_label (a_call_rt st "dc_match_fail") end_lbl, sc, ns)
+  | br :: rest -> case br of
+      | (pat, body) ->
+          let (stg, gid) = a_fresh_id st in
+          let next_lbl = "Lcn" ++ int_to_string gid in
+          -- reload scrutinee from base slot every time: previous branch's
+          -- checks/binds may have clobbered x0
+          let tb = ts_ldr_slot stg 0 base in
+          let (sa, sc2, ns2) = cm_asm tb cid_tbl ar_tbl sc ns pat 0 next_lbl in
+          let (sb, _, _) = ce sa cid_tbl ar_tbl sc2 ns2 body in
+          let sb2 = ts_b sb end_lbl in
+          let sn = a_label sb2 next_lbl in
+          go_cases sn cid_tbl ar_tbl sc ns base rest (idx + 1) end_lbl
+
+and c_binop st cid_tbl ar_tbl sc ns op l r =
+  if op == "+" || op == "-" || op == "*" || op == "%" then
+    let (s1, _, _) = ce st cid_tbl ar_tbl sc ns l in
+    let la = ns in
+    let s2 = ts_str_slot s1 0 la in
+    let (s3, _, _) = ce s2 cid_tbl ar_tbl sc (ns + 1) r in
+    let rb = ns + 1 in
+    let s3b = ts_str_slot s3 0 rb in
+    let s4 = ts_ldr_slot s3b 0 la in
+    let s5 = ts_ldr_slot s4 1 rb in
+    if op == "+" then
+      -- tagged sum: (a+b)-1 keeps the tag bits right (see Gen2 int_arith)
+      let s6 = ts_add_rr s5 0 0 1 in
+      (a_inst s6 "sub x0, x0, #1", sc, ns)
+    else if op == "-" then
+      -- tag bits cancel: t(a)-t(b) = (a-b)<<2, so just add #1 back
+      let s6 = a_inst s5 "sub x0, x0, x1" in
+      (a_inst s6 "add x0, x0, #1", sc, ns)
+    else if op == "%" then
+      let s6 = ts_asr s5 0 0 2 in
+      let s7 = ts_asr s6 1 1 2 in
+      let s8 = a_inst s7 "sdiv x9, x0, x1" in
+      let s9 = a_inst s8 "msub x0, x9, x1, x0" in
+      (ts_retag s9 0, sc, ns)
+    else
+      let s6 = ts_asr s5 0 0 2 in
+      let s7 = ts_asr s6 1 1 2 in
+      let s8 = ts_mul s7 0 0 1 in
+      (ts_retag s8 0, sc, ns)
+  else if op == "<" || op == ">" || op == "<=" || op == ">=" then
+    let cn = if op == "<" then "lt" else if op == ">" then "gt"
+             else if op == "<=" then "le" else "ge" in
+    let (s1, _, _) = ce st cid_tbl ar_tbl sc ns l in
+    let la = ns in
+    let s2 = ts_str_slot s1 0 la in
+    let (s3, _, _) = ce s2 cid_tbl ar_tbl sc (ns + 1) r in
+    let rb = ns + 1 in
+    let s3b = ts_str_slot s3 0 rb in
+    let s4 = ts_ldr_slot s3b 0 la in
+    let s5 = ts_ldr_slot s4 1 rb in
+    let (s5b, eno) = a_fresh_id s5 in
+    let s6 = ts_cmp_reg s5b 0 1 in
+    let l_true = "Lbt" ++ int_to_string eno in
+    let l_end = "_be" ++ int_to_string eno in
+    -- b.cond Ltrue; false; b Lend; Ltrue: true-const; Lend:
+    let s7 = ts_bcond s6 (if op == "<" then c_lt else if op == ">" then c_gt
+                          else if op == "<=" then c_le else c_ge) l_true in
+    let s8 = ts_load_const s7 0 3 in
+    let s9 = a_inst s8 ("b " ++ l_end) in
+    let s9b = a_label s9 l_true in
+    let s10 = ts_load_const s9b 0 7 in
+    (a_label s10 l_end, sc, ns)
+  else if op == "==" || op == "!=" then
+    -- structural equality via runtime helper (strings are heap objects;
+    -- pointer comparison can never work). dc_val_eq returns a bool.
+    let (s1, _, _) = ce st cid_tbl ar_tbl sc ns l in
+    let la = ns in
+    let s2 = ts_str_slot s1 0 la in
+    let (s3, _, _) = ce s2 cid_tbl ar_tbl sc (ns + 1) r in
+    let rb = ns + 1 in
+    let s3b = ts_str_slot s3 0 rb in
+    let s4 = ts_ldr_slot s3b 0 la in
+    let s5 = ts_ldr_slot s4 1 rb in
+    let s6 = a_call_rt s5 "dc_val_eq" in
+    if op == "==" then (s6, sc, ns)
+    else
+      -- boolean negation
+      let eno = len (a_lines s6) in
+      let l_t = "Lnt" ++ int_to_string eno in
+      let l_e = "Lne" ++ int_to_string eno in
+      let s7 = ts_cmp_imm s6 0 7 in
+      let s8 = ts_bcond s7 c_eq l_t in
+      let s9 = ts_load_const s8 0 7 in
+      let s10 = ts_b s9 l_e in
+      let s11 = a_label s10 l_t in
+      let s12 = ts_load_const s11 0 3 in
+      (a_label s12 l_e, sc, ns)
+  else if op == "/" then
+    -- untag both, divide, re-tag
+    let (s1, _, _) = ce st cid_tbl ar_tbl sc ns l in
+    let la = ns in
+    let s2 = ts_str_slot s1 0 la in
+    let (s3, _, _) = ce s2 cid_tbl ar_tbl sc (ns + 1) r in
+    let rb = ns + 1 in
+    let s3b = ts_str_slot s3 0 rb in
+    let s4 = ts_ldr_slot s3b 0 la in
+    let s5 = ts_ldr_slot s4 1 rb in
+    let s6 = ts_asr s5 0 0 2 in
+    let s7 = ts_asr s6 1 1 2 in
+    let s8 = a_inst s7 "sdiv x0, x0, x1" in
+    (ts_retag s8 0, sc, ns)
+  else if op == "&&" || op == "||" then
+    -- short-circuit booleans
+    let (st0, eno) = a_fresh_id st in
+    let l_short = "Lsc" ++ int_to_string eno in
+    let l_end = "Lse" ++ int_to_string eno in
+    let (s1, _, _) = ce st0 cid_tbl ar_tbl sc ns l in
+    let s2 = ts_cmp_imm s1 0 7 in
+    let s3 = if op == "&&" then ts_bcond s2 c_ne l_short
+                          else ts_bcond s2 c_eq l_short in
+    let (s4, _, _) = ce s3 cid_tbl ar_tbl sc ns r in
+    let s5 = ts_b s4 l_end in
+    let s6 = a_label s5 l_short in
+    let s7 = ts_load_const s6 0 (if op == "&&" then 3 else 7) in
+    (a_label s7 l_end, sc, ns)
+  else if op == "++" then
+    let (s1, _, _) = ce st cid_tbl ar_tbl sc ns l in
+    let la = ns in
+    let s2 = ts_str_slot s1 0 la in
+    let (s3, _, _) = ce s2 cid_tbl ar_tbl sc (ns + 1) r in
+    let rb = ns + 1 in
+    let s3b = ts_str_slot s3 0 rb in
+    let s4 = ts_ldr_slot s3b 0 la in
+    let s5 = ts_ldr_slot s4 1 rb in
+    (a_call_rt s5 "dc_bi_str_concat", sc, ns)
+else
+    -- unknown operator: keep the stream monotonic, yield tagged 0
+    let (s1, _, _) = ce st cid_tbl ar_tbl sc ns l in
+    let sa = ns in
+    let s2 = ts_str_slot s1 0 sa in
+    let (s3, _, _) = ce s2 cid_tbl ar_tbl sc (ns + 1) r in
+    (ts_load_const s3 0 1, sc, ns)
+-- ---------- program driver ----------
+let d_name3 d = case d of | Def3 _ n _ -> n
+let d_rhs3 d = case d of | Def3 _ _ b -> b
+let g_defs3 g = case g of | Group ds -> ds
+let p_ctorpairs2 pr = case pr of | Prog c _ -> c
+let p_groups2 pr = case pr of | Prog _ gs -> gs
+
+let rec zip_ids2_d names i = case names of
+    [] -> []
+  | nm :: rest -> (nm, i) :: zip_ids2_d rest (i + 1)
+
+let rec map_gname2 ds = case ds of
+    [] -> []
+  | d :: rest -> d_name3 d :: map_gname2 rest
+
+let rec flatten_groups2 gs acc = case gs of
+    [] -> rev_list acc []
+  | g :: rest -> flatten_groups2 rest (app_list (g_defs3 g) acc)
+
+-- strip nested ELams from a def rhs: returns (params, inner body)
+let rec strip_lams e ps = case e of
+    | ELam p body -> strip_lams body (p :: ps)
+    | _ -> (rev_list ps [], e)
+
+-- emit one param level: _fn_<name>_<idx> binds pat from x(idx+1);
+-- last level runs the body, others return a closure over the next level
+-- names bound by pats[0..n-1] in binding order (non-var patterns skipped)
+let rec pv_names_upto ps n = case ps of
+    [] -> []
+  | p :: rest -> if n == 0 then [] else
+      let nm = pat_var_opt p in
+      (if nm == "" then pv_names_upto rest (n - 1) else nm :: pv_names_upto rest (n - 1))
+
+let rec emit_fn_level t cid_tbl ar_tbl name idx k pats body =
+  let flbl = "_fn_" ++ name ++ "_" ++ int_to_string idx in
+  let t0 = a_line t ".p2align 2" in
+  let t1 = a_label t0 flbl in
+  let t2 = a_line t1 "  stp x29, x30, [sp, #-16]!" in
+  let t3 = a_inst t2 "mov x29, sp" in
+  let t4 = a_inst t3 ("sub sp, sp, #" ++ int_to_string frame_bytes) in
+  -- levels >= 2 receive earlier params via the closure env chain:
+  -- copy env words [x0+24..] into frame slots and expose them in scope.
+  let prev_names = pv_names_upto pats (idx - 1) in
+  let np = len prev_names in
+  let rec ld_prev tt j = if j == np then tt
+    else
+      let ta = ts_ldr_off tt 9 0 (24 + (8 * j)) in
+      ld_prev (ts_str_slot ta 9 j) (j + 1)
+  in
+  let t4b = ld_prev t4 0 in
+  let (t4c, fid) = a_fresh_id t4b in
+  let fail_lbl = "Lpfail" ++ int_to_string fid in
+  let pat = nth_pat pats (idx - 1) in
+  let sc0 = zip_ids2_d prev_names 0 in
+  let (t5, sc2, ns2) = cm_asm t4c cid_tbl ar_tbl sc0 np pat 1 fail_lbl in
+  -- the next level's closure captures EVERYTHING visible so far:
+  -- previous params (slots 0..np-1) plus this level's binding(s)
+  let t6 = if idx == k then
+    let (tb, _, _) = ce t5 cid_tbl ar_tbl sc2 ns2 body in tb
+  else
+    let next_lbl = "_fn_" ++ name ++ "_" ++ int_to_string (idx + 1) in
+    let caps = rev_list sc2 [] in
+    let slots = map_snd caps in
+    let tb = mk_closure_seq t5 next_lbl slots in tb
+  in
+  let t7 = a_inst t6 ("add sp, sp, #" ++ int_to_string frame_bytes) in
+  let t8 = a_line t7 "  ldp x29, x30, [sp], #16" in
+  let t8b = a_line t8 "  ret" in
+  let t9 = a_label t8b fail_lbl in
+  let t10 = a_call_rt t9 "dc_match_fail" in
+  a_line t10 "  ret"
+
+let rec emit_fns_asm t cid_tbl ar_tbl defs = case defs of
+    [] -> t
+  | d :: rest ->
+      let (pats, body) = strip_lams (d_rhs3 d) [] in
+      let k = len pats in
+      let rec emit_levels tt i = if i > k then tt
+        else emit_levels (emit_fn_level tt cid_tbl ar_tbl (d_name3 d) i k pats body) (i + 1)
+      in
+      let t2 = emit_levels t 1 in
+      emit_fns_asm t2 cid_tbl ar_tbl rest
+
+let rec emit_thunks_asm t cid_tbl ar_tbl defs = case defs of
+    [] -> t
+  | d :: rest ->
+      let nm = "_thunk_" ++ d_name3 d in
+      let (pats, _) = strip_lams (d_rhs3 d) [] in
+      if len pats != 0 then
+        -- function def: thunk just allocates its level-1 closure
+        let t0a = a_line t ".p2align 2" in
+        let t1 = a_label t0a nm in
+        let t2 = a_line t1 "  stp x29, x30, [sp, #-16]!" in
+        let t3 = a_inst t2 "mov x29, sp" in
+        let t4 = mk_closure_seq t3 ("_fn_" ++ d_name3 d ++ "_1") [] in
+        let t5 = a_line t4 "  ldp x29, x30, [sp], #16" in
+        emit_thunks_asm (a_line t5 "  ret") cid_tbl ar_tbl rest
+      else
+      let t0a = a_line t ".p2align 2" in
+      let t1 = a_label t0a nm in
+      let t2 = a_line t1 "  stp x29, x30, [sp, #-16]!" in
+      let t3 = a_inst t2 "mov x29, sp" in
+      let t4 = a_inst t3 ("sub sp, sp, #" ++ int_to_string frame_bytes) in
+      let (t5, _, _) = ce t4 cid_tbl ar_tbl [] 0 (d_rhs3 d) in
+      let t6 = a_inst t5 ("add sp, sp, #" ++ int_to_string frame_bytes) in
+      let t7 = a_line t6 "  ldp x29, x30, [sp], #16" in
+      emit_thunks_asm (a_line t7 "  ret") cid_tbl ar_tbl rest
+
+-- Balanced output joining: a naive per-line recursive join holds an
+-- O(n^2) set of partial strings across deep frames, which the
+-- conservative GC stack scan retains -> multi-GB on big compiles.
+-- Chunking bounds both recursion depth and retained garbage.
+let rec take_chunk ls k acc =
+  if k == 0 then (rev_list acc [], ls)
+  else
+    case ls of
+      [] -> (rev_list acc [], [])
+    | h :: rest -> take_chunk rest (k - 1) (h :: acc)
+
+let rec join_lin ls = case ls of
+    [] -> ""
+  | l :: rst -> l ++ "\n" ++ join_lin rst
+
+let rec join_chunks ls = case ls of
+    [] -> ""
+  | only :: [] -> only
+  | _ ->
+      case take_chunk ls 24 [] of
+        | (chunk, rest2) ->
+            case rest2 of
+              | [] -> join_lin chunk
+              | _ -> join_lin chunk ++ "\n" ++ join_chunks rest2
+
+-- ---------- staged pipeline ----------
+-- Splitting into small top-level functions avoids one giant main and makes
+-- each stage independently verifiable.
+
+let load_prog path =
+  let src_code = read_file path in
+  let toks = lex_all src_code in
+  let prog = parse_prog toks in
+  prog
+
+let build_tables prog =
+  let ctor_pairs = p_ctorpairs2 prog in
+  let groups = p_groups2 prog in
+  let ct_ar_tbl = app_list [("Nil", 0), ("Cons", 2)] ctor_pairs in
+  let ct_id_tbl = zip_ids2_d (map_fst ct_ar_tbl) 0 in
+  let all_defs = flatten_groups2 groups [] in
+  (ct_id_tbl, ct_ar_tbl, all_defs)
+
+let build_globs ct_ar_tbl all_defs =
+  let rec alloc_seq names slot acc = case names of
+      [] -> (rev_list acc [], slot)
+    | nm :: rest -> alloc_seq rest (slot + 1) ((nm, slot) :: acc)
+  in
+  let rec filter_nonzero names = case names of
+      [] -> []
+    | kv :: rest -> case kv of
+        | (nm, ar) -> if ar > 0 then nm :: filter_nonzero rest else filter_nonzero rest
+  in
+  let (b_globs, next1) = alloc_seq builtins 0 [] in
+  let pc_names = filter_nonzero ct_ar_tbl in
+  let (c_globs, next2) = alloc_seq pc_names next1 [] in
+  let (d_globs, _) = alloc_seq (map_gname2 all_defs) next2 [] in
+  let all_globs = app_list (app_list b_globs c_globs) d_globs in
+  (all_globs, next2)
+
+let emit_code prog =
+  let ctor_pairs = p_ctorpairs2 prog in
+  let groups = p_groups2 prog in
+  let ct_ar_tbl = app_list [("Nil", 0), ("Cons", 2)] ctor_pairs in
+  let ct_id_tbl = zip_ids2_d (map_fst ct_ar_tbl) 0 in
+  let all_defs = flatten_groups2 groups [] in
+  let rec alloc_seq names slot acc = case names of
+      [] -> (rev_list acc [], slot)
+    | nm :: rest -> alloc_seq rest (slot + 1) ((nm, slot) :: acc)
+  in
+  let rec filter_nonzero names = case names of
+      [] -> []
+    | kv :: rest -> case kv of
+        | (nm, ar) -> if ar > 0 then nm :: filter_nonzero rest else filter_nonzero rest
+  in
+  let (b_globs, next1) = alloc_seq builtins 0 [] in
+  let pc_names = filter_nonzero ct_ar_tbl in
+  let (c_globs, next2) = alloc_seq pc_names next1 [] in
+  let (d_globs, _) = alloc_seq (map_gname2 all_defs) next2 [] in
+  let all_globs = app_list (app_list b_globs c_globs) d_globs in
+  -- emit thunks for each definition
+  let st0 = a_set_globs as_new all_globs in
+  let st1 = a_set_nglob st0 next2 in
+
+  let t_fns = emit_fns_asm st1 ct_id_tbl ct_ar_tbl all_defs in
+
+  let t_final = emit_thunks_asm t_fns ct_id_tbl ct_ar_tbl all_defs in
+
+  -- emit ctor names data section
+  let ctor_names_all = map_fst ct_ar_tbl in
+  let rec emit_names t i names = case names of
+      [] -> t
+    | nm :: rest ->
+        let lbl = "_nm" ++ int_to_string i in
+        let ta = a_label t lbl in
+        let tb = a_inst ta (".asciz \"" ++ nm ++ "\"") in
+        emit_names tb (i + 1) rest
+  in
+  let t_dstart = a_inst t_final ".section __DATA,__data" in
+  let t_names = emit_names t_dstart 0 ctor_names_all in
+  let rec emit_name_tbl t i n = if i == n then t
+    else emit_name_tbl (a_inst t (".quad _nm" ++ int_to_string i)) (i + 1) n
+  in
+  let t_nd0 = a_inst t_names ".section __DATA,__data" in
+  let t_nd1 = a_inst t_nd0 ".p2align 3" in
+  let t_ntbl0 = a_line t_nd1 ".globl _dc_ctor_names" in
+  let t_ntbl1 = a_label t_ntbl0 "_dc_ctor_names" in
+  let t_ntbl2 = emit_name_tbl t_ntbl1 0 (len ctor_names_all) in
+  let t_nd2 = a_inst t_ntbl2 ".p2align 3" in
+  let t_names2 = a_inst t_nd2 ".section __TEXT,__text,regular,pure_instructions" in
+
+  -- _dc_init
+  let t_init0 = a_globl t_names2 "_dc_init" in
+  let t_init1 = a_label t_init0 "_dc_init" in
+  let t_init2 = a_line t_init1 "  stp x29, x30, [sp, #-16]!" in
+  let t_init3 = a_inst t_init2 "mov x29, sp" in
+  let rec reg_all t i names = case names of
+      [] -> t
+    | nm :: rest ->
+        let cid = assoc_ikey nm ct_id_tbl in
+        let ar = assoc_ikey nm ct_ar_tbl in
+        let ta = ts_load_const t 0 cid in
+        let tb = ts_load_const ta 1 ar in
+        reg_all (a_call_rt tb "dc_register_ctor") (i + 1) rest
+  in
+  let t_init4 = reg_all t_init3 0 ctor_names_all in
+  let rec fill_bi t i = if i == len builtins then t
+    else
+      let bnme = nth_str builtins i in
+      let slot = assoc_ikey bnme all_globs in
+      let ta = ts_load_const t 0 i in
+      let tb = a_call_rt ta "dc_mk_partial_builtin" in
+      let tc = ts_mov_rr tb 1 0 in
+      let td = ts_load_const tc 0 slot in
+      fill_bi (a_call_rt td "dc_gset") (i + 1)
+  in
+  let t_init5 = fill_bi t_init4 0 in
+  let rec fill_pc t i names = case names of
+      [] -> t
+    | nm :: rest ->
+        let ar = assoc_ikey nm ct_ar_tbl in
+        if ar == 0 then fill_pc t (i + 1) rest
+        else
+          let cid = assoc_ikey nm ct_id_tbl in
+          let slot = assoc_ikey nm all_globs in
+          let ta = ts_load_const t 0 cid in
+          let tb = a_call_rt ta "dc_mk_partial_ctor" in
+          let tc = ts_mov_rr tb 1 0 in
+          let td = ts_load_const tc 0 slot in
+          fill_pc (a_call_rt td "dc_gset") (i + 1) rest
+  in
+  let t_init6 = fill_pc t_init5 0 ctor_names_all in
+  let rec call_thunks t defs = case defs of
+      [] -> t
+    | d :: rest ->
+        let dnme = d_name3 d in
+        let slot = assoc_ikey dnme all_globs in
+        let ta = ts_bl t ("_thunk_" ++ dnme) in
+        let s_tmp = ts_mov_rr ta 1 0 in
+        let s_tmp2 = ts_load_const s_tmp 0 slot in
+        call_thunks (a_call_rt s_tmp2 "dc_gset") rest
+  in
+  let t_init7 = call_thunks t_init6 all_defs in
+  let t_init_end = a_line t_init7 "  ldp x29, x30, [sp], #16" in
+  let t_init_ret = a_line t_init_end "  ret" in
+
+  -- _dc_user_main
+  let main_slot = assoc_ikey "main" all_globs in
+  if main_slot == (0 - 1) then
+    -- no main defined: user_main returns immediately
+    let u0 = a_globl t_init_ret "_dc_user_main" in
+    let u1 = a_label u0 "_dc_user_main" in
+    let u2 = a_line u1 "  stp x29, x30, [sp, #-16]!" in
+    let u3 = a_inst u2 "mov x29, sp" in
+    let u4 = a_line u3 "  ldp x29, x30, [sp], #16" in
+    let u5 = a_line u4 "  ret" in
+    let h0 = a_line u5 "" in
+    let h1 = a_line h0 ".globl _dc_init" in
+    let h2 = a_line h1 ".globl _dc_user_main" in
+    rev_list (a_lines h2) []
+  else
+    let u0 = a_globl t_init_ret "_dc_user_main" in
+    let u1 = a_label u0 "_dc_user_main" in
+    let u2 = a_line u1 "  stp x29, x30, [sp, #-16]!" in
+    let u3 = a_inst u2 "mov x29, sp" in
+    let u4 = ts_load_const u3 0 main_slot in
+    let u5 = a_call_rt u4 "dc_gget" in
+    let u6 = a_inst u5 "adrp x1, _dc_unit_block@GOTPAGE" in
+    let u7 = a_inst u6 "ldr x1, [x1, _dc_unit_block@GOTPAGEOFF]" in
+    let u8 = ts_ldr_off u7 9 0 8 in
+    let u9 = ts_blr u8 9 in
+    let u10 = a_line u9 "  ldp x29, x30, [sp], #16" in
+    let u11 = a_line u10 "  ret" in
+    let h0 = a_line u11 "" in
+    let h1 = a_line h0 ".globl _dc_init" in
+    let h2 = a_line h1 ".globl _dc_user_main" in
+    rev_list (a_lines h2) []
+
+let join_lines_fwd ls =
+  join_chunks ls
+
+let main () =
+  print_string "" ;
+  let in_path = argv 1 in
+  let out_base = argv 2 in
+  let prog = load_prog in_path in
+  let tabs = build_tables prog in
+  let all_defs = case tabs of
+      | (a, b, c) -> c in
+  let ct_id_tbl = case tabs of
+      | (a, b, c) -> a in
+  let ct_ar_tbl = case tabs of
+      | (a, b, c) -> b in
+
+  let lines_fwd = emit_code prog in
+  let content = join_chunks lines_fwd in
+  let s_path = out_base ++ ".s" in
+  write_file s_path content ;
+  let rt_c = "gen2-dcc-rs/rt/rt.c" in
+  let _r1 = system ("cc -O2 -arch arm64 -c " ++ s_path ++ " -o " ++ out_base ++ ".o") in
+  let _r2 = system ("cc -O2 -arch arm64 -c " ++ rt_c ++ " -o " ++ out_base ++ ".rt.o") in
+  let _r3 = system ("cc " ++ out_base ++ ".o " ++ out_base ++ ".rt.o -o " ++ out_base) in
+  print_string ("wrote " ++ out_base ++ "\n")

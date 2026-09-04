@@ -1,0 +1,12 @@
+[package]
+name = "dcc"
+version = "0.1.0"
+edition = "2021"
+description = "dacelo Gen 2: ARM64 native code compiler"
+
+[[bin]]
+name = "dcc"
+path = "src/main.rs"
+
+[dependencies]
+dacelo = { path = "../gen0-interp-rs" }

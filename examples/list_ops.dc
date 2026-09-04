@@ -1,0 +1,35 @@
+-- dacelo: higher-order functions on lists
+
+let rec map f xs = case xs of
+    [] -> []
+  | h :: rest -> f h :: map f rest
+
+let rec filter p xs = case xs of
+    [] -> []
+  | h :: rest -> if p h then h :: filter p rest else filter p rest
+
+let rec foldl f acc xs = case xs of
+    [] -> acc
+  | h :: rest -> foldl f (f acc h) rest
+
+let rec range lo hi = if lo > hi then [] else lo :: range (lo + 1) hi
+
+let rec print_ints xs = case xs of
+    [] -> print_string "\n"
+  | h :: rest ->
+      print_int h ;
+      (if rest == [] then () else print_string " ") ;
+      print_ints rest
+
+let main () =
+  let nums = range 1 10 in
+  let squares = map (fun x -> x * x) nums in
+  let evens = filter (fun x -> x % 2 == 0) nums in
+  print_string "sum of squares 1..10 = " ;
+  print_int (foldl (fun a x -> a + x) 0 squares) ;
+  print_string "\n" ;
+  print_string "evens 1..10          = " ;
+  print_ints evens ;
+  print_string "product of 1..5      = " ;
+  print_int (foldl (fun a x -> a * x) 1 (range 1 5)) ;
+  print_string "\n"

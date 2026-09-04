@@ -1,0 +1,13 @@
+[package]
+name = "dacelo"
+version = "0.1.0"
+edition = "2021"
+description = "dacelo Gen 0: tree-walking interpreter written in Rust"
+
+[[bin]]
+name = "dacelo"
+path = "src/main.rs"
+
+[lib]
+name = "dacelo"
+path = "src/lib.rs"

@@ -1,0 +1,21 @@
+# Rust build outputs
+target/
+**/target/
+
+# dacelo compiler binaries (rebuilt via test scripts)
+dcc_1
+dcc_2
+dcc_2dbg
+
+# Generated test outputs (native binaries, objects, assembly)
+*_g3
+*_g3.o
+*_g3.rt.o
+*_g3.s
+*.o
+*.s
+
+# Local scratch / temp files
+*.log
+*~
+.DS_Store

@@ -1,0 +1,27 @@
+-- dacelo: closures, currying and partial application
+
+let add x y = x + y
+
+let compose f g = fun x -> f (g x)
+
+let double = fun x -> x * 2
+
+-- partial application: add5 is a closure waiting for one argument
+let add5 = add 5
+
+-- compose double with add5: x -> (x * 2) + 5
+let transform = compose add5 double
+
+let rec apply_n f n x =
+  if n == 0 then x else apply_n f (n - 1) (f x)
+
+let main () =
+  print_int (add5 10) ;        -- 15
+  print_string "\n" ;
+  print_int (transform 3) ;    -- 11
+  print_string "\n" ;
+  print_int (apply_n double 4 1) ;  -- 16
+  print_string "\n" ;
+  let make_adder n = fun x -> x + n in
+  print_int ((make_adder 100) 23) ; -- 123
+  print_string "\n"

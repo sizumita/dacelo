@@ -1,0 +1,43 @@
+-- dacelo: binary search tree with ADTs and pattern matching
+
+type Tree =
+  | Leaf
+  | Node Int Tree Tree
+
+let max a b = if a > b then a else b
+
+-- list append (must be defined before use in Gen 0)
+let rec append xs ys = case xs of
+    [] -> ys
+  | h :: rest -> h :: append rest ys
+
+let rec insert t x = case t of
+    Leaf -> Node x Leaf Leaf
+  | Node v l r ->
+      if x < v then Node v (insert l x) r
+      else Node v l (insert r x)
+
+let rec sum t = case t of
+    Leaf -> 0
+  | Node v l r -> v + sum l + sum r
+
+let rec depth t = case t of
+    Leaf -> 0
+  | Node _ l r -> 1 + max (depth l) (depth r)
+
+let rec inorder t = case t of
+    Leaf -> []
+  | Node v l r -> append (inorder l) (v :: inorder r)
+
+let rec print_list xs = case xs of
+    [] -> print_string "\n"
+  | h :: rest ->
+      print_int h ;
+      (if rest == [] then () else print_string " ") ;
+      print_list rest
+
+let main () =
+  let t = insert (insert (insert (insert (insert Leaf 5) 3) 8) 1) 4 in
+  print_string "sum   = " ; print_int (sum t) ; print_string "\n" ;
+  print_string "depth = " ; print_int (depth t) ; print_string "\n" ;
+  print_string "sorted: " ; print_list (inorder t)

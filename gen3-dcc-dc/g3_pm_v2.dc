@@ -1,0 +1,101 @@
+
+-- ---------- pattern matching compiler ----------
+-- Convention: the value being matched arrives in register `reg`.
+-- Compound patterns (PTup / PCtor) immediately spill it to a fresh frame
+-- slot and reload through that slot, so nested matches (which reuse x9 as
+-- scratch) can never clobber the base pointer.
+
+let rec cm_asm st cid_tbl ar_tbl sc ns pat reg flbl = case pat of
+    PWild -> (st, sc, ns)
+  | PVar n ->
+      let s1 = ts_str_slot st reg ns in
+      (s1, (n, ns) :: sc, ns + 1)
+  | PInt k ->
+      let s1 = ts_load_const st 10 ((k * 4) + 1) in
+      let s2 = ts_cmp_reg s1 reg 10 in
+      (ts_bcond s2 c_ne flbl, sc, ns)
+  | PBool b ->
+      let s1 = ts_load_const st 10 (if b then 7 else 3) in
+      let s2 = ts_cmp_reg s1 reg 10 in
+      (ts_bcond s2 c_ne flbl, sc, ns)
+  | PStr str ->
+      -- string literals must be compared by CONTENT: lexer tokens are fresh
+      -- heap objects that can never be pointer-equal to the interned static.
+      -- dc_val_eq is a C call, so keep the scrutinee in a spill slot.
+      let (s1, lbl) = a_intern_str st str in
+      let sv = ns in
+      let s2 = ts_str_slot s1 reg sv in
+      let s3 = a_inst s2 ("adrp x0, " ++ lbl ++ "@GOTPAGE") in
+      let s4 = a_inst s3 ("ldr x0, [x0, " ++ lbl ++ "@GOTPAGEOFF]") in
+      let s5 = ts_ldr_slot s4 1 sv in
+      let s6 = a_call_rt s5 "dc_val_eq" in
+      let s7 = ts_cmp_imm s6 0 7 in
+      (ts_bcond s7 c_ne flbl, sc, ns)
+  | PUnit ->
+      let s1 = a_inst st ("adrp x10, _dc_unit_block@GOTPAGE") in
+      let s2 = a_inst s1 ("ldr x10, [x10, _dc_unit_block@GOTPAGEOFF]") in
+      let s3 = ts_cmp_reg s2 reg 10 in
+      (ts_bcond s3 c_ne flbl, sc, ns)
+
+  | PTup ps ->
+      let sv = ns in
+      let ta = ts_str_slot st reg sv in
+      -- header check: words = 1 + len(ps), tag_tuple
+      let tb = ts_ldr_slot ta 9 sv in
+      let tc = ts_ldr_off tb 9 9 0 in
+      let td = ts_load_const tc 10 ((256 * (1 + len ps)) + tag_tuple) in
+      let te = ts_cmp_reg td 9 10 in
+      let tf = ts_bcond te c_ne flbl in
+      let rec fld t j cur_sc cur_ns rest_ps = case rest_ps of
+          [] -> (t, cur_sc, cur_ns)
+        | p2 :: rest2 ->
+            let tg = ts_ldr_slot t 9 sv in
+            let th = ts_ldr_off tg 9 9 (8 * (j + 1)) in
+            let (t2, sc3, ns3) =
+              cm_asm th cid_tbl ar_tbl cur_sc cur_ns p2 9 flbl in
+            fld t2 (j + 1) sc3 ns3 rest2
+      in
+      fld tf 0 sc (ns + 1) ps
+
+  | PCtor nm ps ->
+      let ar = assoc_ikey nm ar_tbl in
+      if ar == 0 then
+        let cid = assoc_ikey nm cid_tbl in
+        let sym_lbl = "_ctorinst_" ++ nm in
+        let s2 = a_inst st ("adrp x9, " ++ sym_lbl ++ "@GOTPAGE") in
+        let s3 = a_inst s2 ("ldr x9, [x9, " ++ sym_lbl ++ "@GOTPAGEOFF]") in
+        let s4 = ts_cmp_reg s3 reg 9 in
+        (ts_bcond s4 c_ne flbl, sc, ns)
+      else
+        let cid = assoc_ikey nm cid_tbl in
+        let sv = ns in
+        let ta = ts_str_slot st reg sv in
+        -- header check: words = 2 + arity, tag_adt
+        let tb = ts_ldr_slot ta 9 sv in
+        let tc = ts_ldr_off tb 9 9 0 in
+        let td = ts_load_const tc 10 ((256 * (2 + ar)) + tag_adt) in
+        let te = ts_cmp_reg td 9 10 in
+        let tf = ts_bcond te c_ne flbl in
+        -- ctor id check: block[1]
+        let tg = ts_ldr_slot tf 9 sv in
+        let th = ts_ldr_off tg 9 9 8 in
+        let ti = ts_load_const th 10 cid in
+        let tj = ts_cmp_reg ti 9 10 in
+        let tk = ts_bcond tj c_ne flbl in
+        let rec fld t j cur_sc cur_ns rest_ps = case rest_ps of
+            [] -> (t, cur_sc, cur_ns)
+          | p2 :: rest2 ->
+              let tl = ts_ldr_slot t 9 sv in
+              let tm = ts_ldr_off tl 9 9 (8 * (j + 2)) in
+              let (t2, sc3, ns3) =
+                cm_asm tm cid_tbl ar_tbl cur_sc cur_ns p2 9 flbl in
+              fld t2 (j + 1) sc3 ns3 rest2
+        in
+        fld tk 0 sc (ns + 1) ps
+
+and cmf_asm st cid_tbl ar_tbl sc ns ps reg flbl base = case ps of
+    [] -> (st, sc, ns)
+  | p :: rest ->
+      let s1 = ts_ldr_off st 9 reg (8 * base) in
+      let (s2, sc2, ns2) = cm_asm s1 cid_tbl ar_tbl sc ns p 9 flbl in
+      cmf_asm s2 cid_tbl ar_tbl sc2 ns2 rest reg flbl (base + 1)

@@ -1,0 +1,367 @@
+
+
+let rec zip_ids2_z names i = case names of
+    [] -> []
+  | nm :: rest -> (nm, i) :: zip_ids2_z rest (i + 1)
+
+-- ---------- free variables & pattern helpers ----------
+let rec mem_str_z x xs = case xs of
+    [] -> false
+  | h :: rest -> if h == x then true else mem_str_z x rest
+
+let rec union_str a b = case a of
+    [] -> b
+  | h :: rest -> if mem_str_z h b then union_str rest b else union_str rest (h :: b)
+
+let rec diff_str a b = case a of
+    [] -> []
+  | h :: rest -> if mem_str_z h b then diff_str rest b else h :: diff_str rest b
+
+let rec pat_bound p acc = case p of
+    PWild -> acc
+  | PVar n -> n :: acc
+  | PInt k -> acc
+  | PBool b -> acc
+  | PStr s -> acc
+  | PUnit -> acc
+  | PTup ps -> pv_list ps acc
+  | PCtor nm ps -> pv_list ps acc
+
+and pv_list ps acc = case ps of
+    [] -> acc
+  | p :: rest -> pv_list rest (pat_bound p acc)
+
+-- Free variables in BOUND-SET style: fv_expr e bound = names mentioned in e
+-- that are not covered by `bound` (params/lets/lambdas extend bound going down).
+let rec fv_expr e bound = case e of
+    EInt n -> []
+  | EBool b -> []
+  | EStr s -> []
+  | EUnit -> []
+  | ECtor nm -> []
+  | EVar n -> if mem_str_z n bound then [] else n :: []
+  | EApp f a -> union_str (fv_expr f bound) (fv_expr a bound)
+  | EBin op l r -> union_str (fv_expr l bound) (fv_expr r bound)
+  | EIf c t el ->
+      union_str (union_str (fv_expr c bound) (fv_expr t bound)) (fv_expr el bound)
+  | ECase scr brs ->
+      let rec go_br bs ac = case bs of
+          [] -> ac
+        | br :: rest -> case br of
+            | (p, b) ->
+                go_br rest (union_str ac (diff_str (fv_expr b bound) (pat_bound p [])))
+      in go_br brs (fv_expr scr bound)
+  | ELet isrec nm rhs body ->
+      union_str (fv_expr rhs bound) (diff_str (fv_expr body (nm :: bound)) [])
+  | ELam p b -> diff_str (fv_expr b (union_str (pat_bound p []) bound)) []
+  | ETup es -> fv_list es bound
+
+and fv_list es bound = case es of
+    [] -> []
+  | e :: rest -> union_str (fv_expr e bound) (fv_list rest bound)
+
+-- ---------- expression compiler ----------
+-- State threading convention: AS holds REVERSED lines; every nested compile
+-- call must receive the LATEST state so instructions keep program order.
+-- Spill/frame slots come from the ns counter; labels use len(a_lines).
+
+let rec ce st cid_tbl ar_tbl sc ns e = case e of
+    EInt n -> (ts_load_const st 0 ((n * 4) + 1), sc, ns)
+  | EBool b -> (ts_load_const st 0 (if b then 7 else 3), sc, ns)
+  | EStr str ->
+      let (s1, lbl) = a_intern_str st str in
+      let s2 = a_inst s1 ("adrp x0, " ++ lbl ++ "@GOTPAGE") in
+      (a_inst s2 ("ldr x0, [x0, " ++ lbl ++ "@GOTPAGEOFF]"), sc, ns)
+  | EUnit ->
+      let s1 = a_inst st ("adrp x0, _dc_unit_block@GOTPAGE") in
+      (a_inst s1 ("ldr x0, [x0, _dc_unit_block@GOTPAGEOFF]"), sc, ns)
+  | EVar n ->
+      let slot = assoc_ikey n sc in
+      if slot != (0 - 1) then (ts_ldr_slot st 0 slot, sc, ns)
+      else
+        let g = assoc_ikey n (a_globs st) in
+        if g != (0 - 1) then
+          let s2 = ts_load_const st 0 g in
+          (a_call_rt s2 "dc_gget", sc, ns)
+        else (st, sc, ns)
+  | ECtor nm ->
+      let ar = assoc_ikey nm ar_tbl in
+      if ar == 0 then
+        let cid = assoc_ikey nm cid_tbl in
+        let (s1, lbl) = a_intern_nullary st nm cid in
+        let s2 = a_inst s1 ("adrp x0, " ++ lbl ++ "@GOTPAGE") in
+        (a_inst s2 ("ldr x0, [x0, " ++ lbl ++ "@GOTPAGEOFF]"), sc, ns)
+      else
+        let slot = assoc_ikey nm (a_globs st) in
+        let s1 = ts_load_const st 0 slot in
+        (a_call_rt s1 "dc_gget", sc, ns)
+  | EApp fe ae ->
+      let (s1, _, _) = ce st cid_tbl ar_tbl sc ns fe in
+      let sp_slot = ns in
+      let s2 = ts_str_slot s1 0 sp_slot in
+      let (s3, _, _) = ce s2 cid_tbl ar_tbl sc (ns + 1) ae in
+      let s4 = ts_mov_rr s3 1 0 in
+      let s5 = ts_ldr_slot s4 0 sp_slot in
+      let s6 = ts_ldr_off s5 9 0 8 in
+      (ts_blr s6 9, sc, ns)
+  | EBin op l r -> c_binop st cid_tbl ar_tbl sc ns op l r
+  | EIf c th el ->
+      let (st0, eno) = a_fresh_id st in
+      let else_lbl = "Lelse" ++ int_to_string eno in
+      let end_lbl = "Lendif" ++ int_to_string eno in
+      let (s1, _, _) = ce st0 cid_tbl ar_tbl sc ns c in
+      let s2 = ts_cmp_imm s1 0 7 in
+      let s3 = ts_bcond s2 c_ne else_lbl in
+      let (s4, _, _) = ce s3 cid_tbl ar_tbl sc ns th in
+      let s5 = ts_b s4 end_lbl in
+      let s6 = a_label s5 else_lbl in
+      let (s7, _, _) = ce s6 cid_tbl ar_tbl sc ns el in
+      (a_label s7 end_lbl, sc, ns)
+  | ECase scrut branches ->
+      let (st0, eno) = a_fresh_id st in
+      let end_lbl = "Lcend" ++ int_to_string eno in
+      let (s0, _, _) = ce st0 cid_tbl ar_tbl sc ns scrut in
+      -- spill scrutinee once: individual branch checks clobber x0
+      let sa = ts_str_slot s0 0 ns in
+      go_cases sa cid_tbl ar_tbl sc (ns + 1) ns branches 0 end_lbl
+  | ELet true name rhs body ->
+      -- local let rec: bind the name to a FRESH GLOBAL SLOT so recursive
+      -- self-references resolve via dc_gget at run time (after the closure
+      -- has been stored). Frame-slot binding would break captures.
+      -- live in a high slot region far away from real def slots.
+      -- draw ids from the label counter so a_nglob (def slots) stays put
+      let (st0b, uid) = a_fresh_id st in
+      let gslot = 30000 + uid in
+      let stB = a_set_globs st0b ((name, gslot) :: a_globs st0b) in
+      let (s1, sc1, ns1) = ce stB cid_tbl ar_tbl sc ns rhs in
+      let s2 = ts_mov_rr s1 1 0 in
+      let s3 = ts_load_const s2 0 gslot in
+      let s4 = a_call_rt s3 "dc_gset" in
+      ce s4 cid_tbl ar_tbl sc1 ns1 body
+  | ELet false name rhs body ->
+        let (s1, _, _) = ce st cid_tbl ar_tbl sc ns rhs in
+        let slot = ns in
+        let s2 = ts_str_slot s1 0 slot in
+        ce s2 cid_tbl ar_tbl ((name, slot) :: sc) (ns + 1) body
+  | ELam pat body ->
+      -- anonymous lambda: allocate closure capturing free vars from frame.
+      -- caps is a list of (name, enclosing-frame-slot) pairs; names that are
+      -- actually globals (top-level defs/builtins) are NOT captured — the
+      -- body resolves them via dc_gget at run time like any other EVar.
+      let (st0, eno) = a_fresh_id st in
+      let lbl = "_lam" ++ int_to_string eno in
+      let patdbg = case pat of
+          | PWild -> "WILD"
+          | PVar n -> "VAR:" ++ n
+          | _ -> "OTHER" in
+      let fvs = fv_expr body (pat_bound pat []) in
+      let rec pick acc fs = case fs of
+          [] -> rev_list acc []
+        | fv :: rest ->
+            let sl = assoc_ikey fv sc in
+            pick (if sl == (0 - 1) then acc else (fv, sl) :: acc) rest
+      in
+      let caps = pick [] fvs in
+      let nc = len caps in
+      -- Out-of-line placement: lines are PREPENDED, so emit in reverse of
+      -- program order. Desired layout: [alloc][b skip][fn body][skip:]
+      let skip_lbl = "Lamskip" ++ int_to_string eno in
+      let s_bra = a_inst st0 ("b " ++ skip_lbl) in
+      let t0 = a_line s_bra ".p2align 2" in
+      let t1 = a_label t0 lbl in
+      let t1b = a_inst t1 ("// LAM " ++ lbl ++ " pat=" ++ patdbg) in
+      let t2 = a_line t1b "  stp x29, x30, [sp, #-16]!" in
+      let t3 = a_inst t2 "mov x29, sp" in
+      let t4 = a_inst t3 ("sub sp, sp, #" ++ int_to_string frame_bytes) in
+      let flbl = "Lpfail" ++ int_to_string eno in
+      let (t5, sc2, ns2) = cm_asm t4 cid_tbl ar_tbl [] 0 pat 1 flbl in
+      -- load captured env words into frame slots ns2..ns2+nc-1
+      let rec ld_env tt j cs = case cs of
+          [] -> tt
+        | kv :: rest ->
+            let ta = ts_ldr_off tt 9 0 (24 + (8 * j)) in
+            ld_env (ts_str_slot ta 9 (ns2 + j)) (j + 1) rest
+      in
+      let t6 = ld_env t5 0 caps in
+      let sc4 = app_list sc2 (zip_ids2_z (map_fst caps) ns2) in
+      let (t7, _, _) = ce t6 cid_tbl ar_tbl sc4 (ns2 + nc) body in
+      let t8 = a_inst t7 ("add sp, sp, #" ++ int_to_string frame_bytes) in
+      let t9 = a_line t8 "  ldp x29, x30, [sp], #16" in
+      let t10 = a_line t9 "  ret" in
+      let t11 = a_label t10 flbl in
+      let t12 = a_call_rt t11 "dc_match_fail" in
+      let t13 = a_label (a_line t12 "  ret") skip_lbl in
+      -- closure allocation prepended last => executes FIRST
+      (mk_closure_seq t13 lbl (map_snd caps), sc, ns)
+  | ETup es ->
+      -- tuple CONSTRUCTION: evaluate every element, then allocate a block
+      -- [hdr][e1][e2].. (the `;` sequencing reading of source is compatible:
+      -- side effects fire in order and callers that ignore the value are
+      -- unaffected)
+      let cnt = len es in
+      let rec go t2 idx slts es2 = case es2 of
+          [] -> (t2, rev_list slts [])
+        | e :: rest ->
+            let (t3, _, _) = ce t2 cid_tbl ar_tbl sc (ns + idx) e in
+            let t4 = ts_str_slot t3 0 (ns + idx) in
+            go t4 (idx + 1) ((ns + idx) :: slts) rest
+      in
+      let (sa, slots_rev) = go st 0 [] es in
+      let slots = slots_rev in
+      let s1 = ts_load_const sa 0 ((1 + cnt) * 8) in
+      let s2 = a_call_rt s1 "dacelo_alloc" in
+      let s3 = ts_load_const s2 9 ((256 * (1 + cnt)) + tag_tuple) in
+      let s4 = ts_str_off s3 9 0 0 in
+      let rec fill t5 j cs = case cs of
+          [] -> t5
+        | slotv :: rest ->
+            let ta = ts_ldr_slot t5 9 slotv in
+            fill (ts_str_off ta 9 0 (8 * (j + 1))) (j + 1) rest
+      in
+      (fill s4 0 slots, sc, ns)
+
+and seq_exprs st cid_tbl ar_tbl sc ns es = case es of
+    [] -> (ts_load_const st 0 1, sc, ns)
+  | e :: [] -> ce st cid_tbl ar_tbl sc ns e
+  | e :: rest ->
+      let (s1, _, _) = ce st cid_tbl ar_tbl sc ns e in
+      seq_exprs s1 cid_tbl ar_tbl sc ns rest
+
+and go_cases st cid_tbl ar_tbl sc ns base branches idx end_lbl =
+  case branches of
+    [] -> (a_label (a_call_rt st "dc_match_fail") end_lbl, sc, ns)
+  | br :: rest -> case br of
+      | (pat, body) ->
+          let (stg, gid) = a_fresh_id st in
+          let next_lbl = "Lcn" ++ int_to_string gid in
+          -- reload scrutinee from base slot every time: previous branch's
+          -- checks/binds may have clobbered x0
+          let tb = ts_ldr_slot stg 0 base in
+          let (sa, sc2, ns2) = cm_asm tb cid_tbl ar_tbl sc ns pat 0 next_lbl in
+          let (sb, _, _) = ce sa cid_tbl ar_tbl sc2 ns2 body in
+          let sb2 = ts_b sb end_lbl in
+          let sn = a_label sb2 next_lbl in
+          go_cases sn cid_tbl ar_tbl sc ns base rest (idx + 1) end_lbl
+
+and c_binop st cid_tbl ar_tbl sc ns op l r =
+  if op == "+" || op == "-" || op == "*" || op == "%" then
+    let (s1, _, _) = ce st cid_tbl ar_tbl sc ns l in
+    let la = ns in
+    let s2 = ts_str_slot s1 0 la in
+    let (s3, _, _) = ce s2 cid_tbl ar_tbl sc (ns + 1) r in
+    let rb = ns + 1 in
+    let s3b = ts_str_slot s3 0 rb in
+    let s4 = ts_ldr_slot s3b 0 la in
+    let s5 = ts_ldr_slot s4 1 rb in
+    if op == "+" then
+      -- tagged sum: (a+b)-1 keeps the tag bits right (see Gen2 int_arith)
+      let s6 = ts_add_rr s5 0 0 1 in
+      (a_inst s6 "sub x0, x0, #1", sc, ns)
+    else if op == "-" then
+      -- tag bits cancel: t(a)-t(b) = (a-b)<<2, so just add #1 back
+      let s6 = a_inst s5 "sub x0, x0, x1" in
+      (a_inst s6 "add x0, x0, #1", sc, ns)
+    else if op == "%" then
+      let s6 = ts_asr s5 0 0 2 in
+      let s7 = ts_asr s6 1 1 2 in
+      let s8 = a_inst s7 "sdiv x9, x0, x1" in
+      let s9 = a_inst s8 "msub x0, x9, x1, x0" in
+      (ts_retag s9 0, sc, ns)
+    else
+      let s6 = ts_asr s5 0 0 2 in
+      let s7 = ts_asr s6 1 1 2 in
+      let s8 = ts_mul s7 0 0 1 in
+      (ts_retag s8 0, sc, ns)
+  else if op == "<" || op == ">" || op == "<=" || op == ">=" then
+    let cn = if op == "<" then "lt" else if op == ">" then "gt"
+             else if op == "<=" then "le" else "ge" in
+    let (s1, _, _) = ce st cid_tbl ar_tbl sc ns l in
+    let la = ns in
+    let s2 = ts_str_slot s1 0 la in
+    let (s3, _, _) = ce s2 cid_tbl ar_tbl sc (ns + 1) r in
+    let rb = ns + 1 in
+    let s3b = ts_str_slot s3 0 rb in
+    let s4 = ts_ldr_slot s3b 0 la in
+    let s5 = ts_ldr_slot s4 1 rb in
+    let (s5b, eno) = a_fresh_id s5 in
+    let s6 = ts_cmp_reg s5b 0 1 in
+    let l_true = "Lbt" ++ int_to_string eno in
+    let l_end = "_be" ++ int_to_string eno in
+    -- b.cond Ltrue; false; b Lend; Ltrue: true-const; Lend:
+    let s7 = ts_bcond s6 (if op == "<" then c_lt else if op == ">" then c_gt
+                          else if op == "<=" then c_le else c_ge) l_true in
+    let s8 = ts_load_const s7 0 3 in
+    let s9 = a_inst s8 ("b " ++ l_end) in
+    let s9b = a_label s9 l_true in
+    let s10 = ts_load_const s9b 0 7 in
+    (a_label s10 l_end, sc, ns)
+  else if op == "==" || op == "!=" then
+    -- structural equality via runtime helper (strings are heap objects;
+    -- pointer comparison can never work). dc_val_eq returns a bool.
+    let (s1, _, _) = ce st cid_tbl ar_tbl sc ns l in
+    let la = ns in
+    let s2 = ts_str_slot s1 0 la in
+    let (s3, _, _) = ce s2 cid_tbl ar_tbl sc (ns + 1) r in
+    let rb = ns + 1 in
+    let s3b = ts_str_slot s3 0 rb in
+    let s4 = ts_ldr_slot s3b 0 la in
+    let s5 = ts_ldr_slot s4 1 rb in
+    let s6 = a_call_rt s5 "dc_val_eq" in
+    if op == "==" then (s6, sc, ns)
+    else
+      -- boolean negation
+      let eno = len (a_lines s6) in
+      let l_t = "Lnt" ++ int_to_string eno in
+      let l_e = "Lne" ++ int_to_string eno in
+      let s7 = ts_cmp_imm s6 0 7 in
+      let s8 = ts_bcond s7 c_eq l_t in
+      let s9 = ts_load_const s8 0 7 in
+      let s10 = ts_b s9 l_e in
+      let s11 = a_label s10 l_t in
+      let s12 = ts_load_const s11 0 3 in
+      (a_label s12 l_e, sc, ns)
+  else if op == "/" then
+    -- untag both, divide, re-tag
+    let (s1, _, _) = ce st cid_tbl ar_tbl sc ns l in
+    let la = ns in
+    let s2 = ts_str_slot s1 0 la in
+    let (s3, _, _) = ce s2 cid_tbl ar_tbl sc (ns + 1) r in
+    let rb = ns + 1 in
+    let s3b = ts_str_slot s3 0 rb in
+    let s4 = ts_ldr_slot s3b 0 la in
+    let s5 = ts_ldr_slot s4 1 rb in
+    let s6 = ts_asr s5 0 0 2 in
+    let s7 = ts_asr s6 1 1 2 in
+    let s8 = a_inst s7 "sdiv x0, x0, x1" in
+    (ts_retag s8 0, sc, ns)
+  else if op == "&&" || op == "||" then
+    -- short-circuit booleans
+    let (st0, eno) = a_fresh_id st in
+    let l_short = "Lsc" ++ int_to_string eno in
+    let l_end = "Lse" ++ int_to_string eno in
+    let (s1, _, _) = ce st0 cid_tbl ar_tbl sc ns l in
+    let s2 = ts_cmp_imm s1 0 7 in
+    let s3 = if op == "&&" then ts_bcond s2 c_ne l_short
+                          else ts_bcond s2 c_eq l_short in
+    let (s4, _, _) = ce s3 cid_tbl ar_tbl sc ns r in
+    let s5 = ts_b s4 l_end in
+    let s6 = a_label s5 l_short in
+    let s7 = ts_load_const s6 0 (if op == "&&" then 3 else 7) in
+    (a_label s7 l_end, sc, ns)
+  else if op == "++" then
+    let (s1, _, _) = ce st cid_tbl ar_tbl sc ns l in
+    let la = ns in
+    let s2 = ts_str_slot s1 0 la in
+    let (s3, _, _) = ce s2 cid_tbl ar_tbl sc (ns + 1) r in
+    let rb = ns + 1 in
+    let s3b = ts_str_slot s3 0 rb in
+    let s4 = ts_ldr_slot s3b 0 la in
+    let s5 = ts_ldr_slot s4 1 rb in
+    (a_call_rt s5 "dc_bi_str_concat", sc, ns)
+else
+    -- unknown operator: keep the stream monotonic, yield tagged 0
+    let (s1, _, _) = ce st cid_tbl ar_tbl sc ns l in
+    let sa = ns in
+    let s2 = ts_str_slot s1 0 sa in
+    let (s3, _, _) = ce s2 cid_tbl ar_tbl sc (ns + 1) r in
+    (ts_load_const s3 0 1, sc, ns)

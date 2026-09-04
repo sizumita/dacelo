@@ -1,0 +1,331 @@
+-- ---------- program driver ----------
+let d_name3 d = case d of | Def3 _ n _ -> n
+let d_rhs3 d = case d of | Def3 _ _ b -> b
+let g_defs3 g = case g of | Group ds -> ds
+let p_ctorpairs2 pr = case pr of | Prog c _ -> c
+let p_groups2 pr = case pr of | Prog _ gs -> gs
+
+let rec zip_ids2_d names i = case names of
+    [] -> []
+  | nm :: rest -> (nm, i) :: zip_ids2_d rest (i + 1)
+
+let rec map_gname2 ds = case ds of
+    [] -> []
+  | d :: rest -> d_name3 d :: map_gname2 rest
+
+let rec flatten_groups2 gs acc = case gs of
+    [] -> rev_list acc []
+  | g :: rest -> flatten_groups2 rest (app_list (g_defs3 g) acc)
+
+-- strip nested ELams from a def rhs: returns (params, inner body)
+let rec strip_lams e ps = case e of
+    | ELam p body -> strip_lams body (p :: ps)
+    | _ -> (rev_list ps [], e)
+
+-- emit one param level: _fn_<name>_<idx> binds pat from x(idx+1);
+-- last level runs the body, others return a closure over the next level
+-- names bound by pats[0..n-1] in binding order (non-var patterns skipped)
+let rec pv_names_upto ps n = case ps of
+    [] -> []
+  | p :: rest -> if n == 0 then [] else
+      let nm = pat_var_opt p in
+      (if nm == "" then pv_names_upto rest (n - 1) else nm :: pv_names_upto rest (n - 1))
+
+let rec emit_fn_level t cid_tbl ar_tbl name idx k pats body =
+  let flbl = "_fn_" ++ name ++ "_" ++ int_to_string idx in
+  let t0 = a_line t ".p2align 2" in
+  let t1 = a_label t0 flbl in
+  let t2 = a_line t1 "  stp x29, x30, [sp, #-16]!" in
+  let t3 = a_inst t2 "mov x29, sp" in
+  let t4 = a_inst t3 ("sub sp, sp, #" ++ int_to_string frame_bytes) in
+  -- levels >= 2 receive earlier params via the closure env chain:
+  -- copy env words [x0+24..] into frame slots and expose them in scope.
+  let prev_names = pv_names_upto pats (idx - 1) in
+  let np = len prev_names in
+  let rec ld_prev tt j = if j == np then tt
+    else
+      let ta = ts_ldr_off tt 9 0 (24 + (8 * j)) in
+      ld_prev (ts_str_slot ta 9 j) (j + 1)
+  in
+  let t4b = ld_prev t4 0 in
+  let (t4c, fid) = a_fresh_id t4b in
+  let fail_lbl = "Lpfail" ++ int_to_string fid in
+  let pat = nth_pat pats (idx - 1) in
+  let sc0 = zip_ids2_d prev_names 0 in
+  let (t5, sc2, ns2) = cm_asm t4c cid_tbl ar_tbl sc0 np pat 1 fail_lbl in
+  -- the next level's closure captures EVERYTHING visible so far:
+  -- previous params (slots 0..np-1) plus this level's binding(s)
+  let t6 = if idx == k then
+    let (tb, _, _) = ce t5 cid_tbl ar_tbl sc2 ns2 body in tb
+  else
+    let next_lbl = "_fn_" ++ name ++ "_" ++ int_to_string (idx + 1) in
+    let caps = rev_list sc2 [] in
+    let slots = map_snd caps in
+    let tb = mk_closure_seq t5 next_lbl slots in tb
+  in
+  let t7 = a_inst t6 ("add sp, sp, #" ++ int_to_string frame_bytes) in
+  let t8 = a_line t7 "  ldp x29, x30, [sp], #16" in
+  let t8b = a_line t8 "  ret" in
+  let t9 = a_label t8b fail_lbl in
+  let t10 = a_call_rt t9 "dc_match_fail" in
+  a_line t10 "  ret"
+
+let rec emit_fns_asm t cid_tbl ar_tbl defs = case defs of
+    [] -> t
+  | d :: rest ->
+      let (pats, body) = strip_lams (d_rhs3 d) [] in
+      let k = len pats in
+      let rec emit_levels tt i = if i > k then tt
+        else emit_levels (emit_fn_level tt cid_tbl ar_tbl (d_name3 d) i k pats body) (i + 1)
+      in
+      let t2 = emit_levels t 1 in
+      emit_fns_asm t2 cid_tbl ar_tbl rest
+
+let rec emit_thunks_asm t cid_tbl ar_tbl defs = case defs of
+    [] -> t
+  | d :: rest ->
+      let nm = "_thunk_" ++ d_name3 d in
+      let (pats, _) = strip_lams (d_rhs3 d) [] in
+      if len pats != 0 then
+        -- function def: thunk just allocates its level-1 closure
+        let t0a = a_line t ".p2align 2" in
+        let t1 = a_label t0a nm in
+        let t2 = a_line t1 "  stp x29, x30, [sp, #-16]!" in
+        let t3 = a_inst t2 "mov x29, sp" in
+        let t4 = mk_closure_seq t3 ("_fn_" ++ d_name3 d ++ "_1") [] in
+        let t5 = a_line t4 "  ldp x29, x30, [sp], #16" in
+        emit_thunks_asm (a_line t5 "  ret") cid_tbl ar_tbl rest
+      else
+      let t0a = a_line t ".p2align 2" in
+      let t1 = a_label t0a nm in
+      let t2 = a_line t1 "  stp x29, x30, [sp, #-16]!" in
+      let t3 = a_inst t2 "mov x29, sp" in
+      let t4 = a_inst t3 ("sub sp, sp, #" ++ int_to_string frame_bytes) in
+      let (t5, _, _) = ce t4 cid_tbl ar_tbl [] 0 (d_rhs3 d) in
+      let t6 = a_inst t5 ("add sp, sp, #" ++ int_to_string frame_bytes) in
+      let t7 = a_line t6 "  ldp x29, x30, [sp], #16" in
+      emit_thunks_asm (a_line t7 "  ret") cid_tbl ar_tbl rest
+
+-- Balanced output joining: a naive per-line recursive join holds an
+-- O(n^2) set of partial strings across deep frames, which the
+-- conservative GC stack scan retains -> multi-GB on big compiles.
+-- Chunking bounds both recursion depth and retained garbage.
+let rec take_chunk ls k acc =
+  if k == 0 then (rev_list acc [], ls)
+  else
+    case ls of
+      [] -> (rev_list acc [], [])
+    | h :: rest -> take_chunk rest (k - 1) (h :: acc)
+
+let rec join_lin ls = case ls of
+    [] -> ""
+  | l :: rst -> l ++ "\n" ++ join_lin rst
+
+let rec join_chunks ls = case ls of
+    [] -> ""
+  | only :: [] -> only
+  | _ ->
+      case take_chunk ls 24 [] of
+        | (chunk, rest2) ->
+            case rest2 of
+              | [] -> join_lin chunk
+              | _ -> join_lin chunk ++ "\n" ++ join_chunks rest2
+
+-- ---------- staged pipeline ----------
+-- Splitting into small top-level functions avoids one giant main and makes
+-- each stage independently verifiable.
+
+let load_prog path =
+  let src_code = read_file path in
+  let toks = lex_all src_code in
+  let prog = parse_prog toks in
+  prog
+
+let build_tables prog =
+  let ctor_pairs = p_ctorpairs2 prog in
+  let groups = p_groups2 prog in
+  let ct_ar_tbl = app_list [("Nil", 0), ("Cons", 2)] ctor_pairs in
+  let ct_id_tbl = zip_ids2_d (map_fst ct_ar_tbl) 0 in
+  let all_defs = flatten_groups2 groups [] in
+  (ct_id_tbl, ct_ar_tbl, all_defs)
+
+let build_globs ct_ar_tbl all_defs =
+  let rec alloc_seq names slot acc = case names of
+      [] -> (rev_list acc [], slot)
+    | nm :: rest -> alloc_seq rest (slot + 1) ((nm, slot) :: acc)
+  in
+  let rec filter_nonzero names = case names of
+      [] -> []
+    | kv :: rest -> case kv of
+        | (nm, ar) -> if ar > 0 then nm :: filter_nonzero rest else filter_nonzero rest
+  in
+  let (b_globs, next1) = alloc_seq builtins 0 [] in
+  let pc_names = filter_nonzero ct_ar_tbl in
+  let (c_globs, next2) = alloc_seq pc_names next1 [] in
+  let (d_globs, _) = alloc_seq (map_gname2 all_defs) next2 [] in
+  let all_globs = app_list (app_list b_globs c_globs) d_globs in
+  (all_globs, next2)
+
+let emit_code prog =
+  let ctor_pairs = p_ctorpairs2 prog in
+  let groups = p_groups2 prog in
+  let ct_ar_tbl = app_list [("Nil", 0), ("Cons", 2)] ctor_pairs in
+  let ct_id_tbl = zip_ids2_d (map_fst ct_ar_tbl) 0 in
+  let all_defs = flatten_groups2 groups [] in
+  let rec alloc_seq names slot acc = case names of
+      [] -> (rev_list acc [], slot)
+    | nm :: rest -> alloc_seq rest (slot + 1) ((nm, slot) :: acc)
+  in
+  let rec filter_nonzero names = case names of
+      [] -> []
+    | kv :: rest -> case kv of
+        | (nm, ar) -> if ar > 0 then nm :: filter_nonzero rest else filter_nonzero rest
+  in
+  let (b_globs, next1) = alloc_seq builtins 0 [] in
+  let pc_names = filter_nonzero ct_ar_tbl in
+  let (c_globs, next2) = alloc_seq pc_names next1 [] in
+  let (d_globs, _) = alloc_seq (map_gname2 all_defs) next2 [] in
+  let all_globs = app_list (app_list b_globs c_globs) d_globs in
+  -- emit thunks for each definition
+  let st0 = a_set_globs as_new all_globs in
+  let st1 = a_set_nglob st0 next2 in
+
+  let t_fns = emit_fns_asm st1 ct_id_tbl ct_ar_tbl all_defs in
+
+  let t_final = emit_thunks_asm t_fns ct_id_tbl ct_ar_tbl all_defs in
+
+  -- emit ctor names data section
+  let ctor_names_all = map_fst ct_ar_tbl in
+  let rec emit_names t i names = case names of
+      [] -> t
+    | nm :: rest ->
+        let lbl = "_nm" ++ int_to_string i in
+        let ta = a_label t lbl in
+        let tb = a_inst ta (".asciz \"" ++ nm ++ "\"") in
+        emit_names tb (i + 1) rest
+  in
+  let t_dstart = a_inst t_final ".section __DATA,__data" in
+  let t_names = emit_names t_dstart 0 ctor_names_all in
+  let rec emit_name_tbl t i n = if i == n then t
+    else emit_name_tbl (a_inst t (".quad _nm" ++ int_to_string i)) (i + 1) n
+  in
+  let t_nd0 = a_inst t_names ".section __DATA,__data" in
+  let t_nd1 = a_inst t_nd0 ".p2align 3" in
+  let t_ntbl0 = a_line t_nd1 ".globl _dc_ctor_names" in
+  let t_ntbl1 = a_label t_ntbl0 "_dc_ctor_names" in
+  let t_ntbl2 = emit_name_tbl t_ntbl1 0 (len ctor_names_all) in
+  let t_nd2 = a_inst t_ntbl2 ".p2align 3" in
+  let t_names2 = a_inst t_nd2 ".section __TEXT,__text,regular,pure_instructions" in
+
+  -- _dc_init
+  let t_init0 = a_globl t_names2 "_dc_init" in
+  let t_init1 = a_label t_init0 "_dc_init" in
+  let t_init2 = a_line t_init1 "  stp x29, x30, [sp, #-16]!" in
+  let t_init3 = a_inst t_init2 "mov x29, sp" in
+  let rec reg_all t i names = case names of
+      [] -> t
+    | nm :: rest ->
+        let cid = assoc_ikey nm ct_id_tbl in
+        let ar = assoc_ikey nm ct_ar_tbl in
+        let ta = ts_load_const t 0 cid in
+        let tb = ts_load_const ta 1 ar in
+        reg_all (a_call_rt tb "dc_register_ctor") (i + 1) rest
+  in
+  let t_init4 = reg_all t_init3 0 ctor_names_all in
+  let rec fill_bi t i = if i == len builtins then t
+    else
+      let bnme = nth_str builtins i in
+      let slot = assoc_ikey bnme all_globs in
+      let ta = ts_load_const t 0 i in
+      let tb = a_call_rt ta "dc_mk_partial_builtin" in
+      let tc = ts_mov_rr tb 1 0 in
+      let td = ts_load_const tc 0 slot in
+      fill_bi (a_call_rt td "dc_gset") (i + 1)
+  in
+  let t_init5 = fill_bi t_init4 0 in
+  let rec fill_pc t i names = case names of
+      [] -> t
+    | nm :: rest ->
+        let ar = assoc_ikey nm ct_ar_tbl in
+        if ar == 0 then fill_pc t (i + 1) rest
+        else
+          let cid = assoc_ikey nm ct_id_tbl in
+          let slot = assoc_ikey nm all_globs in
+          let ta = ts_load_const t 0 cid in
+          let tb = a_call_rt ta "dc_mk_partial_ctor" in
+          let tc = ts_mov_rr tb 1 0 in
+          let td = ts_load_const tc 0 slot in
+          fill_pc (a_call_rt td "dc_gset") (i + 1) rest
+  in
+  let t_init6 = fill_pc t_init5 0 ctor_names_all in
+  let rec call_thunks t defs = case defs of
+      [] -> t
+    | d :: rest ->
+        let dnme = d_name3 d in
+        let slot = assoc_ikey dnme all_globs in
+        let ta = ts_bl t ("_thunk_" ++ dnme) in
+        let s_tmp = ts_mov_rr ta 1 0 in
+        let s_tmp2 = ts_load_const s_tmp 0 slot in
+        call_thunks (a_call_rt s_tmp2 "dc_gset") rest
+  in
+  let t_init7 = call_thunks t_init6 all_defs in
+  let t_init_end = a_line t_init7 "  ldp x29, x30, [sp], #16" in
+  let t_init_ret = a_line t_init_end "  ret" in
+
+  -- _dc_user_main
+  let main_slot = assoc_ikey "main" all_globs in
+  if main_slot == (0 - 1) then
+    -- no main defined: user_main returns immediately
+    let u0 = a_globl t_init_ret "_dc_user_main" in
+    let u1 = a_label u0 "_dc_user_main" in
+    let u2 = a_line u1 "  stp x29, x30, [sp, #-16]!" in
+    let u3 = a_inst u2 "mov x29, sp" in
+    let u4 = a_line u3 "  ldp x29, x30, [sp], #16" in
+    let u5 = a_line u4 "  ret" in
+    let h0 = a_line u5 "" in
+    let h1 = a_line h0 ".globl _dc_init" in
+    let h2 = a_line h1 ".globl _dc_user_main" in
+    rev_list (a_lines h2) []
+  else
+    let u0 = a_globl t_init_ret "_dc_user_main" in
+    let u1 = a_label u0 "_dc_user_main" in
+    let u2 = a_line u1 "  stp x29, x30, [sp, #-16]!" in
+    let u3 = a_inst u2 "mov x29, sp" in
+    let u4 = ts_load_const u3 0 main_slot in
+    let u5 = a_call_rt u4 "dc_gget" in
+    let u6 = a_inst u5 "adrp x1, _dc_unit_block@GOTPAGE" in
+    let u7 = a_inst u6 "ldr x1, [x1, _dc_unit_block@GOTPAGEOFF]" in
+    let u8 = ts_ldr_off u7 9 0 8 in
+    let u9 = ts_blr u8 9 in
+    let u10 = a_line u9 "  ldp x29, x30, [sp], #16" in
+    let u11 = a_line u10 "  ret" in
+    let h0 = a_line u11 "" in
+    let h1 = a_line h0 ".globl _dc_init" in
+    let h2 = a_line h1 ".globl _dc_user_main" in
+    rev_list (a_lines h2) []
+
+let join_lines_fwd ls =
+  join_chunks ls
+
+let main () =
+  print_string "" ;
+  let in_path = argv 1 in
+  let out_base = argv 2 in
+  let prog = load_prog in_path in
+  let tabs = build_tables prog in
+  let all_defs = case tabs of
+      | (a, b, c) -> c in
+  let ct_id_tbl = case tabs of
+      | (a, b, c) -> a in
+  let ct_ar_tbl = case tabs of
+      | (a, b, c) -> b in
+
+  let lines_fwd = emit_code prog in
+  let content = join_chunks lines_fwd in
+  let s_path = out_base ++ ".s" in
+  write_file s_path content ;
+  let rt_c = "gen2-dcc-rs/rt/rt.c" in
+  let _r1 = system ("cc -O2 -arch arm64 -c " ++ s_path ++ " -o " ++ out_base ++ ".o") in
+  let _r2 = system ("cc -O2 -arch arm64 -c " ++ rt_c ++ " -o " ++ out_base ++ ".rt.o") in
+  let _r3 = system ("cc " ++ out_base ++ ".o " ++ out_base ++ ".rt.o -o " ++ out_base) in
+  print_string ("wrote " ++ out_base ++ "\n")
