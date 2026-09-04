@@ -239,6 +239,22 @@ impl Codegen {
         self.asm.load_const_u64(crate::encoder::R9, 0);
         self.asm.sub_sp_reg();
         self.frame_patches.push(patch_pos);
+        // Zero-initialize the whole reserved frame so that any slot read
+        // before its first write yields 0 instead of stale garbage left by
+        // previous frames (root cause class of layout-dependent crashes).
+        // x9 still holds the (patched) byte count here; x10/x11 are scratch.
+        //   x10 = sp (cursor); x11 = sp + bytes (end)
+        //   loop: if x10 >= x11 goto done; *x10 = 0; x10 += 8; repeat
+        let zloop = self.new_label();
+        let zdone = self.new_label();
+        self.asm.add_imm(crate::encoder::R10, crate::encoder::RSP, 0);
+        self.asm.add_reg(crate::encoder::R11, crate::encoder::R10, crate::encoder::R9, 0);
+        self.asm.bind_label(zloop);
+        self.asm.cmp_reg(crate::encoder::R10, crate::encoder::R11);
+        self.asm.b_cond(crate::encoder::Cond::Hs, zdone);
+        self.asm.str_xzr_post8(crate::encoder::R10);
+        self.asm.b(zloop);
+        self.asm.bind_label(zdone);
         // closure layout: [hdr@0][code@8][env_size@16][env words @24..]
         for i in 0..captured {
             self.asm.ldr_off(crate::encoder::R9, X0, 24 + 8 * i as i64);
