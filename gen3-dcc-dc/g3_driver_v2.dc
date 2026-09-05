@@ -2,8 +2,9 @@
 let d_name3 d = case d of | Def3 _ n _ -> n
 let d_rhs3 d = case d of | Def3 _ _ b -> b
 let g_defs3 g = case g of | Group ds -> ds
-let p_ctorpairs2 pr = case pr of | Prog c _ -> c
-let p_groups2 pr = case pr of | Prog _ gs -> gs
+let p_ctorpairs2 pr = case pr of | Prog c _ _ _ -> c
+let p_groups2 pr = case pr of | Prog _ gs _ _ -> gs
+let p_tydecls2 pr = case pr of | Prog _ _ tds _ -> tds
 
 let rec zip_ids2_d names i = case names of
     [] -> []
@@ -17,9 +18,10 @@ let rec flatten_groups2 gs acc = case gs of
     [] -> rev_list acc []
   | g :: rest -> flatten_groups2 rest (app_list (g_defs3 g) acc)
 
--- strip nested ELams from a def rhs: returns (params, inner body)
+-- strip nested ELams (and annotations) from a def rhs: (params, body)
 let rec strip_lams e ps = case e of
     | ELam p body -> strip_lams body (p :: ps)
+    | EAnn inner _ -> strip_lams inner ps
     | _ -> (rev_list ps [], e)
 
 -- emit one param level: _fn_<name>_<idx> binds pat from x(idx+1);

@@ -65,6 +65,14 @@ type Pat =
   | PTup (List Pat)
   | PCtor String (List Pat)
 
+-- ---------- source type expressions (kept for Gen4 inference) ----------
+
+type TyAst =
+  | TTVar String
+  | TTCon String (List TyAst)
+  | TTArr TyAst TyAst
+  | TTTup (List TyAst)
+
 type Expr =
   | EInt Int
   | EBool Bool
@@ -79,12 +87,17 @@ type Expr =
   | ECase Expr (List (Pat, Expr))
   | ELet Bool String Expr Expr
   | ETup (List Expr)
+  | EAnn Expr TyAst
 
 -- ---------- definitions ----------
 
 type Def3 = Def3 Bool String Expr
 type Group = Group (List Def3)
-type Prog = Prog (List (String, Int)) (List Group)
+type CtorDecl4 = CtorDecl4 String (List TyAst)
+type TyDecl4 = TyDecl4 String (List String) (List CtorDecl4)
+type OptTy = NoneTy | SomeTy TyAst
+type ProgItem = PTy TyDecl4 | PGrp Group
+type Prog = Prog (List (String, Int)) (List Group) (List TyDecl4) (List ProgItem)
 
 -- ---------- runtime values ----------
 
@@ -238,6 +251,50 @@ let starts_tyatom toks = case toks of
   | TSym "[" :: _ -> true
   | _ -> false
 
+let rec ptyatom2 toks = case toks of
+  | TIdent n :: rest -> (TTVar n, rest)
+  | TUpper n :: rest -> (TTCon n [], rest)
+  | TSym "(" :: rest ->
+      if is_sym ")" rest then (TTCon "Unit" [], drop1 rest)
+      else
+        let (t1, u1) = ptype2 rest in
+        if is_sym "," u1 then
+          let (ts, u2) = pmore_tytuple2 (drop1 u1) [t1] in
+          (TTTup ts, expect_sym ")" u2)
+        else (t1, expect_sym ")" u1)
+  | TSym "[" :: rest ->
+      let (t1, u1) = ptype2 rest in
+      (TTCon "List" [t1], expect_sym "]" u1)
+  | _ -> error "interp: expected type"
+
+and pmore_tytuple2 toks acc =
+  let (t1, u1) = ptype2 toks in
+  if is_sym "," u1 then pmore_tytuple2 (drop1 u1) (t1 :: acc)
+  else (rev_acc [] (t1 :: acc), u1)
+
+and ptyapp2 toks =
+  let (hd, u1) = ptyatom2 toks in
+  let (args, u2) = ptyapp_args2 u1 [] in
+  case args of
+    | [] -> (hd, u2)
+    | _ -> case hd of
+        | TTCon n [] -> (TTCon n args, u2)
+        | _ -> error "interp: invalid type application"
+
+and ptyapp_args2 toks acc =
+  if starts_tyatom toks then
+    let (t1, u1) = ptyatom2 toks in
+    ptyapp_args2 u1 (t1 :: acc)
+  else (rev_acc [] acc, toks)
+
+and ptype2 toks =
+  let (t1, u1) = ptyapp2 toks in
+  if is_sym "->" u1 then
+    let (t2, u2) = ptype2 (drop1 u1) in
+    (TTArr t1 t2, u2)
+  else (t1, u1)
+
+-- legacy droppers (kept: backend arity counting reuses shapes)
 let rec ptyatom toks = case toks of
   | TIdent _ :: rest -> rest
   | TUpper _ :: rest -> rest
@@ -266,6 +323,12 @@ and ptype toks =
 
 let eat_ann_opt toks =
   if is_sym ":" toks then ptype (drop1 toks) else toks
+
+let eat_ann_opt2 toks =
+  if is_sym ":" toks then
+    let (ty, t1) = ptype2 (drop1 toks) in
+    (SomeTy ty, t1)
+  else (NoneTy, toks)
 
 -- ---- expressions ----
 
@@ -450,7 +513,9 @@ and por toks =
 
 and pann toks =
   let (l, t1) = por toks in
-  if is_sym ":" t1 then (l, ptype (drop1 t1))
+  if is_sym ":" t1 then
+    let (ty, t2) = ptype2 (drop1 t1) in
+    (EAnn l ty, t2)
   else (l, t1)
 
 and pseq toks =
@@ -559,34 +624,43 @@ let rec pparams_only toks acc = case toks of
   | TIdent _ :: _ -> let (n, t) = take_ident toks in pparams_only t (n :: acc)
   | _ -> (rev_acc [] acc, toks)
 
+let apply_ann params rhs mty = case mty of
+  | NoneTy -> wrap_lams params rhs
+  | SomeTy ty -> EAnn (wrap_lams params rhs) ty
+
 let pdef_tail isrec toks =
   let (name, t1) = take_ident toks in
   let (params, t2) = pmany_param t1 [] in
-  let t3 = eat_ann_opt t2 in
+  let (mty, t3) = eat_ann_opt2 t2 in
   let t4 = expect_sym "=" t3 in
   let (rhs, t5) = pexpr t4 in
-  (Def3 isrec name (wrap_lams params rhs), t5)
+  (Def3 isrec name (apply_ann params rhs mty), t5)
 
-let rec pctrs toks acc =
+let rec pctrs2 toks acc =
   let (cname, t1) = take_upper toks in
-  let (fields, t2) = ptyapp_count t1 0 in
-  let acc2 = (cname, fields) :: acc in
-  if is_sym "|" t2 then pctrs (drop1 t2) acc2
+  let (fields, t2) = ptyatom_fields t1 [] in
+  let acc2 = CtorDecl4 cname fields :: acc in
+  if is_sym "|" t2 then pctrs2 (drop1 t2) acc2
   else (acc2, t2)
 
-and ptyapp_count toks n =
+and ptyatom_fields toks acc =
   if starts_tyatom toks then
-    let t1 = ptyatom toks in
-    if starts_tyatom t1 then ptyapp_count t1 (n + 1) else (n + 1, t1)
-  else (n, toks)
+    let (t1, u1) = ptyatom2 toks in
+    ptyatom_fields u1 (t1 :: acc)
+  else (rev_acc [] acc, toks)
+
+let rec pairs_of_cds cds acc = case cds of
+    [] -> rev_acc [] acc
+  | cd :: rest -> case cd of
+      | CtorDecl4 nm fs -> pairs_of_cds rest ((nm, len fs) :: acc)
 
 let ptydef toks = case toks of
   | TUpper name :: rest ->
-      let (_, t1) = pparams_only rest [] in
+      let (tparams, t1) = pparams_only rest [] in
       let t2 = expect_sym "=" t1 in
       let t3 = (case t2 of | TSym "|" :: r -> r | _ -> t2) in
-      let (cds, t4) = pctrs t3 [] in
-      ((name, rev_acc [] cds), t4)
+      let (cds, t4) = pctrs2 t3 [] in
+      (TyDecl4 name tparams (rev_acc [] cds), t4)
   | _ -> error "interp: expected type name"
 
 let next_is_and toks = case toks of
@@ -608,11 +682,12 @@ let pand_chain_cont toks first =
   let (grp_d, t1) = pand_chain toks [first] in
   (grp_d, t1)
 
-let rec pitems toks ctors groups = case toks of
-  | [] -> (Prog (rev_acc [] ctors) (rev_acc [] groups), [])
+let rec pitems toks ctors groups tydecls order = case toks of
+  | [] -> (Prog (rev_acc [] ctors) (rev_acc [] groups) (rev_acc [] tydecls) (rev_acc [] order), [])
   | TKw "type" :: rest ->
-      let ((_, cds), t1) = ptydef rest in
-      pitems t1 (push_pairs cds ctors) groups
+      let (td, t1) = ptydef rest in
+      let cps = case td of | TyDecl4 _ _ cds -> pairs_of_cds cds [] in
+      pitems t1 (push_pairs cps ctors) groups (td :: tydecls) (PTy td :: order)
   | TKw "let" :: rest ->
       let (isrec, t1) = (case rest of
                            | TKw "rec" :: r -> (true, r)
@@ -620,15 +695,15 @@ let rec pitems toks ctors groups = case toks of
       let (d, t2) = pdef_tail isrec t1 in
       if next_is_and t2 && isrec then
         let (grp, t3) = pand_chain_cont t2 d in
-        pitems t3 ctors (grp :: groups)
+        pitems t3 ctors (grp :: groups) tydecls (PGrp grp :: order)
       else if next_is_and t2 then
         error "interp: `and` is only allowed after `let rec`"
       else
-        pitems t2 ctors (Group [d] :: groups)
+        pitems t2 ctors (Group [d] :: groups) tydecls (PGrp (Group [d]) :: order)
   | _ -> error "interp: expected top-level item (`let` or `type`)"
 
 let parse_prog toks =
-  let (prog, rest) = pitems toks [] [] in
+  let (prog, rest) = pitems toks [] [] [] [] in
   case rest of
     | [] -> prog
     | _ -> error "interp: trailing tokens after program"
@@ -1675,6 +1750,7 @@ let rec fv_expr e bound = case e of
   | EUnit -> []
   | ECtor nm -> []
   | EVar n -> if mem_str_z n bound then [] else n :: []
+  | EAnn e _ -> fv_expr e bound
   | EApp f a -> union_str (fv_expr f bound) (fv_expr a bound)
   | EBin op l r -> union_str (fv_expr l bound) (fv_expr r bound)
   | EIf c t el ->
@@ -1737,6 +1813,7 @@ let rec ce st cid_tbl ar_tbl sc ns e = case e of
           let s2 = ts_load_const st 0 g in
           (a_call_rt s2 "dc_gget", sc, ns)
         else (st, sc, ns)
+  | EAnn e _ -> ce st cid_tbl ar_tbl sc ns e
   | ECtor nm ->
       let ar = assoc_ikey nm ar_tbl in
       if ar == 0 then
@@ -2014,8 +2091,9 @@ and go_tup t2 idx slts es2 ns cid_tbl ar_tbl sc = case es2 of
 let d_name3 d = case d of | Def3 _ n _ -> n
 let d_rhs3 d = case d of | Def3 _ _ b -> b
 let g_defs3 g = case g of | Group ds -> ds
-let p_ctorpairs2 pr = case pr of | Prog c _ -> c
-let p_groups2 pr = case pr of | Prog _ gs -> gs
+let p_ctorpairs2 pr = case pr of | Prog c _ _ _ -> c
+let p_groups2 pr = case pr of | Prog _ gs _ _ -> gs
+let p_tydecls2 pr = case pr of | Prog _ _ tds _ -> tds
 
 let rec zip_ids2_d names i = case names of
     [] -> []
@@ -2029,9 +2107,10 @@ let rec flatten_groups2 gs acc = case gs of
     [] -> rev_list acc []
   | g :: rest -> flatten_groups2 rest (app_list (g_defs3 g) acc)
 
--- strip nested ELams from a def rhs: returns (params, inner body)
+-- strip nested ELams (and annotations) from a def rhs: (params, body)
 let rec strip_lams e ps = case e of
     | ELam p body -> strip_lams body (p :: ps)
+    | EAnn inner _ -> strip_lams inner ps
     | _ -> (rev_list ps [], e)
 
 -- emit one param level: _fn_<name>_<idx> binds pat from x(idx+1);

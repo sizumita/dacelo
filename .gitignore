@@ -6,6 +6,9 @@ target/
 dcc_1
 dcc_2
 dcc_2dbg
+dcc_3
+gen4check
+gen4dbg
 
 # Generated test outputs (native binaries, objects, assembly)
 *_g3
@@ -14,6 +17,9 @@ dcc_2dbg
 *_g3.s
 *.o
 *.s
+
+# Generated concatenation for Gen4 build (rebuilt by gen4-infer-dc/test.sh)
+gen4-infer-dc/g4_full.dc
 
 # Local scratch / temp files
 *.log

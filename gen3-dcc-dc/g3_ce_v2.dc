@@ -40,6 +40,7 @@ let rec fv_expr e bound = case e of
   | EUnit -> []
   | ECtor nm -> []
   | EVar n -> if mem_str_z n bound then [] else n :: []
+  | EAnn e _ -> fv_expr e bound
   | EApp f a -> union_str (fv_expr f bound) (fv_expr a bound)
   | EBin op l r -> union_str (fv_expr l bound) (fv_expr r bound)
   | EIf c t el ->
@@ -102,6 +103,7 @@ let rec ce st cid_tbl ar_tbl sc ns e = case e of
           let s2 = ts_load_const st 0 g in
           (a_call_rt s2 "dc_gget", sc, ns)
         else (st, sc, ns)
+  | EAnn e _ -> ce st cid_tbl ar_tbl sc ns e
   | ECtor nm ->
       let ar = assoc_ikey nm ar_tbl in
       if ar == 0 then
