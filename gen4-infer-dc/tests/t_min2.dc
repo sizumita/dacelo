@@ -1,0 +1,6 @@
+let rec len2 xs = case xs of
+    [] -> 0
+  | _ :: rest -> 1 + len2 rest
+let main () =
+  print_int (len2 ["a"; "b"]) ;
+  print_string " "

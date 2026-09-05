@@ -1,0 +1,8 @@
+let main () =
+  let sv = 2 in
+  let f3 t j k = sv + t + j + k in
+  let f5 a b c d e = sv + a + b + c + d + e in
+  print_int (f3 10 20 30) ;
+  print_string " " ;
+  print_int (f5 10 20 30 40 50) ;
+  print_string "\n"

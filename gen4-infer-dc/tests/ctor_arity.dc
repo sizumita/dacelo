@@ -1,0 +1,5 @@
+type T =
+  | A Int
+  | B
+
+let main () = print_string (case A 1 2 of | A x -> "a" | B -> "b")

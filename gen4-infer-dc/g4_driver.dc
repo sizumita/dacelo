@@ -1,0 +1,72 @@
+-- Gen4 driver: parse a file, run HM inference over items in source order,
+-- report first error like gen0 ("dacelo: [item N: kind] msg", exit 1) or
+-- silent success (exit 0). Mirrors gen0 print_types/check_program.
+
+let g4_order pr = case pr of | Prog _ _ _ od -> od
+
+let rec g4_names ds = case ds of
+    [] -> []
+  | d :: rest -> case d of
+      | Def3 _ nm _ -> nm :: g4_names rest
+
+let rec g4_join_names ns = case ns of
+    [] -> ""
+  | h :: rest -> case rest of
+      | [] -> h
+      | _ -> h ++ " / " ++ g4_join_names rest
+
+let g4_single_name d = case d of | Def3 _ nm _ -> nm
+
+let g4_kind_of_group g = case g of
+  | Group [d] -> "let " ++ g4_single_name d
+  | Group ds -> "let rec " ++ g4_join_names (g4_names ds)
+
+let rec g4_app_env xs env = case xs of
+    [] -> env
+  | h :: rest -> h :: g4_app_env rest env
+
+let tis_clear_subst s = case s of | TIS _ b c d e -> TIS [] b c d e
+
+let g4_next_env schs env s = ti_norm_env (g4_app_env schs env) s
+
+let rec g4_run_ty td env s idx rest =
+  let tname = g4_ty_name td in
+  let kind = "type " ++ tname in
+  let e0 = tis_ectx s in
+  let s1 = ti_push_ctx s ("[item " ++ int_to_string idx ++ ": " ++ kind ++ "] ") in
+  let (s2, schemes) = ti_check_tydef td s1 in
+  let s3 = ti_with_ctx s2 e0 in
+  g4_run_order rest (g4_next_env schemes env s3) (tis_clear_subst s3) (idx + 1)
+
+and g4_ty_name td = case td of | TyDecl4 n _ _ -> n
+
+and g4_run_grp g env s idx rest =
+  let kind = g4_kind_of_group g in
+  let e0 = tis_ectx s in
+  let s1 = ti_push_ctx s ("[item " ++ int_to_string idx ++ ": " ++ kind ++ "] ") in
+  case g of
+    | Group ds ->
+        let (s2, schs) = ti_infer_def_group ds env s1 in
+        let s3 = ti_with_ctx s2 e0 in
+        g4_run_order rest (g4_next_env schs env s3) (tis_clear_subst s3) (idx + 1)
+
+and g4_run_order od env s idx = case od of
+    [] -> (s, env)
+  | it :: rest -> case it of
+      | PTy td -> g4_run_ty td env s idx rest
+      | PGrp g -> g4_run_grp g env s idx rest
+
+let g4_check prog =
+  let od = g4_order prog in
+  let (s0, env0) = ti_init_env tis_new in
+  let (s1, env1) = g4_run_order od env0 s0 0 in
+  s1
+
+let main () =
+  print_string "" ;
+  let path = argv 1 in
+  let src = read_file path in
+  let toks = lex_all src in
+  let prog = parse_prog toks in
+  let done1 = g4_check prog in
+  print_string ""

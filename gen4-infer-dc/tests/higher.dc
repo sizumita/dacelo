@@ -1,0 +1,7 @@
+let compose f g x = f (g x)
+
+let add1 x = x + 1
+
+let dbl x = x * 2
+
+let main () = print_int ((compose add1 dbl) 5)

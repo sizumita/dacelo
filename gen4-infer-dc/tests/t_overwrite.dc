@@ -1,0 +1,14 @@
+let mk n =
+  let base = n * 100 in
+  let rec f x =
+    if x == 0 then base else f (x - 1) + base
+  in
+  f
+
+let main () =
+  let f1 = mk 1 in
+  let f2 = mk 2 in
+  print_int (f1 1) ;
+  print_string " " ;
+  print_int (f2 1) ;
+  print_string "\n"

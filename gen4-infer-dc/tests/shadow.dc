@@ -1,0 +1,5 @@
+let x = 1
+
+let f x = x + 1
+
+let main () = print_int (f x)

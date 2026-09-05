@@ -19,6 +19,7 @@ Dacelo(ワライカワセミ属)— ML 系静的型付け関数型言語。自�
 | Gen 1 | `gen1-interp-dc` — dacelo 製インタプリタ(dacelo 上で動作)| dacelo | **完了** ✅ |
 | Gen 2 | `gen2-dcc-rs` — Rust 製コンパイラ(ARM64 直接コード生成)| Rust | **完了** ✅ |
 | Gen 3 | `gen3-dcc-dc` — dacelo 製コンパイラ(自己コンパイル)| dacelo | **完了** ✅ |
+| Gen 4 | `gen4-infer-dc` — dacelo 製 HM 型推論(dacelo 上で動作)| dacelo | **完了** ✅ |
 
 ## Gen 0 の現状
 
@@ -83,9 +84,24 @@ dcc-rs -o dcc_1 dcc.dc     # Rust 製コンパイラで dacelo 製コンパイ�
 `dcc_2` が生成した `dcc_3` とバイト一致(`diff dcc_2.s dcc_3.s` 差分 0 行)
 = 不動点に到達。全サンプルがインタプリタと出力一致。検証: `zsh gen3-dcc-dc/test.sh`。
 
+### ゴール(Gen 4 完了条件) — 達成 ✅
+
+```
+./dcc_1 gen4-infer-dc/g4_full.dc gen4check   # dacelo 製コンパイラで型検査器をビルド
+./gen4check <file.dc>                        # Gen0 --types と終了コード+stderr が一致
+```
+
+達成内容: dacelo 自身で書かれた Hindley-Milner 型推論(`infer.dc` + ドライバ)が
+`dcc_1` でビルドした `gen4check` として動作し、38 ケースのオラクル
+(examples + ADT/多相/注釈/occurs-check/否定ケース)で Gen0 と完全一致。
+`dcc.dc` 自身と `g4_full.dc` 自身の検査にも成功(Gen0 と同意)。
+詳細は [gen4-infer-dc/RESUME.md](./gen4-infer-dc/RESUME.md)。
+検証: `zsh gen4-infer-dc/test.sh`。
+
 ## ステータス
 
-Gen 0〜2 完了(ネイティブコンパイラ動作、全サンプル出力がインタプリタと一致)。
+Gen 0〜4 完了。Gen 4(`gen4-infer-dc/`)は dacelo 製 HM 型推論:
+`dcc_1` でビルドした `gen4check` が Gen0 `--types` と 38 ケース完全一致。
 
 **Gen 3 完了**: `gen3-dcc-dc/` — dacelo 自身で書かれたコンパイラが
 自分自身をコンパイルして完全動作する `dcc_2` を生成し、`dcc_2` の

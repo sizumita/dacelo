@@ -1,0 +1,680 @@
+-- Gen4: Hindley-Milner type inference in dacelo (pure explicit-substitution
+-- Algorithm W). Mirrors gen0-interp-rs/src/infer.rs semantics AND messages.
+-- State (TIS) threads: substitution, fresh-var counter, app counter, context.
+
+type Ty = TVI Int | TC String | TAr Ty Ty | TTup (List Ty) | TApp String (List Ty)
+type Sch = Sch (List Int) Ty
+type TIS = TIS (List (Int, Ty)) Int Int String (List (String, Int))
+
+let tis_sub s = case s of | TIS a _ _ _ _ -> a
+let tis_ctr s = case s of | TIS _ a _ _ _ -> a
+let tis_with_sub s v = case s of | TIS _ b c d e -> TIS v b c d e
+let tis_new = TIS [] 0 0 "" []
+
+let ti_fresh s = case s of
+  | TIS a c p x e -> (TIS a (c + 1) p x e, c)
+
+let ti_fresh_n s n = case s of
+  | TIS a c p x e -> (TIS a (c + n) p x e, c)
+
+let ti_app_tick s = case s of
+  | TIS a c p x e -> (TIS a c (p + 1) x e, p)
+
+-- State (TIS) threads: substitution, fresh-var counter, app counter,
+-- error-context prefix stack (for nested "in def / case branch" messages).
+
+let ti_with_ctx s c = case s of | TIS a b d _ e -> TIS a b d c e
+
+let tis_ectx s = case s of | TIS _ _ _ d _ -> d
+let tis_tydefs s = case s of | TIS _ _ _ _ t -> t
+let tis_with_tydefs s v = case s of | TIS a b c d _ -> TIS a b c d v
+
+let ti_push_ctx s frag = ti_with_ctx s (tis_ectx s ++ frag)
+
+-- ---------- small int-list / assoc helpers ----------
+
+let rec ti_mem_int x xs = case xs of
+    [] -> false
+  | h :: rest -> if h == x then true else ti_mem_int x rest
+
+let rec ti_nub acc xs = case xs of
+    [] -> rev_acc [] acc
+  | h :: rest -> if ti_mem_int h acc then ti_nub acc rest else ti_nub (h :: acc) rest
+
+let rec ti_diff a b = case a of
+    [] -> []
+  | h :: rest -> if ti_mem_int h b then ti_diff rest b else h :: ti_diff rest b
+
+let rec ti_find_ty mp x = case mp of
+    [] -> TVI x
+  | kv :: rest -> case kv of
+      | (k, t) -> if k == x then t else ti_find_ty rest x
+
+let rec ti_find_int mp x = case mp of
+    [] -> x
+  | kv :: rest -> case kv of
+      | (k, v) -> if k == x then v else ti_find_int rest x
+
+let rec ti_find_str m x = case m of
+    [] -> ""
+  | kv :: rest -> case kv of
+      | (k, n) -> if k == x then n else ti_find_str rest x
+
+let rec ti_zip_ids xs i = case xs of
+    [] -> []
+  | h :: rest -> (h, i) :: ti_zip_ids rest (i + 1)
+
+let rec ti_lookup_str scope v = case scope of
+    [] -> 0 - 1
+  | kv :: rest -> case kv of
+      | (k, n) -> if k == v then n else ti_lookup_str rest v
+
+-- ---------- substitution ----------
+
+let rec ti_walk_full o s v = case s of
+    [] -> TVI v
+  | kv :: rest -> case kv of
+      | (k, t) -> if k == v then ti_chase o t else ti_walk_full o rest v
+
+and ti_chase s t = case t of
+    TVI x -> ti_walk_full s s x
+  | _ -> t
+
+let rec ti_apply s t = case ti_chase s t of
+    TVI _ -> ti_chase s t
+  | TC _ -> ti_chase s t
+  | TAr a b -> TAr (ti_apply s a) (ti_apply s b)
+  | TTup ts -> TTup (ti_map_apply s ts)
+  | TApp n ts -> TApp n (ti_map_apply s ts)
+
+and ti_map_apply s ts = case ts of
+    [] -> []
+  | h :: rest -> ti_apply s h :: ti_map_apply s rest
+
+let rec ti_occurs v t s = case ti_chase s t of
+    TVI x -> x == v
+  | TC _ -> false
+  | TAr a b -> if ti_occurs v a s then true else ti_occurs v b s
+  | TTup ts -> ti_occurs_list v ts s
+  | TApp _ ts -> ti_occurs_list v ts s
+
+and ti_occurs_list v ts s = case ts of
+    [] -> false
+  | h :: rest -> if ti_occurs v h s then true else ti_occurs_list v rest s
+
+let rec ti_free_ty t acc = case t of
+    TVI x -> if ti_mem_int x acc then acc else x :: acc
+  | TC _ -> acc
+  | TAr a b -> ti_free_ty b (ti_free_ty a acc)
+  | TTup ts -> ti_free_tys ts acc
+  | TApp _ ts -> ti_free_tys ts acc
+
+and ti_free_tys ts acc = case ts of
+    [] -> acc
+  | h :: rest -> ti_free_tys rest (ti_free_ty h acc)
+
+-- ---------- type display (mirrors gen0 show_ty) ----------
+
+let ti_letter n =
+  let abc = "abcdefghijklmnopqrstuvwxyz" in
+  if n < 26 then substring abc n 1
+  else substring abc (n % 26) 1 ++ int_to_string (n / 26)
+
+let rec ti_show_go t names = case t of
+    TVI x ->
+      let f = ti_find_str names x in
+      if f == "" then
+        let l = ti_letter (len names) in
+        (l, (x, l) :: names)
+      else (f, names)
+  | TC s -> (s, names)
+  | TAr a b ->
+      let (sa, n1) = (case a of
+          | TAr _ _ ->
+              let (s0, n0) = ti_show_go a names in
+              ("(" ++ s0 ++ ")", n0)
+          | _ -> ti_show_go a names) in
+      let (sb, n2) = ti_show_go b n1 in
+      (sa ++ " -> " ++ sb, n2)
+  | TTup ts ->
+      let (s, n1) = ti_show_list ts ", " names in
+      ("(" ++ s ++ ")", n1)
+  | TApp n ts -> case ts of
+      | [] -> (n, names)
+      | h :: rest -> if n == "List" then
+            let (s, n1) = ti_show_go h names in
+            ("[" ++ s ++ "]", n1)
+          else
+            let (s, n1) = ti_show_list ts " " names in
+            ("(" ++ n ++ " " ++ s ++ ")", n1)
+
+and ti_show_list ts sep names = case ts of
+    [] -> ("", names)
+  | h :: rest ->
+      let (s0, n0) = ti_show_go h names in
+      case rest of
+        | [] -> (s0, n0)
+        | _ ->
+            let (s1, n1) = ti_show_list rest sep n0 in
+            (s0 ++ sep ++ s1, n1)
+
+let ti_show s t = case ti_show_go (ti_apply (tis_sub s) t) [] of
+  | (txt, _) -> txt
+
+-- ---------- unification ----------
+-- em = custom error override (binop sites, mirrors map_err REPLACE);
+-- "" = default core message. All failures prepend current ectx.
+
+let ti_fail em s dflt = if em == "" then error (tis_ectx s ++ dflt) else error (tis_ectx s ++ em)
+
+let ti_err s msg = error (tis_ectx s ++ msg)
+
+let ti_bind v t s em =
+  if ti_occurs v t (tis_sub s) then
+    ti_fail em s ("infinite type: cannot unify `" ++ ti_show s (TVI v) ++ "` with `" ++ ti_show s t ++ "`")
+  else (v, t) :: tis_sub s
+
+let ti_bind_st x t s em = tis_with_sub s (ti_bind x t s em)
+
+let ti_mismatch ta tb s em =
+  ti_fail em s ("type mismatch: expected `" ++ ti_show s tb ++ "`, found `" ++ ti_show s ta ++ "`")
+
+let rec ti_unify_lists xs ys s ta tb em = case xs of
+    [] -> (case ys of
+      | [] -> s
+      | _ -> ti_mismatch ta tb s em)
+  | x :: xr -> (case ys of
+      | [] -> ti_mismatch ta tb s em
+      | y :: yr -> ti_unify_lists xr yr (ti_unify x y s em) ta tb em)
+
+and ti_unify a b s em =
+  ti_unify_ap (ti_chase (tis_sub s) a) (ti_chase (tis_sub s) b) s em
+
+and ti_unify_ap ta tb s em = case ta of
+    TVI x -> (case tb of
+      | TVI y -> if x == y then s else ti_bind_st x tb s em
+      | _ -> ti_bind_st x tb s em)
+  | _ -> ti_unify_nv ta tb s em
+
+and ti_unify_nv ta tb s em = case tb of
+    TVI _ -> ti_unify_ap tb ta s em
+  | _ -> ti_unify_struct ta tb s em
+
+and ti_unify_struct ta tb s em = case ta of
+    TC x -> (case tb of
+      | TC y -> if x == y then s else ti_mismatch ta tb s em
+      | _ -> ti_mismatch ta tb s em)
+  | TAr a1 a2 -> (case tb of
+      | TAr b1 b2 -> ti_unify a2 b2 (ti_unify a1 b1 s em) em
+      | _ -> ti_mismatch ta tb s em)
+  | TTup xs -> (case tb of
+      | TTup ys -> ti_unify_lists xs ys s ta tb em
+      | _ -> ti_mismatch ta tb s em)
+  | TApp n1 xs -> (case tb of
+      | TApp n2 ys ->
+          if n1 == n2 then ti_unify_lists xs ys s ta tb em
+          else ti_mismatch ta tb s em
+      | _ -> ti_mismatch ta tb s em)
+  | TVI _ -> ti_mismatch ta tb s em
+
+let ti_unify_d a b s = ti_unify a b s ""
+
+-- ---------- instantiation / generalization ----------
+
+let rec ti_inst_rewrite t mp s = case ti_chase (tis_sub s) t of
+    TVI x -> TVI (ti_find_int mp x)
+  | TC _ -> t
+  | TAr a b -> TAr (ti_inst_rewrite a mp s) (ti_inst_rewrite b mp s)
+  | TTup ts -> TTup (ti_inst_map ts mp s)
+  | TApp n ts -> TApp n (ti_inst_map ts mp s)
+
+and ti_inst_map ts mp s = case ts of
+    [] -> []
+  | h :: rest -> ti_inst_rewrite h mp s :: ti_inst_map rest mp s
+
+let ti_instantiate qvars ty s =
+  let (s1, base) = ti_fresh_n s (len qvars) in
+  let mp = ti_zip_ids qvars base in
+  let res = ti_inst_rewrite ty mp s1 in
+  (s1, res)
+
+let rec ti_free_chase t s acc = case ti_chase (tis_sub s) t of
+    TVI x -> if ti_mem_int x acc then acc else x :: acc
+  | TC _ -> acc
+  | TAr a b -> ti_free_chase b s (ti_free_chase a s acc)
+  | TTup ts -> ti_free_chase_list ts s acc
+  | TApp _ ts -> ti_free_chase_list ts s acc
+
+and ti_free_chase_list ts s acc = case ts of
+    [] -> acc
+  | h :: rest -> ti_free_chase_list rest s (ti_free_chase h s acc)
+
+let rec ti_env_free env s acc = case env of
+    [] -> acc
+  | kv :: rest -> case kv of
+      | (_, sch) -> case sch of
+          | Sch q ty ->
+              let f = ti_diff (ti_free_chase ty s []) q in
+              ti_env_free rest s (ti_union_new f acc)
+
+and ti_union_new xs acc = case xs of
+    [] -> acc
+  | h :: rest -> if ti_mem_int h acc then ti_union_new rest acc else ti_union_new rest (h :: acc)
+
+let ti_generalize env t s =
+  let ef = ti_env_free env s [] in
+  Sch (ti_nub [] (ti_diff (ti_free_chase t s []) ef)) t
+
+-- ---------- item-boundary normalize + prune ----------
+-- Sound (top-level schemes are closed: every var in a stored ty is either
+-- quantified or ground after normalization): rewrite every env scheme through
+-- the current substitution, then the substitution can be dropped. This keeps
+-- chase chains short and the live set bounded (linear scaling); without it
+-- raw stored types force all history to stay live (super-quadratic blowup).
+
+let rec ti_norm_env env s = case env of
+    [] -> []
+  | kv :: rest -> case kv of
+      | (nm, sch) -> case sch of
+          | Sch q ty -> (nm, Sch q (ti_apply (tis_sub s) ty)) :: ti_norm_env rest s
+
+-- ---------- source type conversion (mirrors resolve_tyast) ----------
+
+let ti_base_case n args ty s = case args of
+    [] -> ty
+  | _ -> ti_err s ("unknown type `" ++ n ++ "`")
+
+let rec ti_resolve ta scope s = case ta of
+    TTVar v ->
+      let id = ti_lookup_str scope v in
+      if id == (0 - 1) then ti_err s ("unbound type variable `" ++ v ++ "`")
+      else TVI id
+  | TTCon n args ->
+      if n == "Int" then ti_base_case n args (TC "Int") s
+      else if n == "Bool" then ti_base_case n args (TC "Bool") s
+      else if n == "String" then ti_base_case n args (TC "String") s
+      else if n == "Unit" then ti_base_case n args (TC "Unit") s
+      else if n == "List" then (case args of
+        | [e] -> TApp "List" [ti_resolve e scope s]
+        | _ -> ti_err s "`List` expects exactly one argument")
+      else
+        let ar = ti_lookup_str (tis_tydefs s) n in
+        if ar == (0 - 1) then ti_err s ("unknown type `" ++ n ++ "`")
+        else if ar == len args then
+          TApp n (ti_resolve_list args scope s)
+        else
+          ti_err s ("type `" ++ n ++ "` expects " ++ int_to_string ar ++ " arguments, got " ++ int_to_string (len args))
+  | TTArr a b -> TAr (ti_resolve a scope s) (ti_resolve b scope s)
+  | TTTup ts -> TTup (ti_resolve_list ts scope s)
+
+and ti_resolve_list ts scope s = case ts of
+    [] -> []
+  | h :: rest -> ti_resolve h scope s :: ti_resolve_list rest scope s
+
+let ti_is_builtin_ty n =
+  if n == "Int" then true
+  else if n == "Bool" then true
+  else if n == "String" then true
+  else if n == "Unit" then true
+  else if n == "List" then true
+  else false
+
+let rec ti_dup_tydef tydefs n = case tydefs of
+    [] -> false
+  | kv :: rest -> case kv of
+      | (k, _) -> if k == n then true else ti_dup_tydef rest n
+
+let rec ti_resolve_fields fs scope s = case fs of
+    [] -> []
+  | h :: rest -> ti_resolve h scope s :: ti_resolve_fields rest scope s
+
+let rec ti_mk_arrows ftys res = case ftys of
+    [] -> res
+  | h :: rest -> TAr h (ti_mk_arrows rest res)
+
+let rec ti_ctor_schemes cds tname param_ids s scope acc = case cds of
+    [] -> rev_acc [] acc
+  | cd :: rest -> case cd of
+      | CtorDecl4 cn fs ->
+          let ftys = ti_resolve_fields fs scope s in
+          let full = ti_mk_arrows ftys (TApp tname (ti_mk_tvis param_ids)) in
+          ti_ctor_schemes rest tname param_ids s scope ((cn, Sch (ti_nub [] (ti_free_ty full [])) full) :: acc)
+
+and ti_mk_tvis ids = case ids of
+    [] -> []
+  | h :: rest -> TVI h :: ti_mk_tvis rest
+
+let rec ti_map_snd kvs = case kvs of
+    [] -> []
+  | kv :: rest -> case kv of
+      | (_, v) -> v :: ti_map_snd rest
+
+let ti_check_tydef td s = case td of
+  | TyDecl4 name params ctors ->
+      let tydefs = tis_tydefs s in
+      if ti_is_builtin_ty name then
+        ti_err s ("cannot redefine built-in type `" ++ name ++ "`")
+      else if ti_dup_tydef tydefs name then
+        ti_err s ("duplicate type definition `" ++ name ++ "`")
+      else
+        let (s1, base) = ti_fresh_n s (len params) in
+        let scope = ti_zip_ids params base in
+        let param_ids = ti_map_snd scope in
+        let tydefs2 = (name, len params) :: tydefs in
+        let sa = tis_with_tydefs s1 tydefs2 in
+        let schemes = ti_ctor_schemes ctors name param_ids sa scope [] in
+        (sa, schemes)
+
+-- ---------- pattern typing (mirrors gen0 pat_type) ----------
+
+let rec ti_range base n = if n == 0 then [] else base :: ti_range (base + 1) (n - 1)
+
+let rec ti_map_fst kvs = case kvs of
+    [] -> []
+  | kv :: rest -> case kv of
+      | (k, _) -> k :: ti_map_fst rest
+
+let rec ti_env_find env name = case env of
+    [] -> Sch [] (TC "!!unbound!!")
+  | kv :: rest -> case kv of
+      | (k, sch) -> if k == name then sch else ti_env_find rest name
+
+let rec ti_env_has env name = case env of
+    [] -> false
+  | kv :: rest -> case kv of
+      | (k, _) -> if k == name then true else ti_env_has rest name
+
+let rec ti_decomp_args t acc s = case ti_chase (tis_sub s) t of
+    TAr a b -> ti_decomp_args b (a :: acc) s
+  | _ -> (rev_acc [] acc, t)
+
+let rec ti_pat_each ps ts binds env s = case ps of
+    [] -> (s, binds)
+  | p :: rest -> (case ts of
+      | [] -> (s, binds)
+      | t :: tr ->
+          let (s1, b1) = ti_pat_type p t binds env s in
+          ti_pat_each rest tr b1 env s1)
+
+and ti_pat_type pat ty binds env s = case pat of
+    PWild -> (s, binds)
+  | PVar n -> (s, (n, Sch [] ty) :: binds)
+  | PInt _ -> (ti_unify_d ty (TC "Int") s, binds)
+  | PBool _ -> (ti_unify_d ty (TC "Bool") s, binds)
+  | PStr _ -> (ti_unify_d ty (TC "String") s, binds)
+  | PUnit -> (ti_unify_d ty (TC "Unit") s, binds)
+  | PTup ps ->
+      let n = len ps in
+      let (s1, base) = ti_fresh_n s n in
+      let tvs = ti_mk_tvis (ti_range base n) in
+      let s2 = ti_unify_d ty (TTup tvs) s1 in
+      ti_pat_each ps tvs binds env s2
+  | PCtor name ps ->
+      if ti_env_has env name then
+        let sch = ti_env_find env name in
+        case sch of
+          | Sch qvs sty ->
+              let (s1, ity) = ti_instantiate qvs sty s in
+              case ti_decomp_args ity [] s1 of
+                | (argtys, resty) ->
+                    if len argtys == len ps then
+                      let s2 = ti_unify_d ty resty s1 in
+                      ti_pat_each ps argtys binds env s2
+                    else
+                      ti_err s1 ("constructor `" ++ name ++ "` expects " ++ int_to_string (len argtys) ++ " argument(s), pattern gives " ++ int_to_string (len ps))
+      else ti_err s ("unknown constructor `" ++ name ++ "`")
+
+-- ---------- expression typing (mirrors gen0 expr_type) ----------
+
+let ti_bin_shape t wantname s op side = case ti_chase (tis_sub s) t of
+    TVI _ -> s
+  | TC w ->
+      if w == wantname then s
+      else ti_err s ("operator `" ++ op ++ "` expects `" ++ wantname ++ "` operands, got " ++ side ++ " `" ++ ti_show s t ++ "`")
+  | _ -> ti_err s ("operator `" ++ op ++ "` expects `" ++ wantname ++ "` operands, got " ++ side ++ " `" ++ ti_show s t ++ "`")
+
+let rec ti_bin_check op tl tr wantname s =
+  let s1 = ti_bin_shape tl wantname s op "left" in
+  let s2 = ti_bin_shape tr wantname s1 op "right" in
+  let s3 = ti_unify_d tl (TC wantname) s2 in
+  ti_unify_d tr (TC wantname) s3
+
+let rec ti_app_binds a b = case a of
+    [] -> b
+  | h :: rest -> h :: ti_app_binds rest b
+
+let rec ti_mem_str x xs = case xs of
+    [] -> false
+  | h :: rest -> if h == x then true else ti_mem_str x rest
+
+let rec ti_ann_vars ta acc = case ta of
+    TTVar v -> if ti_mem_str v acc then acc else v :: acc
+  | TTCon _ args -> ti_ann_var_list args acc
+  | TTArr a b -> ti_ann_vars b (ti_ann_vars a acc)
+  | TTTup ts -> ti_ann_var_list ts acc
+
+and ti_ann_var_list ts acc = case ts of
+    [] -> acc
+  | h :: rest -> ti_ann_var_list rest (ti_ann_vars h acc)
+
+let ti_ann_scope ty = rev_acc [] (ti_ann_vars ty [])
+
+let ti_unify_wrap a b s prefix =
+  let e0 = tis_ectx s in
+  let s1 = ti_unify_d a b (ti_push_ctx s prefix) in
+  ti_with_ctx s1 e0
+
+let ti_binop_arith op tl tr s wantname ret =
+  (ti_bin_check op tl tr wantname s, ret)
+
+let ti_binop_eq op tl tr s =
+  (ti_unify_wrap tl tr s ("`" ++ op ++ "`: "), TC "Bool")
+
+let ti_binop op tl tr s =
+  if op == "+" then ti_binop_arith op tl tr s "Int" (TC "Int")
+  else if op == "-" then ti_binop_arith op tl tr s "Int" (TC "Int")
+  else if op == "*" then ti_binop_arith op tl tr s "Int" (TC "Int")
+  else if op == "/" then ti_binop_arith op tl tr s "Int" (TC "Int")
+  else if op == "%" then ti_binop_arith op tl tr s "Int" (TC "Int")
+  else if op == "++" then ti_binop_arith op tl tr s "String" (TC "String")
+  else if op == "::" then
+    let (s1, a) = ti_fresh s in
+    let s2 = ti_unify_wrap tl (TVI a) s1 "`::`: " in
+    let s3 = ti_unify_wrap tr (TApp "List" [TVI a]) s2 "`::`: " in
+    (s3, TApp "List" [TVI a])
+  else if op == "==" then ti_binop_eq op tl tr s
+  else if op == "!=" then ti_binop_eq op tl tr s
+  else if op == "<" then ti_binop_arith op tl tr s "Int" (TC "Bool")
+  else if op == ">" then ti_binop_arith op tl tr s "Int" (TC "Bool")
+  else if op == "<=" then ti_binop_arith op tl tr s "Int" (TC "Bool")
+  else if op == ">=" then ti_binop_arith op tl tr s "Int" (TC "Bool")
+  else if op == "&&" then ti_binop_arith op tl tr s "Bool" (TC "Bool")
+  else if op == "||" then ti_binop_arith op tl tr s "Bool" (TC "Bool")
+  else ti_err s ("unknown operator `" ++ op ++ "`")
+
+let rec ti_infer_e e env s = case e of
+    EInt _ -> (s, TC "Int")
+  | EBool _ -> (s, TC "Bool")
+  | EStr _ -> (s, TC "String")
+  | EUnit -> (s, TC "Unit")
+  | EVar n -> if ti_env_has env n then
+        case ti_env_find env n of
+          | Sch qvs sty ->
+              let (s1, ity) = ti_instantiate qvs sty s in
+              (s1, ity)
+      else ti_err s ("unbound variable `" ++ n ++ "`")
+  | ECtor n -> if ti_env_has env n then
+        case ti_env_find env n of
+          | Sch qvs sty ->
+              let (s1, ity) = ti_instantiate qvs sty s in
+              (s1, ity)
+      else ti_err s ("unbound variable `" ++ n ++ "`")
+  | ELam p body ->
+      let (s1, v) = ti_fresh s in
+      let (s2, bnds) = ti_pat_type p (TVI v) [] env s1 in
+      let (s3, bt) = ti_infer_e body (ti_app_binds bnds env) s2 in
+      (s3, TAr (TVI v) bt)
+  | EApp fe ae ->
+      let (s1, tf) = ti_infer_e fe env s in
+      let (s2, tx) = ti_infer_e ae env s1 in
+      let (s3, ctr) = ti_app_tick s2 in
+      let (s4, r) = ti_fresh s3 in
+      let s5 = ti_unify_wrap tf (TAr tx (TVI r)) s4 ("in application #" ++ int_to_string ctr ++ ": ") in
+      (s5, TVI r)
+  | EBin op l r ->
+      let (s1, tl) = ti_infer_e l env s in
+      let (s2, tr) = ti_infer_e r env s1 in
+      ti_binop op tl tr s2
+  | EIf c th el ->
+      let (s1, tc) = ti_infer_e c env s in
+      let s2 = ti_unify tc (TC "Bool") s1 "`if` condition must be Bool" in
+      let (s3, tt) = ti_infer_e th env s2 in
+      let (s4, te) = ti_infer_e el env s3 in
+      let s5 = ti_unify_wrap tt te s4 "if branches differ: " in
+      (s5, tt)
+  | ECase scrut brs ->
+      let (s1, st) = ti_infer_e scrut env s in
+      let (s2, rv) = ti_fresh s1 in
+      ti_case_brs brs st (TVI rv) env s2 0
+  | ELet isrec name rhs body ->
+      if isrec then
+        let (s1, v) = ti_fresh s in
+        let env1 = (name, Sch [] (TVI v)) :: env in
+        let (s2, rt) = ti_infer_e rhs env1 s1 in
+        let s3 = ti_unify_d (TVI v) rt s2 in
+        let sch = ti_generalize env rt s3 in
+        ti_infer_e body ((name, sch) :: env) s3
+      else if name == "_" then
+        let (s1, lt) = ti_infer_e rhs env s in
+        let s2 = ti_unify_wrap lt (TC "Unit") s1 "left side of `;` must be Unit: " in
+        ti_infer_e body env s2
+      else
+        let (s1, rt) = ti_infer_e rhs env s in
+        let sch = ti_generalize env rt s1 in
+        ti_infer_e body ((name, sch) :: env) s1
+  | ETup es -> ti_tup_elems es env s []
+  | EAnn inner ty ->
+      let scp = ti_ann_scope ty in
+      let (s0, base) = ti_fresh_n s (len scp) in
+      let scope = ti_zip_ids scp base in
+      let rt = ti_resolve ty scope s in
+      let (s1, et) = ti_infer_e inner env s0 in
+      let s2 = ti_unify_d et rt s1 in
+      (s2, rt)
+
+and ti_tup_elems es env s acc = case es of
+    [] -> (s, TTup (rev_acc [] acc))
+  | h :: rest ->
+      let (s1, t) = ti_infer_e h env s in
+      ti_tup_elems rest env s1 (t :: acc)
+
+and ti_case_brs brs st resty env s idx = case brs of
+    [] -> (s, resty)
+  | br :: rest -> case br of
+      | (pat, body) ->
+          let e0 = tis_ectx s in
+          let s_pushed = ti_push_ctx s ("case branch " ++ int_to_string idx ++ ": ") in
+          let (s1, bnds) = ti_pat_type pat st [] env s_pushed in
+          let s2 = ti_with_ctx s1 e0 in
+          let (s3, bt) = ti_infer_e body (ti_app_binds bnds env) s2 in
+          let s4 = ti_unify_wrap bt resty s3 ("case branch " ++ int_to_string idx ++ ": ") in
+          ti_case_brs rest st resty env s4 (idx + 1)
+
+-- ---------- top-level definition groups (mirrors infer_def_group) ----------
+
+let rec ti_dup_def ds s = case ds of
+    [] -> s
+  | d :: rest -> case d of
+      | Def3 _ nm _ ->
+          if ti_mem_str nm (ti_def_names rest) then
+            ti_err s ("duplicate definition `" ++ nm ++ "`")
+          else ti_dup_def rest s
+
+and ti_def_names ds = case ds of
+    [] -> []
+  | d :: rest -> case d of
+      | Def3 _ nm _ -> nm :: ti_def_names rest
+
+let rec ti_place ds env s n = case ds of
+    [] -> (s, env)
+  | d :: rest -> case d of
+      | Def3 isrec nm _ ->
+          if isrec then
+            let (s1, v) = ti_fresh s in
+            ti_place rest ((nm, Sch [] (TVI v)) :: env) s1 n
+          else if n > 1 then
+            ti_err s ("`" ++ nm ++ "`: all members of an `and` group must be recursive")
+          else ti_place rest env s n
+
+let ti_peel_ann bd = case bd of
+    EAnn inner ty -> (inner, SomeTy ty)
+  | _ -> (bd, NoneTy)
+
+let rec ti_bodies ds env_outer env_full s acc = case ds of
+    [] -> (s, rev_acc [] acc)
+  | d :: rest -> case d of
+      | Def3 isrec nm bd ->
+          let e0 = tis_ectx s in
+          let s_pushed = ti_push_ctx s ("in def `" ++ nm ++ "`: ") in
+          case ti_peel_ann bd of
+            | (inner, man) ->
+                let (s1, bt) = ti_infer_e inner env_full s_pushed in
+                let s1p = ti_with_ctx s1 e0 in
+                let s2 = if isrec then
+                      case ti_env_find env_full nm of
+                        | Sch _ (TVI v) ->
+                            ti_unify_wrap (TVI v) bt s1p ("in `" ++ nm ++ "`: ")
+                        | _ -> s1p
+                    else s1p in
+                case man of
+                  | NoneTy ->
+                      ti_bodies rest env_outer env_full s2 ((nm, bt) :: acc)
+                  | SomeTy ty ->
+                      let scp = ti_ann_scope ty in
+                      let (sa, base) = ti_fresh_n s2 (len scp) in
+                      let rty = ti_resolve ty (ti_zip_ids scp base) sa in
+                      let sb = ti_unify_wrap bt rty sa ("annotation on `" ++ nm ++ "`: ") in
+                      ti_bodies rest env_outer env_full sb ((nm, bt) :: acc)
+
+let rec ti_gen_all tys env_outer s acc = case tys of
+    [] -> (s, rev_acc [] acc)
+  | kv :: rest -> case kv of
+      | (nm, bt) ->
+          let sch = ti_generalize env_outer bt s in
+          ti_gen_all rest env_outer s ((nm, sch) :: acc)
+
+let ti_infer_def_group ds env s =
+  let s0 = ti_dup_def ds s in
+  let n = len ds in
+  let (s1, env_full) = ti_place ds env s0 n in
+  let (s2, btys) = ti_bodies ds env env_full s1 [] in
+  ti_gen_all btys env s2 []
+
+-- ---------- initial environment (mirrors gen0 builtins) ----------
+
+let ti_init_env s =
+  let (s1, a1) = ti_fresh s in
+  let nilsch = Sch [a1] (TApp "List" [TVI a1]) in
+  let (s2, a2) = ti_fresh s1 in
+  let conssch = Sch [a2] (TAr (TVI a2) (TAr (TApp "List" [TVI a2]) (TApp "List" [TVI a2]))) in
+  let monos = [("print_int", Sch [] (TAr (TC "Int") (TC "Unit"))),
+    ("print_string", Sch [] (TAr (TC "String") (TC "Unit"))),
+    ("int_to_string", Sch [] (TAr (TC "Int") (TC "String"))),
+    ("bool_to_string", Sch [] (TAr (TC "Bool") (TC "String"))),
+    ("string_length", Sch [] (TAr (TC "String") (TC "Int"))),
+    ("str_concat", Sch [] (TAr (TC "String") (TAr (TC "String") (TC "String")))),
+    ("read_file", Sch [] (TAr (TC "String") (TC "String"))),
+    ("write_file", Sch [] (TAr (TC "String") (TAr (TC "String") (TC "Unit")))),
+    ("exit", Sch [] (TAr (TC "Int") (TC "Unit"))),
+    ("chr", Sch [] (TAr (TC "Int") (TC "String"))),
+    ("ord", Sch [] (TAr (TC "String") (TC "Int"))),
+    ("string_get", Sch [] (TAr (TC "String") (TAr (TC "Int") (TC "Int")))),
+    ("substring", Sch [] (TAr (TC "String") (TAr (TC "Int") (TAr (TC "Int") (TC "String"))))),
+    ("string_to_int", Sch [] (TAr (TC "String") (TC "Int"))),
+    ("argv", Sch [] (TAr (TC "Int") (TC "String"))),
+    ("system", Sch [] (TAr (TC "String") (TC "Int")))] in
+  let (s3, a3) = ti_fresh s2 in
+  let errsch = Sch [a3] (TAr (TC "String") (TVI a3)) in
+  let (s4, a4) = ti_fresh s3 in
+  let showsch = Sch [a4] (TAr (TVI a4) (TC "String")) in
+  (s4, ("Nil", nilsch) :: ("Cons", conssch) :: ("error", errsch) :: ("show", showsch) :: monos)

@@ -1,0 +1,11 @@
+let main () =
+  let a = 10 in
+  let b = 20 in
+  let c = 30 in
+  let d = 40 in
+  let e = 50 in
+  let f = 60 in
+  let g = 70 in
+  let h = 80 in
+  let rec fld n = if n == 0 then a + b + c + d + e + f + g + h else fld (n - 1) in
+  print_int (fld 5)

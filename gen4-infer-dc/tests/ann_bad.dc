@@ -1,0 +1,3 @@
+let n : String = 42
+
+let main () = print_string n

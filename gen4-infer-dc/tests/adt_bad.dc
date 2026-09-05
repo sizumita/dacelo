@@ -1,0 +1,5 @@
+type Tree =
+  | Leaf Int
+  | Node (List Tree)
+
+let main () = print_int (size (Leaf "oops"))

@@ -1,0 +1,13 @@
+let rec assoc_ikey name lm = case lm of
+    [] -> 0 - 1
+  | kv :: rest -> case kv of
+      | (k2, v2) -> if k2 == name then v2 else assoc_ikey name rest
+
+let main () =
+  let sc = [("rest_ps", 0), ("sv", 1), ("t", 2), ("flbl", 3), ("cur_sc", 4), ("cid_tbl", 5), ("ar_tbl", 6), ("cur_ns", 7), ("j", 8)] in
+  print_int (assoc_ikey "sv" sc) ;
+  print_string " " ;
+  print_int (assoc_ikey "j" sc) ;
+  print_string " " ;
+  print_int (assoc_ikey "zzz" sc) ;
+  print_string "\n"

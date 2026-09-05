@@ -1,0 +1,9 @@
+type Pair a b =
+  | MkPair a b
+
+let swap p = case p of
+  | MkPair a b -> MkPair b a
+
+let main () =
+  case swap (MkPair 1 "x") of
+    | MkPair s n -> print_string s

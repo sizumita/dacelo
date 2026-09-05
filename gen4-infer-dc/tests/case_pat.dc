@@ -1,0 +1,5 @@
+let f x = case x of
+  | (a, b) -> a + b
+  | _ -> 0
+
+let main () = print_int (f (3, 4))

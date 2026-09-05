@@ -1,0 +1,10 @@
+let g v = v + 1
+
+let f n =
+  let rec loop x =
+    let tmp = g (let rec loop y = y + 1000 in loop 1) in
+    if x == 0 then tmp else loop (x - 1) + tmp
+  in
+  loop n
+
+let main () = print_int (f 2)

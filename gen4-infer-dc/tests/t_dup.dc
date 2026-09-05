@@ -1,0 +1,10 @@
+let rec assoc_ikey name lm = case lm of
+    [] -> 0 - 1
+  | kv :: rest -> case kv of
+      | (k2, v2) -> if k2 == name then v2 else assoc_ikey name rest
+
+let main () =
+  print_int (assoc_ikey "fld" [("fld", 111), ("fld", 222)]) ;
+  print_string " " ;
+  print_int (assoc_ikey "fld" [("other", 0), ("fld", 222), ("fld", 111)]) ;
+  print_string "\n"

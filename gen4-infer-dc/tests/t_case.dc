@@ -1,0 +1,20 @@
+type T = A Int | B Int Int | C
+
+let f t u = case t of
+    A x -> case u of
+      | A y -> x + y + 100
+      | _ -> x + 200
+  | B x y -> case u of
+      | B p q -> x + y + p + q + 300
+      | _ -> 400
+  | C -> 500
+
+let main () =
+  print_int (f (A 1) (A 2)) ;
+  print_string " " ;
+  print_int (f (A 1) (B 2 3)) ;
+  print_string " " ;
+  print_int (f (B 1 2) (B 3 4)) ;
+  print_string " " ;
+  print_int (f C (A 9)) ;
+  print_string "\n"

@@ -1,0 +1,13 @@
+let id x = x
+
+let const a b = a
+
+let apply f x = f x
+
+let main () =
+  let s = id "hello" in
+  let n = id 42 in
+  print_string s ;
+  print_string " " ;
+  print_int (apply id n) ;
+  print_string "\n"

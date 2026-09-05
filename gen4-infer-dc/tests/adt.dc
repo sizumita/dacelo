@@ -1,0 +1,12 @@
+type Tree =
+  | Leaf Int
+  | Node (List Tree)
+
+let rec size t = case t of
+  | Leaf _ -> 1
+  | Node xs -> sum_list xs
+and sum_list xs = case xs of
+  | [] -> 0
+  | h :: rest -> size h + sum_list rest
+
+let main () = print_int (size (Node [Leaf 1, Node [Leaf 2]]))

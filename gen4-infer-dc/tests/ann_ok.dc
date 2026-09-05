@@ -1,0 +1,7 @@
+let id x = x
+
+let n : Int = 42
+
+let f : Int -> Int = fun x -> x + 1
+
+let main () = print_int (f n)
