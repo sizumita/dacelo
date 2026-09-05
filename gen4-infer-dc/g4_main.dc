@@ -1,0 +1,9 @@
+
+let main () =
+  print_string "" ;
+  let path = argv 1 in
+  let src = read_file path in
+  let toks = lex_all src in
+  let prog = parse_prog toks in
+  let done1 = g4_check prog in
+  print_string ""

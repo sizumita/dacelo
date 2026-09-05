@@ -1,0 +1,31 @@
+-- Gen4 compiler driver: Gen4 HM typecheck FIRST, then Gen3 codegen.
+-- CLI identical to dcc_1: ./dcc_4 <in.dc> <out_base>
+-- Ill-typed inputs are rejected with the Gen0-style message (exit 1)
+-- BEFORE any output is written. Well-typed inputs produce .s identical
+-- to dcc_1 (same emit_code).
+
+let main () =
+  print_string "" ;
+  let in_path = argv 1 in
+  let out_base = argv 2 in
+  let src_code = read_file in_path in
+  let toks = lex_all src_code in
+  let prog = parse_prog toks in
+  let checked = g4_check prog in
+  let tabs = build_tables prog in
+  let all_defs = case tabs of
+      | (a, b, c) -> c in
+  let ct_id_tbl = case tabs of
+      | (a, b, c) -> a in
+  let ct_ar_tbl = case tabs of
+      | (a, b, c) -> b in
+
+  let lines_fwd = emit_code prog in
+  let content = join_chunks lines_fwd in
+  let s_path = out_base ++ ".s" in
+  write_file s_path content ;
+  let rt_c = "gen2-dcc-rs/rt/rt.c" in
+  let _r1 = system ("cc -O2 -arch arm64 -c " ++ s_path ++ " -o " ++ out_base ++ ".o") in
+  let _r2 = system ("cc -O2 -arch arm64 -c " ++ rt_c ++ " -o " ++ out_base ++ ".rt.o") in
+  let _r3 = system ("cc " ++ out_base ++ ".o " ++ out_base ++ ".rt.o -o " ++ out_base) in
+  print_string ("wrote " ++ out_base ++ "\n")

@@ -76,3 +76,20 @@ pfx160 0.60s/486MB, full `dcc.dc` (278 items) 7.6s, self (`g4_full.dc`,
   explicit-subst + runtime block overhead; typical programs run in ms/MBs).
 - Gen3 chain re-verified after frontend extensions: typecheck OK,
   examples 5/5, `dcc_2.s == dcc_3.s` (0 diff), `t_overwrite` 200 400.
+
+## Gen4 builds Gen4 (check+codegen integration)
+`gen4check` checks but cannot emit binaries. Integration (`g4cc_driver.dc`):
+check-then-compile with the exact `dcc_1` CLI.
+- Reuse without touching Gen3: `main` moved out of `g3_driver_v2.dc`
+  into `g3_main.dc` (pure move; 5-file concat is byte-identical to the old
+  4-file concat — Gen3 chain re-verified green). Same split for the Gen4
+  driver (`g4_check.dc` + `g4_main.dc`).
+- `g4cc_full.dc` = frontend + `infer.dc` + backend + `g4_check.dc` +
+  `g4cc_driver.dc` (3179 lines, no name clashes, Gen0 typecheck clean).
+- `dcc_1` builds `dcc_4`: `.s` byte-identical to `dcc_1` on all 5 examples
+  (same `emit_code`), all run OK; `t_bad`/`unbound`/`occurs` rejected with
+  Gen0-identical messages, no output files written.
+- `dcc_4` builds `dcc_5` from the same source: `dcc_4.s == dcc_5.s`
+  (fixpoint), `dcc_5` runs fib OK and still rejects ill-typed.
+- `zsh gen4-infer-dc/test.sh` runs A (checker oracle) + B (compiler
+  identity/reject) + C (self-build fixpoint) end to end, exit 0.

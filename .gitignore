@@ -7,6 +7,8 @@ dcc_1
 dcc_2
 dcc_2dbg
 dcc_3
+dcc_4
+dcc_5
 gen4check
 gen4dbg
 
@@ -20,6 +22,7 @@ gen4dbg
 
 # Generated concatenation for Gen4 build (rebuilt by gen4-infer-dc/test.sh)
 gen4-infer-dc/g4_full.dc
+gen4-infer-dc/g4cc_full.dc
 
 # Local scratch / temp files
 *.log

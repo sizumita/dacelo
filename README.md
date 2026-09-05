@@ -89,19 +89,27 @@ dcc-rs -o dcc_1 dcc.dc     # Rust 製コンパイラで dacelo 製コンパイ�
 ```
 ./dcc_1 gen4-infer-dc/g4_full.dc gen4check   # dacelo 製コンパイラで型検査器をビルド
 ./gen4check <file.dc>                        # Gen0 --types と終了コード+stderr が一致
+./dcc_1 gen4-infer-dc/g4cc_full.dc dcc_4     # 型検査つきコンパイラをビルド
+./dcc_4 gen4-infer-dc/g4cc_full.dc dcc_5     # Gen4 が Gen4 自身をビルド
 ```
 
-達成内容: dacelo 自身で書かれた Hindley-Milner 型推論(`infer.dc` + ドライバ)が
-`dcc_1` でビルドした `gen4check` として動作し、38 ケースのオラクル
-(examples + ADT/多相/注釈/occurs-check/否定ケース)で Gen0 と完全一致。
-`dcc.dc` 自身と `g4_full.dc` 自身の検査にも成功(Gen0 と同意)。
+達成内容:
+- dacelo 自身で書かれた Hindley-Milner 型推論(`infer.dc` + ドライバ)が
+  `dcc_1` でビルドした `gen4check` として動作し、38 ケースのオラクル
+  (examples + ADT/多相/注釈/occurs-check/否定ケース)で Gen0 と完全一致。
+- 型検査＋コード生成の統合コンパイラ `dcc_4` が `dcc_1` とバイト一致の
+  `.s` を全サンプルで生成し、ill-typed を Gen0 形式で拒否。
+- `dcc_4` が自分自身のソースから `dcc_5` をビルドし
+  `dcc_4.s == dcc_5.s` の不動点に到達 = **Gen4 で Gen4 をビルド**。
 詳細は [gen4-infer-dc/RESUME.md](./gen4-infer-dc/RESUME.md)。
 検証: `zsh gen4-infer-dc/test.sh`。
 
 ## ステータス
 
-Gen 0〜4 完了。Gen 4(`gen4-infer-dc/`)は dacelo 製 HM 型推論:
-`dcc_1` でビルドした `gen4check` が Gen0 `--types` と 38 ケース完全一致。
+Gen 0〜4 完了。Gen 4(`gen4-infer-dc/`)は dacelo 製 HM 型推論＋統合コンパイラ:
+`gen4check` が Gen0 `--types` と 38 ケース完全一致し、`dcc_4` が `dcc_1` と
+同一のバイナリを生成しつつ ill-typed を拒否、`dcc_4` が `dcc_5` を
+セルフビルド(不動点到達)。
 
 **Gen 3 完了**: `gen3-dcc-dc/` — dacelo 自身で書かれたコンパイラが
 自分自身をコンパイルして完全動作する `dcc_2` を生成し、`dcc_2` の
