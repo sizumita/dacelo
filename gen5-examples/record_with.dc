@@ -1,0 +1,7 @@
+-- Record same-type update executed natively (lowered to assoc-list + helpers).
+-- Run: ./dcc_6 gen5-examples/record_with.dc /tmp/rw && /tmp/rw -> prints 2
+
+let alice = { name = "Alice", next_type = 1 }
+let bumped = { alice with next_type = alice.next_type + 1 }
+
+let main () = print_int bumped.next_type

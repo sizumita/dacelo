@@ -1,0 +1,18 @@
+-- Gen5 syntax example: immutable row-polymorphic records
+-- Unique labels, order-independent identity, `{ s with f = ... }` same-type update.
+-- Run: ./dcc_6 gen5-examples/record.dc /tmp/r && /tmp/r   (prints Alice,Bob)
+
+let name_of r = r.name
+-- inferred: forall a r. { name : a | r } -> a
+
+let alice = { name = "Alice", age = 30 }
+let bob = { age = 25, name = "Bob" }
+
+let fresh s =
+  ({ s with next_type = s.next_type + 1 }, s.next_type)
+
+let main () =
+  print_string (name_of alice) ;
+  print_string "," ;
+  print_string (name_of bob) ;
+  print_string "\n"

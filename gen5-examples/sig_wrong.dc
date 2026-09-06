@@ -1,0 +1,5 @@
+-- Negative sig contract: implementation is Int -> Int, not forall a. a -> a.
+-- `gen5check check` must reject (exit 1). See sig.dc for passing contracts.
+
+sig wrong : forall a. a -> a
+let wrong x = x + 1

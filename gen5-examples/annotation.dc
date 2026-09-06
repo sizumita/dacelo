@@ -1,0 +1,9 @@
+-- Gen5 syntax example: annotations (flexible `e : T`, unchanged legacy meaning)
+-- Contrast with `sig` (rigid contract). Annotations use fresh flexible vars,
+-- so `(fun x -> x + 1) : a -> a` can specialize `a := Int`.
+-- Run: ./dcc_6 gen5-examples/annotation.dc /tmp/a && /tmp/a  /  ./gen5check check gen5-examples/annotation.dc
+
+let swap p : (Int, Bool) -> (Bool, Int) = case p of
+  | (x, b) -> (b, x)
+
+let main () = print_string (show (swap (3, true)))

@@ -1,0 +1,17 @@
+-- Gen5 syntax example: let / case / ADT (unchanged core, HM let-poly preserved)
+-- Run: ./dcc_6 gen5-examples/let_case_adt.dc /tmp/lc && /tmp/lc  /  ./gen5check check gen5-examples/let_case_adt.dc
+
+type Tree =
+  | Leaf
+  | Node Int Tree Tree
+
+let rec sum t = case t of
+    Leaf -> 0
+  | Node v l r -> v + sum l + sum r
+
+let id x = x
+let pair = (id 1, id true)
+
+let main () =
+  print_int (sum (Node 1 Leaf (Node 2 Leaf Leaf))) ;
+  print_string "\n"

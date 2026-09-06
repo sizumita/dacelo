@@ -1,0 +1,2213 @@
+-- ============================================================
+-- gen5/g5_infer.dc -- Gen5 type inference in Dacelo (fresh lineage)
+--
+-- Extends Gen4's explicit-substitution Algorithm W (see infer.dc) with:
+--   Ty5 rows (unique-label, open tails), skolem TC5 "@skN" for sig,
+--   holes (?name -> fresh var + hole table + partial flags),
+--   Result-threading (no `error` aborts for type errors; fatal bugs
+--   still use error), per-item snapshots/rollback, node-type recording
+--   (trace flag), symbol table, warnings, bounded trace log.
+-- Only Gen4-subset syntax is used in this file (bootstrap stage 1-2).
+-- ============================================================
+
+-- ---------- types ----------
+
+type RowTail5 = RClosed5 | ROpen5 Int
+
+type Ty5 =
+  | TVI5 Int
+  | TC5 String
+  | TAr5 Ty5 Ty5
+  | TTup5 (List Ty5)
+  | TApp5 String (List Ty5)
+  | TRec5 (List (String, Ty5)) RowTail5
+
+-- Sch5 qvars qrows body partial?
+type Sch5 = Sch5 (List Int) (List Int) Ty5 Bool
+
+type RowC5 = RowC5 (List (String, Ty5)) RowTail5
+
+-- HoleE5 nodeid name type candidates(name, inst-type, declspan) capped?
+-- (capped = candidate walk hit the display limit; trial/rollback semantics
+-- unchanged, only listing is truncated. JSON-only transparency flag.)
+type HoleE5 = HoleE5 Int String Ty5 (List (String, Ty5, Span)) Bool
+
+-- SymE5 symid name declspan nodeid scheme (normalized at bind time)
+type SymE5 = SymE5 Int String Span Int Sch5
+
+-- NodeE5 id span octy symid optscheme inst expected reason
+-- symid -1 = none; optscheme NULLSch5 = not a use/def site with scheme
+type NodeE5 = NodeE5 Int Span Ty5 Int Sch5 (List (Int, Ty5)) Ty5 String
+
+let g5_null_sch = Sch5 [] [] (TC5 "@none") false
+let g5_no_expected = TC5 "@none"
+
+-- Warn5 kind msg span missing-examples sites (sites: machine spans,
+-- JSON-only; text mode never prints warnings so Gen0 parity is unaffected)
+type Warn5 = Warn5 String String Span (List String) (List Span)
+
+-- BindTy5 name span principal-scheme status contract-sig (g5_no_sig5 = none)
+-- RFC 5.3: implementation principal vs public contract kept apart; callers
+-- in v1 use the principal closed scheme (sound, more general); the .dci
+-- publishes the contract when present and `types` returns both fields.
+type BindTy5 = BindTy5 String Span Sch5 String Sig5
+
+let g5_no_sig5 = Sig5 "" [] (TTCon5 "Unit" [] span_dummy) span_dummy
+
+-- ItemSum5 kind span binds tracelog status
+type ItemSum5 = ItemSum5 String Span (List BindTy5) (List String) String
+
+-- Ckpt5 env tydefs ctr appn rowctr
+type Ckpt5 = Ckpt5 (List (String, Sch5)) (List (String, Int, List String)) Int Int Int
+
+-- TIS5: subst ctr appn ectx tydefs rowctr rowsubst holevars holes
+--       syms symctr nodectr nodes warns tracelog trace?
+-- tydefs entries: (name, arity, ctors)
+type TIS5 = TIS5 (List (Int, Ty5)) Int Int String (List (String, Int, List String)) Int (List (Int, RowC5)) (List Int) (List HoleE5) (List SymE5) Int Int (List NodeE5) (List Warn5) (List String) Bool
+
+let g5s_subst s = case s of | TIS5 a _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ -> a
+let g5s_ctr s = case s of | TIS5 _ a _ _ _ _ _ _ _ _ _ _ _ _ _ _ -> a
+let g5s_appn s = case s of | TIS5 _ _ a _ _ _ _ _ _ _ _ _ _ _ _ _ -> a
+let g5s_ectx s = case s of | TIS5 _ _ _ a _ _ _ _ _ _ _ _ _ _ _ _ -> a
+let g5s_tydefs s = case s of | TIS5 _ _ _ _ a _ _ _ _ _ _ _ _ _ _ _ -> a
+let g5s_rowctr s = case s of | TIS5 _ _ _ _ _ a _ _ _ _ _ _ _ _ _ _ -> a
+let g5s_rowsubst s = case s of | TIS5 _ _ _ _ _ _ a _ _ _ _ _ _ _ _ _ -> a
+let g5s_holevars s = case s of | TIS5 _ _ _ _ _ _ _ a _ _ _ _ _ _ _ _ -> a
+let g5s_holes s = case s of | TIS5 _ _ _ _ _ _ _ _ a _ _ _ _ _ _ _ -> a
+let g5s_syms s = case s of | TIS5 _ _ _ _ _ _ _ _ _ a _ _ _ _ _ _ -> a
+let g5s_symctr s = case s of | TIS5 _ _ _ _ _ _ _ _ _ _ a _ _ _ _ _ -> a
+let g5s_nodectr s = case s of | TIS5 _ _ _ _ _ _ _ _ _ _ _ a _ _ _ _ -> a
+let g5s_nodes s = case s of | TIS5 _ _ _ _ _ _ _ _ _ _ _ _ a _ _ _ -> a
+let g5s_warns s = case s of | TIS5 _ _ _ _ _ _ _ _ _ _ _ _ _ a _ _ -> a
+let g5s_tracelog s = case s of | TIS5 _ _ _ _ _ _ _ _ _ _ _ _ _ _ a _ -> a
+let g5s_trace s = case s of | TIS5 _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ a -> a
+
+let g5s_with_subst s v = case s of | TIS5 _ b c d e f g h i j k l m n o p -> TIS5 v b c d e f g h i j k l m n o p
+let g5s_with_ctr s v = case s of | TIS5 a _ c d e f g h i j k l m n o p -> TIS5 a v c d e f g h i j k l m n o p
+let g5s_with_appn s v = case s of | TIS5 a b _ d e f g h i j k l m n o p -> TIS5 a b v d e f g h i j k l m n o p
+let g5s_with_ectx s v = case s of | TIS5 a b c _ e f g h i j k l m n o p -> TIS5 a b c v e f g h i j k l m n o p
+let g5s_with_tydefs s v = case s of | TIS5 a b c d _ f g h i j k l m n o p -> TIS5 a b c d v f g h i j k l m n o p
+let g5s_with_rowctr s v = case s of | TIS5 a b c d e _ g h i j k l m n o p -> TIS5 a b c d e v g h i j k l m n o p
+let g5s_with_rowsubst s v = case s of | TIS5 a b c d e f _ h i j k l m n o p -> TIS5 a b c d e f v h i j k l m n o p
+let g5s_with_holevars s v = case s of | TIS5 a b c d e f g _ i j k l m n o p -> TIS5 a b c d e f g v i j k l m n o p
+let g5s_with_holes s v = case s of | TIS5 a b c d e f g h _ j k l m n o p -> TIS5 a b c d e f g h v j k l m n o p
+let g5s_with_syms s v = case s of | TIS5 a b c d e f g h i _ k l m n o p -> TIS5 a b c d e f g h i v k l m n o p
+let g5s_with_symctr s v = case s of | TIS5 a b c d e f g h i j _ l m n o p -> TIS5 a b c d e f g h i j v l m n o p
+let g5s_with_nodectr s v = case s of | TIS5 a b c d e f g h i j k _ m n o p -> TIS5 a b c d e f g h i j k v m n o p
+let g5s_with_nodes s v = case s of | TIS5 a b c d e f g h i j k l _ n o p -> TIS5 a b c d e f g h i j k l v n o p
+let g5s_with_warns s v = case s of | TIS5 a b c d e f g h i j k l m _ o p -> TIS5 a b c d e f g h i j k l m v o p
+let g5s_with_tracelog s v = case s of | TIS5 a b c d e f g h i j k l m n _ p -> TIS5 a b c d e f g h i j k l m n v p
+let g5s_with_trace s v = case s of | TIS5 a b c d e f g h i j k l m n o _ -> TIS5 a b c d e f g h i j k l m n o v
+
+let g5s_new = TIS5 [] 0 0 "" [] 0 [] [] [] [] 0 0 [] [] [] true
+
+let g5_push_ctx s frag = g5s_with_ectx s (g5s_ectx s ++ frag)
+
+-- trace log with cap 6 (freshest first)
+let rec g5_take5 k xs = if k == 0 then [] else
+  case xs of
+    | [] -> []
+    | h :: rest -> h :: g5_take5 (k - 1) rest
+
+let g5_trace_push s msg =
+  let lg = msg :: g5s_tracelog s in
+  g5s_with_tracelog s (g5_take5 6 lg)
+
+-- ---------- small assoc helpers (int keys reuse ti_*, new ones here) ----------
+
+
+let rec g5_mem_int x xs = case xs of
+    [] -> false
+  | h :: rest -> if h == x then true else g5_mem_int x rest
+
+let rec g5_nub acc xs = case xs of
+    [] -> rev_acc [] acc
+  | h :: rest -> if g5_mem_int h acc then g5_nub acc rest else g5_nub (h :: acc) rest
+
+let rec g5_diff a b = case a of
+    [] -> []
+  | h :: rest -> if g5_mem_int h b then g5_diff rest b else h :: g5_diff rest b
+
+let rec g5_find_int mp x = case mp of
+    [] -> x
+  | kv :: rest -> case kv of
+      | (k, v) -> if k == x then v else g5_find_int rest x
+
+let rec g5_find_str m x = case m of
+    [] -> ""
+  | kv :: rest -> case kv of
+      | (k, n) -> if k == x then n else g5_find_str rest x
+
+let rec g5_union_new xs acc = case xs of
+    [] -> acc
+  | h :: rest -> if g5_mem_int h acc then g5_union_new rest acc else g5_union_new rest (h :: acc)
+
+let rec g5_find_row mp x = case mp of
+    [] -> RowC5 [] RClosed5
+  | kv :: rest -> case kv of
+      | (k, t) -> if k == x then t else g5_find_row rest x
+
+let rec g5_has_row mp x = case mp of
+    [] -> false
+  | kv :: rest -> case kv of
+      | (k, _) -> if k == x then true else g5_has_row rest x
+
+let rec g5_find_ty5 mp x = case mp of
+    [] -> TVI5 x
+  | kv :: rest -> case kv of
+      | (k, t) -> if k == x then t else g5_find_ty5 rest x
+
+let rec g5_mem_str5 x xs = case xs of
+    [] -> false
+  | h :: rest -> if h == x then true else g5_mem_str5 x rest
+
+let rec g5_lookup_str5 scope v = case scope of
+    [] -> 0 - 1
+  | kv :: rest -> case kv of
+      | (k, n) -> if k == v then n else g5_lookup_str5 rest v
+
+let rec g5_zip_ids5 xs i = case xs of
+    [] -> []
+  | h :: rest -> (h, i) :: g5_zip_ids5 rest (i + 1)
+
+let rec g5_env_has5 env name = case env of
+    [] -> false
+  | kv :: rest -> case kv of
+      | (k, _) -> if k == name then true else g5_env_has5 rest name
+
+let rec g5_env_find5 env name = case env of
+    [] -> Sch5 [] [] (TC5 "!!unbound!!") false
+  | kv :: rest -> case kv of
+      | (k, sch) -> if k == name then sch else g5_env_find5 rest name
+
+let rec g5_sym_find5 syms id = case syms of
+    [] -> SymE5 (0 - 1) "" span_dummy (0 - 1) g5_null_sch
+  | sy :: rest -> case sy of
+      | SymE5 i _ _ _ _ -> if i == id then sy else g5_sym_find5 rest id
+
+let rec g5_node_find5 nodes id = case nodes of
+    [] -> NodeE5 (0 - 1) span_dummy (TC5 "!!missing!!") (0 - 1) g5_null_sch [] g5_no_expected ""
+  | nd :: rest -> case nd of
+      | NodeE5 i _ _ _ _ _ _ _ -> if i == id then nd else g5_node_find5 rest id
+
+-- ---------- substitution over Ty5 + rows ----------
+
+let rec g5_walk_full o s v = case s of
+    [] -> TVI5 v
+  | kv :: rest -> case kv of
+      | (k, t) -> if k == v then g5_chase o t else g5_walk_full o rest v
+
+and g5_chase s t = case t of
+    TVI5 x -> g5_walk_full s s x
+  | _ -> t
+
+let rec g5_apply st t = case g5_chase (g5s_subst st) t of
+    TVI5 _ -> g5_chase (g5s_subst st) t
+  | TC5 _ -> g5_chase (g5s_subst st) t
+  | TAr5 a b -> TAr5 (g5_apply st a) (g5_apply st b)
+  | TTup5 ts -> TTup5 (g5_map_apply st ts)
+  | TApp5 n ts -> TApp5 n (g5_map_apply st ts)
+  | TRec5 flds tl ->
+      let (ef, ft) = g5_row_chase (g5s_rowsubst st) tl in
+      TRec5 (g5_map_fields_apply st (g5_merge_fields flds ef)) ft
+
+and g5_map_apply st ts = case ts of
+    [] -> []
+  | h :: rest -> g5_apply st h :: g5_map_apply st rest
+
+and g5_map_fields_apply st flds = case flds of
+    [] -> []
+  | kv :: rest -> case kv of
+      | (lb, t) -> (lb, g5_apply st t) :: g5_map_fields_apply st rest
+
+-- row tail through rowsubst: (extra-fields, final-tail)
+and g5_row_chase rs tl = case tl of
+    RClosed5 -> ([], RClosed5)
+  | ROpen5 id ->
+      if g5_has_row rs id then
+        case g5_find_row rs id of
+          | RowC5 efs etl ->
+              let (ef2, ft) = g5_row_chase rs etl in
+              (g5_merge_fields efs ef2, ft)
+      else ([], ROpen5 id)
+
+and g5_merge_fields a b = case a of
+    [] -> b
+  | kv :: rest -> case kv of
+      | (lb, t) -> if g5_mem_field b lb then g5_merge_fields rest b else (lb, t) :: g5_merge_fields rest b
+
+and g5_mem_field flds lb = case flds of
+    [] -> false
+  | kv :: rest -> case kv of
+      | (l, _) -> if l == lb then true else g5_mem_field rest lb
+
+-- flatten a record type: merged fields + final tail
+and g5_flat_rec rs flds tl =
+  let (ef, ft) = g5_row_chase rs tl in
+  (g5_merge_fields flds ef, ft)
+
+let rec g5_occurs v t st = case g5_chase (g5s_subst st) t of
+    TVI5 x -> x == v
+  | TC5 _ -> false
+  | TAr5 a b -> if g5_occurs v a st then true else g5_occurs v b st
+  | TTup5 ts -> g5_occurs_list v ts st
+  | TApp5 _ ts -> g5_occurs_list v ts st
+  | TRec5 flds tl ->
+      let (ef, _) = g5_row_chase (g5s_rowsubst st) tl in
+      g5_occurs_fields v (g5_merge_fields flds ef) st
+
+and g5_occurs_list v ts st = case ts of
+    [] -> false
+  | h :: rest -> if g5_occurs v h st then true else g5_occurs_list v rest st
+
+and g5_occurs_fields v flds st = case flds of
+    [] -> false
+  | kv :: rest -> case kv of
+      | (_, t) -> if g5_occurs v t st then true else g5_occurs_fields v rest st
+
+-- row var occurs in a type (for bind_row)
+and g5_row_occurs rid t st = case g5_chase (g5s_subst st) t of
+    TVI5 _ -> false
+  | TC5 _ -> false
+  | TAr5 a b -> if g5_row_occurs rid a st then true else g5_row_occurs rid b st
+  | TTup5 ts -> g5_row_occurs_list rid ts st
+  | TApp5 _ ts -> g5_row_occurs_list rid ts st
+  | TRec5 flds tl ->
+      let (ef, _) = g5_row_chase (g5s_rowsubst st) tl in
+      g5_row_occurs_fields rid (g5_merge_fields flds ef) st
+
+and g5_row_occurs_list rid ts st = case ts of
+    [] -> false
+  | h :: rest -> if g5_row_occurs rid h st then true else g5_row_occurs_list rid rest st
+
+and g5_row_occurs_fields rid flds st = case flds of
+    [] -> false
+  | kv :: rest -> case kv of
+      | (_, t) -> if g5_row_occurs rid t st then true else g5_row_occurs_fields rid rest st
+
+and g5_row_tail_occurs rid tl st =
+  let (ef, ft) = g5_row_chase (g5s_rowsubst st) tl in
+  if g5_row_occurs_fields rid ef st then true
+  else case ft of
+    | RClosed5 -> false
+    | ROpen5 id -> id == rid
+
+let rec g5_free_ty t acc = case t of
+    TVI5 x -> if g5_mem_int x acc then acc else x :: acc
+  | TC5 _ -> acc
+  | TAr5 a b -> g5_free_ty b (g5_free_ty a acc)
+  | TTup5 ts -> g5_free_tys ts acc
+  | TApp5 _ ts -> g5_free_tys ts acc
+  | TRec5 flds _ -> g5_free_fields flds acc
+
+and g5_free_tys ts acc = case ts of
+    [] -> acc
+  | h :: rest -> g5_free_tys rest (g5_free_ty h acc)
+
+and g5_free_fields flds acc = case flds of
+    [] -> acc
+  | kv :: rest -> case kv of
+      | (_, t) -> g5_free_fields rest (g5_free_ty t acc)
+
+-- chase-aware free type vars
+and g5_free_chase t st acc = case g5_chase (g5s_subst st) t of
+    TVI5 x -> if g5_mem_int x acc then acc else x :: acc
+  | TC5 _ -> acc
+  | TAr5 a b -> g5_free_chase b st (g5_free_chase a st acc)
+  | TTup5 ts -> g5_free_chase_list ts st acc
+  | TApp5 _ ts -> g5_free_chase_list ts st acc
+  | TRec5 flds tl ->
+      let (ef, _) = g5_row_chase (g5s_rowsubst st) tl in
+      g5_free_chase_fields (g5_merge_fields flds ef) st acc
+
+and g5_free_chase_list ts st acc = case ts of
+    [] -> acc
+  | h :: rest -> g5_free_chase_list rest st (g5_free_chase h st acc)
+
+and g5_free_chase_fields flds st acc = case flds of
+    [] -> acc
+  | kv :: rest -> case kv of
+      | (_, t) -> g5_free_chase_fields rest st (g5_free_chase t st acc)
+
+-- chase-aware free ROW vars
+and g5_freerow_chase t st acc = case g5_chase (g5s_subst st) t of
+    TVI5 _ -> acc
+  | TC5 _ -> acc
+  | TAr5 a b -> g5_freerow_chase b st (g5_freerow_chase a st acc)
+  | TTup5 ts -> g5_freerow_list ts st acc
+  | TApp5 _ ts -> g5_freerow_list ts st acc
+  | TRec5 flds tl ->
+      let (ef, ft) = g5_row_chase (g5s_rowsubst st) tl in
+      let acc2 = g5_freerow_fields (g5_merge_fields flds ef) st acc in
+      case ft of
+        | RClosed5 -> acc2
+        | ROpen5 id -> if g5_mem_int id acc2 then acc2 else id :: acc2
+
+and g5_freerow_list ts st acc = case ts of
+    [] -> acc
+  | h :: rest -> g5_freerow_list rest st (g5_freerow_chase h st acc)
+
+and g5_freerow_fields flds st acc = case flds of
+    [] -> acc
+  | kv :: rest -> case kv of
+      | (_, t) -> g5_freerow_fields rest st (g5_freerow_chase t st acc)
+
+-- ---------- type display (tvars a..z, rows r..; skolem TC5 print raw) ----------
+
+let g5_letter n =
+  let abc = "abcdefghijklmnopqrstuvwxyz" in
+  if n < 26 then substring abc n 1
+  else substring abc (n % 26) 1 ++ int_to_string (n / 26)
+
+let rec g5_show_go t tnames rnames = case t of
+    TVI5 x ->
+      let f = g5_find_str tnames x in
+      if f == "" then
+        let l = g5_letter (len tnames) in
+        (l, (x, l) :: tnames, rnames)
+      else (f, tnames, rnames)
+  | TC5 s -> (s, tnames, rnames)
+  | TAr5 a b ->
+      let (sa, n1, r1) = g5_show_paren a tnames rnames in
+      let (sb, n2, r2) = g5_show_go b n1 r1 in
+      (sa ++ " -> " ++ sb, n2, r2)
+  | TTup5 ts ->
+      let (s, n1, r1) = g5_show_list ts ", " tnames rnames in
+      ("(" ++ s ++ ")", n1, r1)
+  | TApp5 n ts -> (case ts of
+      | [] -> (n, tnames, rnames)
+      | h :: rest -> if n == "List" then
+            let (s, n1, r1) = g5_show_go h tnames rnames in
+            ("[" ++ s ++ "]", n1, r1)
+          else
+            let (s, n1, r1) = g5_show_list ts " " tnames rnames in
+            ("(" ++ n ++ " " ++ s ++ ")", n1, r1))
+  | TRec5 flds tl ->
+      let (sf, n1, r1) = g5_show_fields (g5_sort_fields flds []) tnames rnames in
+      case tl of
+        | RClosed5 -> ("{" ++ sf ++ "}", n1, r1)
+        | ROpen5 id ->
+            let (rn, r2) = g5_row_name id r1 in
+            if sf == "" then ("{| " ++ rn ++ "}", n1, r2)
+            else ("{" ++ sf ++ " | " ++ rn ++ "}", n1, r2)
+
+and g5_show_paren a tnames rnames = case a of
+    TAr5 _ _ ->
+      let (s0, n0, r0) = g5_show_go a tnames rnames in
+      ("(" ++ s0 ++ ")", n0, r0)
+  | _ -> g5_show_go a tnames rnames
+
+and g5_row_name id rnames =
+  let f = g5_find_str rnames id in
+  if f == "" then
+    let l = if len rnames == 0 then "r" else "r" ++ int_to_string (len rnames) in
+    (l, (id, l) :: rnames)
+  else (f, rnames)
+
+and g5_show_list ts sep tnames rnames = case ts of
+    [] -> ("", tnames, rnames)
+  | h :: rest ->
+      let (s0, n0, r0) = g5_show_go h tnames rnames in
+      case rest of
+        | [] -> (s0, n0, r0)
+        | _ ->
+            let (s1, n1, r1) = g5_show_list rest sep n0 r0 in
+            (s0 ++ sep ++ s1, n1, r1)
+
+and g5_show_fields flds tnames rnames = case flds of
+    [] -> ("", tnames, rnames)
+  | kv :: rest -> case kv of
+      | (lb, t) ->
+          let (s0, n0, r0) = g5_show_go t tnames rnames in
+          let here = lb ++ " : " ++ s0 in
+          case rest of
+            | [] -> (here, n0, r0)
+            | _ ->
+                let (s1, n1, r1) = g5_show_fields rest n0 r0 in
+                (here ++ ", " ++ s1, n1, r1)
+
+let g5_show s t = case g5_show_go (g5_apply s t) [] [] of
+  | (txt, _, _) -> txt
+
+let rec g5_scheme_text s sch = case sch of
+  | Sch5 qvars qrows ty _ ->
+      let (qn, qr) = g5_canon_order (g5_apply s ty) qvars qrows in
+      case g5_show_go (g5_apply s ty) qn qr of
+        | (body, _, _) ->
+            if qvars == [] then (if qrows == [] then body else "forall " ++ g5_join_sp (g5_names_of qr) ++ ". " ++ body)
+            else "forall " ++ g5_join_sp (g5_names_of qn) ++ (if qrows == [] then ". " ++ body else " " ++ g5_join_sp (g5_names_of qr) ++ ". " ++ body)
+
+and g5_canon_names qvars qrows = (g5_canon_loop qvars 0 [], g5_canon_rows qrows 0 [])
+
+-- canonical maps in DISPLAY encounter order (sorted row fields), so printed
+-- schemes, var letters and .dci diffs ignore source field order (§5.2).
+-- Falls back to declaration order for quants not met in the type.
+and g5_canon_order ty qvars qrows =
+  case g5_cord ty of
+    | (vo, ro) ->
+        (g5_canon_loop (g5_ord_isect vo qvars qvars) 0 [], g5_canon_rows (g5_ord_isect ro qrows qrows) 0 [])
+
+and g5_cord t = case t of
+  | TVI5 x -> ([x], [])
+  | TAr5 a b -> g5_cord_cat (g5_cord a) (g5_cord b)
+  | TTup5 ts -> g5_cord_list ts
+  | TApp5 _ ts -> g5_cord_list ts
+  | TRec5 flds tl -> g5_cord_cat (g5_cord_fields (g5_sort_fields flds [])) (g5_cord_tail tl)
+  | _ -> ([], [])
+
+and g5_cord_cat p q = case p of
+  | (v1, r1) -> case q of
+      | (v2, r2) -> (app_list v1 v2, app_list r1 r2)
+
+and g5_cord_list ts = case ts of
+    [] -> ([], [])
+  | t :: rest -> g5_cord_cat (g5_cord t) (g5_cord_list rest)
+
+and g5_cord_fields flds = case flds of
+    [] -> ([], [])
+  | kv :: rest -> case kv of
+      | (_, t) -> g5_cord_cat (g5_cord t) (g5_cord_fields rest)
+
+and g5_cord_tail tl = case tl of
+  | ROpen5 id -> ([], [id])
+  | _ -> ([], [])
+
+and g5_ord_isect ord all missing = g5_ord_isect_go ord all (g5_ord_rest all ord []) []
+
+and g5_ord_isect_go ord all rest acc = case ord of
+    [] -> rev_acc rest acc
+  | x :: xs -> if g5_mem_int x all then
+                 if g5_mem_int x acc then g5_ord_isect_go xs all rest acc
+                 else g5_ord_isect_go xs all rest (x :: acc)
+               else g5_ord_isect_go xs all rest acc
+
+and g5_ord_rest all ord acc = case all of
+    [] -> acc
+  | x :: xs -> if g5_mem_int x ord then g5_ord_rest xs ord acc
+               else g5_ord_rest xs ord (x :: acc)
+
+and g5_canon_loop xs i acc = case xs of
+    [] -> rev_acc [] acc
+  | v :: rest -> g5_canon_loop rest (i + 1) ((v, g5_letter i) :: acc)
+
+and g5_canon_rows xs i acc = case xs of
+    [] -> rev_acc [] acc
+  | v :: rest ->
+      let nm = if i == 0 then "r" else "r" ++ int_to_string i in
+      g5_canon_rows rest (i + 1) ((v, nm) :: acc)
+
+and g5_names_of kvs = case kvs of
+    [] -> []
+  | kv :: rest -> case kv of | (_, n) -> n :: g5_names_of rest
+
+and g5_join_sp xs = case xs of
+    [] -> ""
+  | h :: [] -> h
+  | h :: rest -> h ++ " " ++ g5_join_sp rest
+
+-- ---------- allocators & snapshots ----------
+
+let g5_fresh s = case s of
+  | TIS5 q1 q2 q3 q4 q5 q6 q7 q8 q9 q10 q11 q12 q13 q14 q15 q16 -> (TIS5 q1 (q2 + 1) q3 q4 q5 q6 q7 q8 q9 q10 q11 q12 q13 q14 q15 q16, q2)
+
+let g5_fresh_n s n = case s of
+  | TIS5 q1 q2 q3 q4 q5 q6 q7 q8 q9 q10 q11 q12 q13 q14 q15 q16 -> (TIS5 q1 (q2 + n) q3 q4 q5 q6 q7 q8 q9 q10 q11 q12 q13 q14 q15 q16, q2)
+
+-- fresh ROW ids always come from rowctr (never the tvar counter)
+let g5_fresh_n_row s n = case s of
+  | TIS5 q1 q2 q3 q4 q5 q6 q7 q8 q9 q10 q11 q12 q13 q14 q15 q16 -> (TIS5 q1 q2 q3 q4 q5 (q6 + n) q7 q8 q9 q10 q11 q12 q13 q14 q15 q16, q6)
+
+let g5_app_tick s = case s of
+  | TIS5 q1 q2 q3 q4 q5 q6 q7 q8 q9 q10 q11 q12 q13 q14 q15 q16 -> (TIS5 q1 q2 (q3 + 1) q4 q5 q6 q7 q8 q9 q10 q11 q12 q13 q14 q15 q16, q3)
+
+let g5_fresh_row s = case s of
+  | TIS5 q1 q2 q3 q4 q5 q6 q7 q8 q9 q10 q11 q12 q13 q14 q15 q16 -> (TIS5 q1 q2 q3 q4 q5 (q6 + 1) q7 q8 q9 q10 q11 q12 q13 q14 q15 q16, q6)
+
+let g5_fresh_sym s = case s of
+  | TIS5 a b c d e f g h i j k l m n o q -> (TIS5 a b c d e f g h i j (k + 1) l m n o q, k)
+
+let g5_fresh_node s = case s of
+  | TIS5 a b c d e f g h i j k l m n o q -> (TIS5 a b c d e f g h i j k (l + 1) m n o q, l)
+
+-- snapshot = lengths + counters (subst/rowsubst grow-only; truncate restores)
+let g5_snapshot s = (len (g5s_subst s), len (g5s_rowsubst s), len (g5s_holevars s), g5s_ctr s, g5s_rowctr s)
+
+let rec g5_trunc n xs = if n == 0 then [] else
+  case xs of
+    | [] -> []
+    | h :: rest -> h :: g5_trunc (n - 1) rest
+
+let g5_rollback s snap = case snap of
+  | (ns, nr, nh, _, _) ->
+      g5s_with_holevars (g5s_with_rowsubst (g5s_with_subst s (g5_trunc ns (g5s_subst s))) (g5_trunc nr (g5s_rowsubst s))) (g5_trunc nh (g5s_holevars s))
+
+let g5_fail_msg s dflt = g5s_ectx s ++ dflt
+
+-- record a node entry when tracing (types normalized now: subst is live)
+let rec g5_norm_ty_here s t = g5_apply s t
+
+let g5_norm_sch s sch = case sch of
+  | Sch5 q qr ty p -> Sch5 q qr (g5_norm_ty_here s ty) p
+
+let rec g5_norm_inst s inst = case inst of
+    [] -> []
+  | kv :: rest -> case kv of
+      | (q, t) -> (q, g5_norm_ty_here s t) :: g5_norm_inst s rest
+
+let g5_record s nid sp ty symid sch inst exp reason =
+  if g5s_trace s then
+    let nty = g5_norm_ty_here s ty in
+    let nsch = g5_norm_sch s sch in
+    let ninst = g5_norm_inst s inst in
+    let nexp = g5_norm_ty_here s exp in
+    g5s_with_nodes s (NodeE5 nid sp nty symid nsch ninst nexp reason :: g5s_nodes s)
+  else s
+
+let g5_add_warn s w = g5s_with_warns s (w :: g5s_warns s)
+
+let g5_add_sym s sym = g5s_with_syms s (sym :: g5s_syms s)
+
+-- ---------- unification (Result via (s, errmsg); "" = ok) ----------
+
+let rec g5_unify_lists xs ys s ta tb em = case xs of
+    [] -> (case ys of
+      | [] -> (s, "")
+      | _ -> (s, g5_mismatch ta tb s em))
+  | x :: xr -> (case ys of
+      | [] -> (s, g5_mismatch ta tb s em)
+      | y :: yr ->
+          let (s1, e1) = g5_unify x y s em in
+          if e1 == "" then g5_unify_lists xr yr s1 ta tb em else (s1, e1))
+
+and g5_mismatch ta tb s em =
+  if em == "" then g5_fail_msg s ("type mismatch: expected `" ++ g5_show s tb ++ "`, found `" ++ g5_show s ta ++ "`")
+  else g5s_ectx s ++ em
+
+and g5_unify a b s em =
+  g5_unify_ap (g5_chase (g5s_subst s) a) (g5_chase (g5s_subst s) b) s em
+
+and g5_unify_ap ta tb s em = case ta of
+    TVI5 x -> (case tb of
+      | TVI5 y -> if x == y then (s, "") else g5_bind_st x tb s em
+      | _ -> g5_bind_st x tb s em)
+  | _ -> g5_unify_nv ta tb s em
+
+and g5_unify_nv ta tb s em = case tb of
+    TVI5 _ -> g5_unify_ap tb ta s em
+  | _ -> g5_unify_struct ta tb s em
+
+and g5_unify_struct ta tb s em = case ta of
+    TC5 x -> (case tb of
+      | TC5 y -> if x == y then (s, "") else (s, g5_mismatch ta tb s em)
+      | _ -> (s, g5_mismatch ta tb s em))
+  | TAr5 a1 a2 -> (case tb of
+      | TAr5 b1 b2 ->
+          let (s1, e1) = g5_unify a1 b1 s em in
+          if e1 == "" then g5_unify a2 b2 s1 em else (s1, e1)
+      | _ -> (s, g5_mismatch ta tb s em))
+  | TTup5 xs -> (case tb of
+      | TTup5 ys -> g5_unify_lists xs ys s ta tb em
+      | _ -> (s, g5_mismatch ta tb s em))
+  | TApp5 n1 xs -> (case tb of
+      | TApp5 n2 ys ->
+          if n1 == n2 then g5_unify_lists xs ys s ta tb em
+          else (s, g5_mismatch ta tb s em)
+      | _ -> (s, g5_mismatch ta tb s em))
+  | TRec5 f1 t1 -> (case tb of
+      | TRec5 f2 t2 -> g5_unify_recs f1 t1 f2 t2 s em
+      | _ -> (s, g5_mismatch ta tb s em))
+  | TVI5 _ -> (s, g5_mismatch ta tb s em)
+
+and g5_bind v t s em =
+  if g5_occurs v t s then
+    (s, g5_fail_msg s (if em == "" then ("infinite type: cannot unify `" ++ g5_show s (TVI5 v) ++ "` with `" ++ g5_show s t ++ "`") else em))
+  else (g5s_with_subst s ((v, t) :: g5s_subst s), "")
+
+and g5_bind_st x t s em = g5_bind x t s em
+
+-- record unification: unique labels, order-insensitive, open tails
+and g5_unify_recs f1 t1 f2 t2 s em =
+  let (m1, _) = g5_flat_rec (g5s_rowsubst s) f1 t1 in
+  let (m2, _) = g5_flat_rec (g5s_rowsubst s) f2 t2 in
+  let (s1, e1) = g5_unify_common m1 m2 s em in
+  if e1 == "" then
+    let (n1, ft1b) = g5_flat_rec (g5s_rowsubst s1) f1 t1 in
+    let (n2, ft2b) = g5_flat_rec (g5s_rowsubst s1) f2 t2 in
+    g5_unify_tails (g5_sub_only n1 n2) (g5_sub_only n2 n1) ft1b ft2b s1 em
+  else (s1, e1)
+
+and g5_unify_common m1 m2 s em = case m1 of
+    [] -> (s, "")
+  | kv :: rest -> case kv of
+      | (lb, t1) ->
+          if g5_mem_field m2 lb then
+            let t2 = g5_field_get m2 lb in
+            let (s1, e1) = g5_unify_wrap_msg t1 t2 s ("in record field `" ++ lb ++ "`: ") in
+            if e1 == "" then g5_unify_common rest m2 s1 em else (s1, e1)
+          else g5_unify_common rest m2 s em
+
+and g5_field_get flds lb = case flds of
+    [] -> TC5 "@missing"
+  | kv :: rest -> case kv of
+      | (l, t) -> if l == lb then t else g5_field_get rest lb
+
+and g5_sub_only a b = case a of
+    [] -> []
+  | kv :: rest -> case kv of
+      | (lb, t) -> if g5_mem_field b lb then g5_sub_only rest b else (lb, t) :: g5_sub_only rest b
+
+and g5_unify_tails o1 o2 ft1 ft2 s em = case ft1 of
+    RClosed5 -> (case ft2 of
+      | RClosed5 ->
+          if o1 == [] then (if o2 == [] then (s, "") else (s, g5_missing_fields o2 s em))
+          else (s, g5_missing_fields o1 s em)
+      | ROpen5 r2 ->
+          if r2 < 0 then (s, g5_rigid_mismatch s em)
+          else if o2 == [] then g5_bind_row r2 o1 RClosed5 s em
+          else (s, g5_missing_fields o2 s em))
+  | ROpen5 r1 -> (case ft2 of
+      | RClosed5 ->
+          if r1 < 0 then (s, g5_rigid_mismatch s em)
+          else if o1 == [] then g5_bind_row r1 o2 RClosed5 s em
+          else (s, g5_missing_fields o1 s em)
+      | ROpen5 r2 -> g5_unify_open2 o1 o2 r1 r2 s em)
+
+and g5_rigid_mismatch s em =
+  g5_fail_msg s (if em == "" then "rigid row mismatch (contract requires parametricity)" else em)
+
+and g5_unify_open2 o1 o2 r1 r2 s em =
+  if r1 == r2 then (if o1 == [] then (if o2 == [] then (s, "") else (s, g5_missing_fields o2 s em)) else (s, g5_missing_fields o1 s em))
+  else if r1 < 0 then
+    if r2 < 0 then (s, g5_rigid_mismatch s em)
+    else if o2 == [] then g5_bind_row r2 o1 (ROpen5 r1) s em
+    else (s, g5_missing_fields o2 s em)
+  else if r2 < 0 then
+    if o1 == [] then g5_bind_row r1 o2 (ROpen5 r2) s em
+    else (s, g5_missing_fields o1 s em)
+  else if g5_row_occurs_map r1 o2 s then
+    if g5_row_occurs_map r2 o1 s then (s, g5_fail_msg s (if em == "" then "infinite row type" else em))
+    else g5_bind_row r2 o1 (ROpen5 r1) s em
+  else g5_bind_row r1 o2 (ROpen5 r2) s em
+
+and g5_missing_fields o s em =
+  g5_fail_msg s (if em == "" then ("record mismatch: missing field(s) `" ++ g5_join_labels o ++ "`") else em)
+
+and g5_join_labels o = case o of
+    [] -> ""
+  | kv :: rest -> case kv of
+      | (lb, _) -> case rest of
+          | [] -> lb
+          | _ -> lb ++ ", " ++ g5_join_labels rest
+
+and g5_row_occurs_map rid o s = case o of
+    [] -> false
+  | kv :: rest -> case kv of
+      | (_, t) -> if g5_row_occurs rid t s then true else g5_row_occurs_map rid rest s
+
+and g5_bind_row rid flds tl s em =
+  if rid < 0 then (s, g5_rigid_mismatch s em)
+  else if g5_row_occurs_fields rid flds s then (s, g5_fail_msg s (if em == "" then "infinite row type" else em))
+  else if g5_row_tail_occurs rid tl s then (s, g5_fail_msg s (if em == "" then "infinite row type" else em))
+  else if g5_has_row (g5s_rowsubst s) rid then
+    case g5_find_row (g5s_rowsubst s) rid of
+      | RowC5 efs etl -> g5_unify (TRec5 efs etl) (TRec5 flds tl) s em
+  else (g5s_with_rowsubst s ((rid, RowC5 flds tl) :: g5s_rowsubst s), "")
+
+and g5_unify_wrap_msg a b s prefix =
+  let e0 = g5s_ectx s in
+  let (s1, e1) = g5_unify a b (g5_push_ctx s prefix) "" in
+  (g5s_with_ectx s1 e0, e1)
+
+let g5_unify_d a b s = g5_unify a b s ""
+
+-- ---------- instantiation / generalization ----------
+
+let rec g5_inst_rewrite t mp rmp s = case g5_chase (g5s_subst s) t of
+    TVI5 x -> TVI5 (g5_find_int mp x)
+  | TC5 _ -> t
+  | TAr5 a b -> TAr5 (g5_inst_rewrite a mp rmp s) (g5_inst_rewrite b mp rmp s)
+  | TTup5 ts -> TTup5 (g5_inst_map ts mp rmp s)
+  | TApp5 n ts -> TApp5 n (g5_inst_map ts mp rmp s)
+  | TRec5 flds tl ->
+      let (ef, ft) = g5_row_chase (g5s_rowsubst s) tl in
+      TRec5 (g5_inst_fields (g5_merge_fields flds ef) mp rmp s) (g5_inst_tail ft rmp s)
+
+and g5_inst_map ts mp rmp s = case ts of
+    [] -> []
+  | h :: rest -> g5_inst_rewrite h mp rmp s :: g5_inst_map rest mp rmp s
+
+and g5_inst_fields flds mp rmp s = case flds of
+    [] -> []
+  | kv :: rest -> case kv of
+      | (lb, t) -> (lb, g5_inst_rewrite t mp rmp s) :: g5_inst_fields rest mp rmp s
+
+and g5_inst_tail tl rmp s = case tl of
+    RClosed5 -> RClosed5
+  | ROpen5 id -> ROpen5 (g5_find_int rmp id)
+
+let g5_instantiate qvars qrows ty s =
+  let (s1, base) = g5_fresh_n s (len qvars) in
+  let mp = g5_zip_ids5 qvars base in
+  let (s2, rbase) = g5_fresh_n_row s1 (len qrows) in
+  let rmp = g5_zip_ids5 qrows rbase in
+  (s2, g5_inst_rewrite ty mp rmp s2, mp, rmp)
+
+let rec g5_env_free env s acc tacc = case env of
+    [] -> (acc, tacc)
+  | kv :: rest -> case kv of
+      | (_, sch) -> case sch of
+          | Sch5 q qr ty _ ->
+              let f = g5_diff (g5_free_chase ty s []) q in
+              let fr = g5_diff (g5_freerow_chase ty s []) qr in
+              g5_env_free rest s (g5_union_new f acc) (g5_union_new fr tacc)
+
+-- hole taint: free ids (chased) of ty intersect holevars?
+and g5_tainted ty s =
+  let fv = g5_free_chase ty s [] in
+  g5_any_mem fv (g5s_holevars s)
+
+and g5_any_mem xs ys = case xs of
+    [] -> false
+  | h :: rest -> if g5_mem_int h ys then true else g5_any_mem rest ys
+
+and g5_generalize env t s =
+  let (ef, efr) = g5_env_free env s [] [] in
+  let qv = g5_nub [] (g5_diff (g5_free_chase t s []) ef) in
+  let qr = g5_nub [] (g5_diff (g5_freerow_chase t s []) efr) in
+  Sch5 qv qr t (g5_tainted t s)
+
+-- mark all free ids of ty as hole-connected (transitive partial on use)
+and g5_taint_use ty s =
+  g5s_with_holevars s (g5_union_new (g5_free_chase ty s []) (g5s_holevars s))
+
+-- ---------- source type conversion ----------
+
+let g5_base_case n args ty s = case args of
+    [] -> (s, ty, "")
+  | _ -> (s, TC5 "@err", g5s_ectx s ++ "unknown type `" ++ n ++ "`")
+
+let rec g5_resolve ta scope rscope s = case ta of
+    TTVar5 v _ ->
+      let id = g5_lookup_str5 scope v in
+      if id == (0 - 1) then (s, TC5 "@err", g5s_ectx s ++ "unbound type variable `" ++ v ++ "`")
+      else (s, TVI5 id, "")
+  | TTCon5 n args _ ->
+      if n == "Int" then g5_base_case n args (TC5 "Int") s
+      else if n == "Bool" then g5_base_case n args (TC5 "Bool") s
+      else if n == "String" then g5_base_case n args (TC5 "String") s
+      else if n == "Unit" then g5_base_case n args (TC5 "Unit") s
+      else if n == "List" then (case args of
+        | [e] ->
+            let (s1, t1, er1) = g5_resolve e scope rscope s in
+            if er1 == "" then (s1, TApp5 "List" [t1], "") else (s1, TC5 "@err", er1)
+        | _ -> (s, TC5 "@err", g5s_ectx s ++ "`List` expects exactly one argument"))
+      else
+        let ar = g5_tydef_arity (g5s_tydefs s) n in
+        if ar == (0 - 2) then (s, TC5 "@err", g5s_ectx s ++ "unknown type `" ++ n ++ "`")
+        else if ar == len args then
+          let (s1, ts, er1) = g5_resolve_list args scope rscope s in
+          if er1 == "" then (s1, TApp5 n ts, "") else (s1, TC5 "@err", er1)
+        else (s, TC5 "@err", g5s_ectx s ++ ("type `" ++ n ++ "` expects " ++ int_to_string ar ++ " arguments, got " ++ int_to_string (len args)))
+  | TTArr5 a b _ ->
+      let (s1, t1, e1) = g5_resolve a scope rscope s in
+      if e1 == "" then
+        let (s2, t2, e2) = g5_resolve b scope rscope s1 in
+        if e2 == "" then (s2, TAr5 t1 t2, "") else (s2, TC5 "@err", e2)
+      else (s1, TC5 "@err", e1)
+  | TTTup5 ts _ ->
+      let (s1, out, er1) = g5_resolve_list ts scope rscope s in
+      if er1 == "" then (s1, TTup5 out, "") else (s1, TC5 "@err", er1)
+  | TTRec5 flds row _ -> g5_resolve_rec flds row scope rscope s
+
+and g5_resolve_list ts scope rscope s = case ts of
+    [] -> (s, [], "")
+  | h :: rest ->
+      let (s1, t1, e1) = g5_resolve h scope rscope s in
+      if e1 == "" then
+        let (s2, tr, e2) = g5_resolve_list rest scope rscope s1 in
+        if e2 == "" then (s2, t1 :: tr, "") else (s2, [], e2)
+      else (s1, [], e1)
+
+and g5_resolve_rec flds row scope rscope s =
+  let (s1, out, er1) = g5_resolve_rec_fields flds scope rscope s [] in
+  if er1 == "" then
+    if row == "" then (s1, TRec5 out RClosed5, "")
+    else
+      let rid = g5_lookup_str5 rscope row in
+      if rid == (0 - 1) then (s1, TC5 "@err", g5s_ectx s1 ++ "unbound row variable `" ++ row ++ "`")
+      else (s1, TRec5 out (ROpen5 rid), "")
+  else (s1, TC5 "@err", er1)
+
+and g5_resolve_rec_fields flds scope rscope s acc = case flds of
+    [] -> (s, rev_acc [] acc, "")
+  | kv :: rest -> case kv of
+      | (lb, ty) ->
+          if g5_mem_field acc lb then (s, [], "duplicate record label `" ++ lb ++ "` in type")
+          else
+            let (s1, t1, e1) = g5_resolve ty scope rscope s in
+            if e1 == "" then g5_resolve_rec_fields rest scope rscope s1 ((lb, t1) :: acc)
+            else (s1, [], e1)
+
+and g5_tydef_arity tydefs n = case tydefs of
+    [] -> 0 - 2
+  | kv :: rest -> case kv of
+      | (k, ar, _) -> if k == n then ar else g5_tydef_arity rest n
+
+-- collect (tvars, rvars) names from an annotation for fresh scoping
+and g5_ann_vars ta tacc racc = case ta of
+    TTVar5 v _ -> (if g5_mem_str5 v tacc then (tacc, racc) else (v :: tacc, racc))
+  | TTCon5 _ args _ -> g5_ann_var_list args tacc racc
+  | TTArr5 a b _ ->
+      let (t1, r1) = g5_ann_vars a tacc racc in
+      g5_ann_vars b t1 r1
+  | TTTup5 ts _ -> g5_ann_var_list ts tacc racc
+  | TTRec5 flds row _ ->
+      let (t1, r1) = g5_ann_var_fields flds tacc racc in
+      if row == "" then (t1, r1)
+      else (t1, if g5_mem_str5 row r1 then r1 else row :: r1)
+
+and g5_ann_var_list ts tacc racc = case ts of
+    [] -> (tacc, racc)
+  | h :: rest ->
+      let (t1, r1) = g5_ann_vars h tacc racc in
+      g5_ann_var_list rest t1 r1
+
+and g5_ann_var_fields flds tacc racc = case flds of
+    [] -> (tacc, racc)
+  | kv :: rest -> case kv of
+      | (_, ty) ->
+          let (t1, r1) = g5_ann_vars ty tacc racc in
+          g5_ann_var_fields rest t1 r1
+
+and g5_fresh_scope ann s =
+  let (tns, rns) = g5_ann_vars ann [] [] in
+  let (s1, tbase) = g5_fresh_n s (len tns) in
+  let tscope = g5_zip_ids5 tns tbase in
+  let (s2, rscope) = g5_fresh_rows rns s1 [] in
+  (s2, tscope, rscope)
+
+and g5_fresh_rows rns s acc = case rns of
+    [] -> (s, rev_acc [] acc)
+  | r :: rest ->
+      let (s1, id) = g5_fresh_row s in
+      g5_fresh_rows rest s1 ((r, id) :: acc)
+
+-- rigid scope for sig: type vars -> skolem TC5, row vars -> fresh rows.
+-- (tvs, rvs) are pre-split by position; see g5_sig_check.
+and g5_sig_scope tvs rvs s tscope rscope =
+  g5_sig_scope_loop tvs rvs s tscope rscope
+
+and g5_sig_scope_loop tvs rvs s tscope rscope = case tvs of
+    [] -> g5_sig_rows_loop rvs 1 s tscope rscope
+  | v :: rest ->
+      let (s1, c) = g5_fresh s in
+      g5_sig_scope_loop rest rvs s1 ((v, TC5 ("@sk" ++ int_to_string c)) :: tscope) rscope
+
+and g5_sig_rows_loop rvs pos s tscope rscope = case rvs of
+    [] -> (s, tscope, rscope)
+  | r :: rest ->
+      -- rigid rows are negative ids (flex rows are >= 0): no state needed,
+      -- never collide, never bound (bind_row refuses rid < 0).
+      g5_sig_rows_loop rest (pos + 1) s tscope ((r, 0 - pos) :: rscope)
+
+-- ---------- type definitions (tydefs carry ctor names for warnings/ifaces) ----------
+
+let g5_is_builtin_ty n =
+  if n == "Int" then true
+  else if n == "Bool" then true
+  else if n == "String" then true
+  else if n == "Unit" then true
+  else if n == "List" then true
+  else false
+
+let rec g5_dup_tydef tydefs n = case tydefs of
+    [] -> false
+  | kv :: rest -> case kv of
+      | (k, _, _) -> if k == n then true else g5_dup_tydef rest n
+
+let rec g5_mk_arrows ftys res = case ftys of
+    [] -> res
+  | h :: rest -> TAr5 h (g5_mk_arrows rest res)
+
+let rec g5_mk_tvis5 ids = case ids of
+    [] -> []
+  | h :: rest -> TVI5 h :: g5_mk_tvis5 rest
+
+let rec g5_map_snd5 kvs = case kvs of
+    [] -> []
+  | kv :: rest -> case kv of
+      | (_, v) -> v :: g5_map_snd5 rest
+
+let rec g5_ctor_schemes cds tname param_ids s scope rscope acc = case cds of
+    [] -> (s, rev_acc [] acc, "")
+  | cd :: rest -> case cd of
+      | CtorDecl5 cn fs ->
+          let (s1, ftys, er1) = g5_resolve_fields fs scope rscope s in
+          if er1 == "" then
+            let full = g5_mk_arrows ftys (TApp5 tname (g5_mk_tvis5 param_ids)) in
+            g5_ctor_schemes rest tname param_ids s1 scope rscope ((cn, Sch5 (g5_nub [] (g5_free_ty full [])) (g5_nub [] (g5_freerow_ty full)) full false) :: acc)
+          else (s1, [], er1)
+
+and g5_freerow_ty t = g5_freerow_syn t []
+
+and g5_freerow_syn t acc = case t of
+    TVI5 _ -> acc
+  | TC5 _ -> acc
+  | TAr5 a b -> g5_freerow_syn b (g5_freerow_syn a acc)
+  | TTup5 ts -> g5_freerow_syns ts acc
+  | TApp5 _ ts -> g5_freerow_syns ts acc
+  | TRec5 flds tl ->
+      let acc2 = g5_freerow_syn_fields flds acc in
+      case tl of
+        | RClosed5 -> acc2
+        | ROpen5 id -> if g5_mem_int id acc2 then acc2 else id :: acc2
+
+and g5_freerow_syns ts acc = case ts of
+    [] -> acc
+  | h :: rest -> g5_freerow_syns rest (g5_freerow_syn h acc)
+
+and g5_freerow_syn_fields flds acc = case flds of
+    [] -> acc
+  | kv :: rest -> case kv of
+      | (_, t) -> g5_freerow_syn_fields rest (g5_freerow_syn t acc)
+
+and g5_resolve_fields fs scope rscope s = case fs of
+    [] -> (s, [], "")
+  | h :: rest ->
+      let (s1, t1, e1) = g5_resolve h scope rscope s in
+      if e1 == "" then
+        let (s2, tr, e2) = g5_resolve_fields rest scope rscope s1 in
+        if e2 == "" then (s2, t1 :: tr, "") else (s2, [], e2)
+      else (s1, [], e1)
+
+and g5_check_tydef td s = case td of
+  | TyDecl5 name params ctors ->
+      let tydefs = g5s_tydefs s in
+      if g5_is_builtin_ty name then (s, [], g5s_ectx s ++ "cannot redefine built-in type `" ++ name ++ "`")
+      else if g5_dup_tydef tydefs name then (s, [], g5s_ectx s ++ "duplicate type definition `" ++ name ++ "`")
+      else
+        let (s1, base) = g5_fresh_n s (len params) in
+        let scope = g5_zip_ids5 params base in
+        let param_ids = g5_map_snd5 scope in
+        -- row vars in ctor fields scope over the whole decl
+        let rns = g5_ctor_row_names ctors [] in
+        let (s2, rscope) = g5_fresh_rows rns s1 [] in
+        -- extend tydefs BEFORE resolving ctors (recursive types); ctor
+        -- names are known syntactically so the entry is complete at once
+        let cnames = g5_cdor_names ctors [] in
+        let sa = g5s_with_tydefs s2 ((name, len params, cnames) :: tydefs) in
+        let (s3, schemes, er1) = g5_ctor_schemes ctors name param_ids sa scope rscope [] in
+        if er1 == "" then (s3, schemes, "")
+        else (s3, [], er1)
+
+and g5_ctor_row_names cds acc = case cds of
+    [] -> acc
+  | cd :: rest -> case cd of
+      | CtorDecl5 _ fs -> g5_ctor_row_names rest (g5_field_row_names fs acc)
+
+and g5_field_row_names fs acc = case fs of
+    [] -> acc
+  | ty :: rest ->
+      let (tns, rns) = g5_ann_vars ty [] [] in
+      g5_field_row_names rest (g5_union_str rns acc)
+
+and g5_union_str xs acc = case xs of
+    [] -> acc
+  | h :: rest -> if g5_mem_str5 h acc then g5_union_str rest acc else g5_union_str rest (h :: acc)
+
+and g5_cdor_names cds acc = case cds of
+    [] -> rev_acc [] acc
+  | cd :: rest -> case cd of
+      | CtorDecl5 nm _ -> g5_cdor_names rest (nm :: acc)
+
+and g5_ctor_names schemes acc = case schemes of
+    [] -> acc
+  | kv :: rest -> case kv of
+      | (cn, _) -> g5_ctor_names rest (cn :: acc)
+
+-- resolve with separate type/row scopes (rows from annotations are flexible)
+and g5_resolve_ann ann s =
+  let (s0, tscope, rscope) = g5_fresh_scope ann s in
+  g5_resolve ann tscope rscope s0
+
+
+-- ---------- patterns ----------
+-- binds: List (String, Sch5, symid). sc: List (String, symid).
+-- owner: enclosing expr node id for SymE5 entries.
+
+let rec g5_range5 base n = if n == 0 then [] else base :: g5_range5 (base + 1) (n - 1)
+
+let rec g5_map_fst5 kvs = case kvs of
+    [] -> []
+  | kv :: rest -> case kv of
+      | (k, _) -> k :: g5_map_fst5 rest
+
+let rec g5_decomp_args t acc s = case g5_chase (g5s_subst s) t of
+    TAr5 a b -> g5_decomp_args b (a :: acc) s
+  | _ -> (rev_acc [] acc, t)
+
+let rec g5_binds_env binds env = case binds of
+    [] -> env
+  | kv :: rest -> case kv of
+      | (n, sch, _) -> g5_binds_env rest ((n, sch) :: env)
+
+let rec g5_binds_sc binds sc = case binds of
+    [] -> sc
+  | kv :: rest -> case kv of
+      | (n, _, sid) -> g5_binds_sc rest ((n, sid) :: sc)
+
+let rec g5_pat_each ps ts binds env sc s owner = case ps of
+    [] -> (s, binds, sc, "")
+  | p :: rest -> (case ts of
+      | [] -> (s, binds, sc, "")
+      | t :: tr ->
+          let (s1, b1, sc1, e1) = g5_pat_type p t binds env sc s owner in
+          if e1 == "" then g5_pat_each rest tr b1 env sc1 s1 owner else (s1, b1, sc1, e1))
+
+and g5_pat_type pat ty binds env sc s owner = case pat of
+    PWild5 _ -> (s, binds, sc, "")
+  | PVar5 n sp ->
+      let (s1, sid) = g5_fresh_sym s in
+      (case g5_norm_ty_here s1 ty of
+        | nty ->
+            let sch = Sch5 [] [] nty (g5_tainted ty s1) in
+            (g5_add_sym s1 (SymE5 sid n sp owner sch), (n, sch, sid) :: binds, (n, sid) :: sc, ""))
+  | PInt5 _ _ -> g5_pat_unify ty (TC5 "Int") s binds sc
+  | PBool5 _ _ -> g5_pat_unify ty (TC5 "Bool") s binds sc
+  | PStr5 _ _ -> g5_pat_unify ty (TC5 "String") s binds sc
+  | PUnit5 _ -> g5_pat_unify ty (TC5 "Unit") s binds sc
+  | PTup5 ps _ ->
+      let n = len ps in
+      let (s1, base) = g5_fresh_n s n in
+      let tvs = g5_mk_tvis5 (g5_range5 base n) in
+      let (s2, e2) = g5_unify ty (TTup5 tvs) s1 "" in
+      if e2 == "" then g5_pat_each ps tvs binds env sc s2 owner else (s2, binds, sc, e2)
+  | PCtor5 name ps _ ->
+      if g5_env_has5 env name then
+        let sch = g5_env_find5 env name in
+        case sch of
+          | Sch5 qvars qrows sty p ->
+              let (s1, ity, _, _) = g5_instantiate qvars qrows sty s in
+              (case g5_decomp_args ity [] s1 of
+                | (argtys, resty) ->
+                    if len argtys == len ps then
+                      let (s2, e2) = g5_unify ty resty s1 "" in
+                      if e2 == "" then g5_pat_each ps argtys binds env sc s2 owner else (s2, binds, sc, e2)
+                    else (s1, binds, sc, (g5s_ectx s1 ++ "constructor `" ++ name ++ "` expects " ++ int_to_string (len argtys) ++ " argument(s), pattern gives " ++ int_to_string (len ps))))
+      else (s, binds, sc, g5s_ectx s ++ "unknown constructor `" ++ name ++ "`")
+
+and g5_pat_unify ty want s binds sc =
+  let (s1, e1) = g5_unify ty want s "" in
+  (s1, binds, sc, e1)
+
+-- ---------- expression typing ----------
+-- g5_infer_e e env sc s -> (s, Ty5, errmsg)
+
+let rec g5_sc_find sc n = case sc of
+    [] -> 0 - 1
+  | kv :: rest -> case kv of
+      | (k, sid) -> if k == n then sid else g5_sc_find rest n
+
+let rec g5_resolve_sig_var v tscope rscope s = case tscope of
+    [] -> (s, TC5 "@err", g5s_ectx s ++ "unbound type variable `" ++ v ++ "` in sig (bind with forall)")
+  | kv :: rest -> case kv of
+      | (k, t) -> if k == v then (s, t, "") else g5_resolve_sig_var v rest rscope s
+
+let rec g5_infer_e e env sc s = case e of
+    EInt5 _ sp -> g5_leaf s e sp (TC5 "Int")
+  | EBool5 _ sp -> g5_leaf s e sp (TC5 "Bool")
+  | EStr5 _ sp -> g5_leaf s e sp (TC5 "String")
+  | EUnit5 sp -> g5_leaf s e sp (TC5 "Unit")
+  | EVar5 n sp -> g5_infer_var s e n sp env sc
+  | ECtor5 n sp -> g5_infer_var s e n sp env sc
+  | ELam5 p body sp -> g5_infer_lam s e p body sp env sc
+  | EApp5 f a sp -> g5_infer_app s e f a sp env sc
+  | EBin5 op l r sp -> g5_infer_bin s e op l r sp env sc
+  | EIf5 c th el sp -> g5_infer_if s e c th el sp env sc
+  | ECase5 scrt brs sp -> g5_infer_case s e scrt brs sp env sc
+  | ELet5 isrec nm rhs body sp -> g5_infer_let s e isrec nm rhs body sp env sc
+  | ETup5 es sp -> g5_infer_tup s e es sp env sc
+  | EAnn5 inner ty sp -> g5_infer_ann s e inner ty sp env sc
+  | ERec5 flds sp -> g5_infer_rec s e flds sp env sc
+  | EProj5 r lb sp -> g5_infer_proj s e r lb sp env sc
+  | EWith5 b lb u sp -> g5_infer_with s e b lb u sp env sc
+  | EHole5 nm sp -> g5_infer_hole s e nm sp env sc
+
+and g5_leaf s e sp ty =
+  let (s1, nid) = g5_fresh_node s in
+  (g5_record s1 nid sp ty (0 - 1) g5_null_sch [] g5_no_expected "literal", ty, "")
+
+and g5_infer_var s e n sp env sc =
+  let (s0, nid) = g5_fresh_node s in
+  if g5_env_has5 env n then
+    let sch = g5_env_find5 env n in
+    case sch of
+      | Sch5 qvars qrows sty p ->
+          let (s1, ity, mp, rmp) = g5_instantiate qvars qrows sty s0 in
+          let s2 = if p then g5_taint_use ity s1 else s1 in
+          let sid = g5_sc_find sc n in
+          let sid2 = if sid == (0 - 1) then g5_sym_of_env s2 n else sid in
+          (g5_record s2 nid sp ity sid2 sch (g5_inst_pairs_show mp rmp s2) g5_no_expected ("inst " ++ n), ity, "")
+  else (s0, TC5 "@err", g5s_ectx s0 ++ "unbound variable `" ++ n ++ "`")
+
+and g5_sym_of_env s n =
+  g5_sym_find_name (g5s_syms s) n
+
+and g5_sym_find_name syms n = case syms of
+    [] -> 0 - 1
+  | sy :: rest -> case sy of
+      | SymE5 sid nm _ _ _ -> if nm == n then sid else g5_sym_find_name rest n
+
+and g5_inst_pairs_show mp rmp s = g5_inst_pairs_show2 mp s (g5_inst_pairs_rows rmp s)
+
+and g5_inst_pairs_show2 mp s acc = case mp of
+    [] -> acc
+  | kv :: rest -> case kv of
+      | (q, fresh) ->
+          let t = g5_chase (g5s_subst s) (TVI5 fresh) in
+          g5_inst_pairs_show2 rest s ((q, t) :: acc)
+
+and g5_inst_pairs_rows rmp s = case rmp of
+    [] -> []
+  | kv :: rest -> case kv of
+      | (q, fresh) ->
+          let t = TRec5 [] (ROpen5 fresh) in
+          (q, t) :: g5_inst_pairs_rows rest s
+
+and g5_infer_lam s e p body sp env sc =
+  let (s0, nid) = g5_fresh_node s in
+  let (s1, v) = g5_fresh s0 in
+  let (s2, bnds, scb, e1) = g5_pat_each [p] [TVI5 v] [] env sc s1 nid in
+  if e1 == "" then
+    let env2 = g5_binds_env bnds env in
+    let (s3, bt, e2) = g5_infer_e body env2 scb s2 in
+    if e2 == "" then
+      let ty = TAr5 (TVI5 v) bt in
+      (g5_record s3 nid sp ty (0 - 1) g5_null_sch [] g5_no_expected "lambda (params monomorphic)", ty, "")
+    else (s3, TC5 "@err", e2)
+  else (s2, TC5 "@err", e1)
+
+and g5_infer_app s e f a sp env sc =
+  let (s0, nid) = g5_fresh_node s in
+  let (s1, tf, e1) = g5_infer_e f env sc s0 in
+  if e1 == "" then
+    let (s2, tx, e2) = g5_infer_e a env sc s1 in
+    if e2 == "" then
+      let (s3, r) = g5_fresh s2 in
+      let (s4, ctr) = g5_app_tick s3 in
+      let s5 = g5_trace_push s4 ("app#" ++ int_to_string ctr ++ ": " ++ g5_show s4 tf ++ " := " ++ g5_show s4 (TAr5 tx (TVI5 r))) in
+      let (s6, e3) = g5_unify_wrap_msg tf (TAr5 tx (TVI5 r)) s5 ("in application #" ++ int_to_string ctr ++ ": ") in
+      if e3 == "" then
+        (g5_record s6 nid sp (TVI5 r) (0 - 1) g5_null_sch [] g5_no_expected "application result", TVI5 r, "")
+      else
+        let s7 = g5_add_warn s6 (g5_collision_note s5 f a sp tf tx) in
+        (s7, TC5 "@err", e3)
+    else (s2, TC5 "@err", e2)
+  else (s1, TC5 "@err", e1)
+
+
+-- collision-sites note (§7): machine spans of the failing application, the
+-- function/argument occurrences, and the function binding when resolvable.
+-- JSON-only (warnings never reach text output). Sibling applications are not
+-- enumerated: history beyond the bounded trace is deliberately not retained.
+and g5_collision_note s f a sp tf tx =
+  let fsp = e5_span f in
+  let asp = e5_span a in
+  let fnm = case f of | EVar5 n _ -> n | _ -> "" in
+  let did = if fnm == "" then 0 - 1 else g5_sym_find_name (g5s_syms s) fnm in
+  let dinfo = if did == (0 - 1) then ("", span_dummy, g5_null_sch) else case g5_sym_find5 (g5s_syms s) did of
+    | SymE5 _ _ dsp _ sch -> (fnm, dsp, sch) in
+  case dinfo of
+    | (bnm, dsp, sch) ->
+        let shape = case sch of
+          | Sch5 q qr _ _ -> if q == [] then (if qr == [] then "monomorphic here" else "monomorphic here (open row)") else "polymorphic: " ++ g5_scheme_text s sch in
+        let who = if bnm == "" then "function" else "`" ++ bnm ++ "` (" ++ shape ++ ")" in
+        let sites = if bnm == "" then [sp, fsp, asp] else [sp, fsp, asp, dsp] in
+        Warn5 "collision-sites" (who ++ " has type " ++ g5_show s tf ++ " here; argument has type " ++ g5_show s tx) sp [] sites
+
+and g5_infer_bin s e op l r sp env sc =
+  let (s0, nid) = g5_fresh_node s in
+  let (s1, tl, e1) = g5_infer_e l env sc s0 in
+  if e1 == "" then
+    let (s2, tr, e2) = g5_infer_e r env sc s1 in
+    if e2 == "" then
+      let (s3, rt, e3) = g5_binop op tl tr s2 in
+      if e3 == "" then
+        (g5_record s3 nid sp rt (0 - 1) g5_null_sch [] g5_no_expected "binop result", rt, "")
+      else (s3, TC5 "@err", e3)
+    else (s2, TC5 "@err", e2)
+  else (s1, TC5 "@err", e1)
+
+and g5_binop op tl tr s =
+  if op == "+" then g5_bin_arith op tl tr s "Int" (TC5 "Int")
+  else if op == "-" then g5_bin_arith op tl tr s "Int" (TC5 "Int")
+  else if op == "*" then g5_bin_arith op tl tr s "Int" (TC5 "Int")
+  else if op == "/" then g5_bin_arith op tl tr s "Int" (TC5 "Int")
+  else if op == "%" then g5_bin_arith op tl tr s "Int" (TC5 "Int")
+  else if op == "++" then g5_bin_arith op tl tr s "String" (TC5 "String")
+  else if op == "::" then
+    let (s1, a) = g5_fresh s in
+    let (s2, e1) = g5_unify_wrap_msg tl (TVI5 a) s1 "`::`: " in
+    if e1 == "" then
+      let (s3, e2) = g5_unify_wrap_msg tr (TApp5 "List" [TVI5 a]) s2 "`::`: " in
+      if e2 == "" then (s3, TApp5 "List" [TVI5 a], "") else (s3, TC5 "@err", e2)
+    else (s2, TC5 "@err", e1)
+  else if op == "==" then g5_binop_eq op tl tr s
+  else if op == "!=" then g5_binop_eq op tl tr s
+  else if op == "<" then g5_bin_arith op tl tr s "Int" (TC5 "Bool")
+  else if op == ">" then g5_bin_arith op tl tr s "Int" (TC5 "Bool")
+  else if op == "<=" then g5_bin_arith op tl tr s "Int" (TC5 "Bool")
+  else if op == ">=" then g5_bin_arith op tl tr s "Int" (TC5 "Bool")
+  else if op == "&&" then g5_bin_arith op tl tr s "Bool" (TC5 "Bool")
+  else if op == "||" then g5_bin_arith op tl tr s "Bool" (TC5 "Bool")
+  else (s, TC5 "@err", g5s_ectx s ++ "unknown operator `" ++ op ++ "`")
+
+and g5_bin_arith op tl tr s wantname ret =
+  let (s1, e1) = g5_bin_shape tl wantname s op "left" in
+  if e1 == "" then
+    let (s2, e2) = g5_bin_shape tr wantname s1 op "right" in
+    if e2 == "" then
+      let (s3, e3) = g5_unify tl (TC5 wantname) s2 "" in
+      if e3 == "" then
+        let (s4, e4) = g5_unify tr (TC5 wantname) s3 "" in
+        if e4 == "" then (s4, ret, "") else (s4, TC5 "@err", e4)
+      else (s3, TC5 "@err", e3)
+    else (s2, TC5 "@err", e2)
+  else (s1, TC5 "@err", e1)
+
+and g5_bin_shape t wantname s op side = case g5_chase (g5s_subst s) t of
+    TVI5 _ -> (s, "")
+  | TC5 w ->
+      if w == wantname then (s, "")
+      else (s, g5s_ectx s ++ "operator `" ++ op ++ "` expects `" ++ wantname ++ "` operands, got " ++ side ++ " `" ++ g5_show s t ++ "`")
+  | _ -> (s, g5s_ectx s ++ "operator `" ++ op ++ "` expects `" ++ wantname ++ "` operands, got " ++ side ++ " `" ++ g5_show s t ++ "`")
+
+and g5_binop_eq op tl tr s =
+  let (s1, e1) = g5_unify_wrap_msg tl tr s ("`" ++ op ++ "`: ") in
+  if e1 == "" then (s1, TC5 "Bool", "") else (s1, TC5 "@err", e1)
+
+and g5_infer_if s e c th el sp env sc =
+  let (s0, nid) = g5_fresh_node s in
+  let (s1, tc, e1) = g5_infer_e c env sc s0 in
+  if e1 == "" then
+    let (s2, ec) = g5_unify tc (TC5 "Bool") s1 "`if` condition must be Bool" in
+    if ec == "" then
+      let (s3, tt, e2) = g5_infer_e th env sc s2 in
+      if e2 == "" then
+        let (s4, te, e3) = g5_infer_e el env sc s3 in
+        if e3 == "" then
+          let (s5, e4) = g5_unify_wrap_msg tt te s4 "if branches differ: " in
+          if e4 == "" then
+            (g5_record s5 nid sp tt (0 - 1) g5_null_sch [] g5_no_expected "if result", tt, "")
+          else (s5, TC5 "@err", e4)
+        else (s4, TC5 "@err", e3)
+      else (s3, TC5 "@err", e2)
+    else (s2, TC5 "@err", ec)
+  else (s1, TC5 "@err", e1)
+
+and g5_infer_case s e scrt brs sp env sc =
+  let (s0, nid) = g5_fresh_node s in
+  let (s1, st, e1) = g5_infer_e scrt env sc s0 in
+  if e1 == "" then
+    let (s2, rv) = g5_fresh s1 in
+    let (s3, e2) = g5_case_brs brs st (TVI5 rv) env sc s2 0 nid in
+    if e2 == "" then
+      let s4 = g5_check_match st brs sp s3 in
+      (g5_record s4 nid sp (TVI5 rv) (0 - 1) g5_null_sch [] g5_no_expected "case result", TVI5 rv, "")
+    else (s3, TC5 "@err", e2)
+  else (s1, TC5 "@err", e1)
+
+and g5_case_brs brs st resty env sc s idx owner = case brs of
+    [] -> (s, "")
+  | br :: rest -> case br of
+      | (pat, body) ->
+          let e0 = g5s_ectx s in
+          let s_pushed = g5_push_ctx s ("case branch " ++ int_to_string idx ++ ": ") in
+          let (s1, bnds, scb, e1) = g5_pat_each [pat] [st] [] env sc s_pushed owner in
+          if e1 == "" then
+            let s2 = g5s_with_ectx s1 e0 in
+            let env2 = g5_binds_env bnds env in
+            let (s3, bt, e2) = g5_infer_e body env2 scb s2 in
+            if e2 == "" then
+              let s3t = g5_trace_push s3 ("branch#" ++ int_to_string idx ++ ": " ++ g5_show s3 bt) in
+              let (s4, e3) = g5_unify_wrap_msg bt resty s3t ("case branch " ++ int_to_string idx ++ ": ") in
+              if e3 == "" then g5_case_brs rest st resty env sc s4 (idx + 1) owner else (s4, e3)
+            else (s3, e2)
+          else (s1, e1)
+
+and g5_infer_let s e isrec nm rhs body sp env sc =
+  let (s0, nid) = g5_fresh_node s in
+  if isrec then
+    let (s1, v) = g5_fresh s0 in
+    let (s1b, sid0) = g5_fresh_sym s1 in
+    let env1 = (nm, Sch5 [] [] (TVI5 v) false) :: env in
+    let sc1 = (nm, sid0) :: sc in
+    let (s2, rt, e1) = g5_infer_e rhs env1 sc1 s1b in
+    if e1 == "" then
+      let (s3, e2) = g5_unify (TVI5 v) rt s2 "" in
+      if e2 == "" then
+        let sch = g5_generalize env rt s3 in
+        let (s4, sid) = g5_fresh_sym s3 in
+        let s5 = g5_add_sym s4 (SymE5 sid nm sp nid (g5_norm_sch s4 sch)) in
+        let (s6, bt, e3) = g5_infer_e body ((nm, sch) :: env) ((nm, sid) :: sc) s5 in
+        if e3 == "" then
+          (g5_record s6 nid sp bt sid sch [] g5_no_expected "local let body", bt, "")
+        else (s6, TC5 "@err", e3)
+      else (s3, TC5 "@err", e2)
+    else (s2, TC5 "@err", e1)
+  else if nm == "_" then
+    let (s1, lt, e1) = g5_infer_e rhs env sc s0 in
+    if e1 == "" then
+      let (s2, e2) = g5_unify_wrap_msg lt (TC5 "Unit") s1 "left side of `;` must be Unit: " in
+      if e2 == "" then g5_infer_e body env sc s2
+      else (s2, TC5 "@err", e2)
+    else (s1, TC5 "@err", e1)
+  else
+    let (s1, rt, e1) = g5_infer_e rhs env sc s0 in
+    if e1 == "" then
+      let sch = g5_generalize env rt s1 in
+      let (s2, sid) = g5_fresh_sym s1 in
+      let s3 = g5_add_sym s2 (SymE5 sid nm sp nid (g5_norm_sch s2 sch)) in
+      let (s4, bt, e2) = g5_infer_e body ((nm, sch) :: env) ((nm, sid) :: sc) s3 in
+      if e2 == "" then
+        (g5_record s4 nid sp bt sid sch [] g5_no_expected "local let body", bt, "")
+      else (s4, TC5 "@err", e2)
+    else (s1, TC5 "@err", e1)
+
+and g5_infer_tup s e es sp env sc =
+  let (s0, nid) = g5_fresh_node s in
+  let (s1, ts, e1) = g5_tup_elems es env sc s0 [] in
+  if e1 == "" then
+    (g5_record s1 nid sp (TTup5 ts) (0 - 1) g5_null_sch [] g5_no_expected "tuple", TTup5 ts, "")
+  else (s1, TC5 "@err", e1)
+
+and g5_tup_elems es env sc s acc = case es of
+    [] -> (s, rev_acc [] acc, "")
+  | h :: rest ->
+      let (s1, t, e1) = g5_infer_e h env sc s in
+      if e1 == "" then g5_tup_elems rest env sc s1 (t :: acc) else (s1, [], e1)
+
+and g5_infer_ann s e inner ty sp env sc =
+  let (s0, nid) = g5_fresh_node s in
+  let (s1, tscope, rscope) = g5_fresh_scope ty s0 in
+  let (s2, rt, er1) = g5_resolve ty tscope rscope s1 in
+  if er1 == "" then
+    let (s3, et, e1) = g5_infer_e inner env sc s2 in
+    if e1 == "" then
+      let s3t = g5_trace_push s3 ("ann: " ++ g5_show s3 et ++ " := " ++ g5_show s3 rt) in
+      let (s4, e2) = g5_unify et rt s3t "" in
+      if e2 == "" then
+        (g5_record s4 nid sp rt (0 - 1) g5_null_sch [] g5_no_expected "annotation", rt, "")
+      else (s4, TC5 "@err", e2)
+    else (s3, TC5 "@err", e1)
+  else (s2, TC5 "@err", er1)
+
+and g5_infer_rec s e flds sp env sc =
+  let (s0, nid) = g5_fresh_node s in
+  let (s1, out, e1) = g5_rec_fields flds env sc s0 [] in
+  if e1 == "" then
+    let sfields = g5_sort_fields out [] in
+    let dup = g5_dup_label sfields in
+    if dup == "" then
+      (g5_record s1 nid sp (TRec5 sfields RClosed5) (0 - 1) g5_null_sch [] g5_no_expected "record literal", TRec5 sfields RClosed5, "")
+    else (s1, TC5 "@err", g5s_ectx s1 ++ "duplicate record label `" ++ dup ++ "`")
+  else (s1, TC5 "@err", e1)
+
+and g5_rec_fields flds env sc s acc = case flds of
+    [] -> (s, rev_acc [] acc, "")
+  | kv :: rest -> case kv of
+      | (lb, ex) ->
+          let (s1, t, e1) = g5_infer_e ex env sc s in
+          if e1 == "" then g5_rec_fields rest env sc s1 ((lb, t) :: acc) else (s1, [], e1)
+
+and g5_infer_proj s e r lb sp env sc =
+  let (s0, nid) = g5_fresh_node s in
+  let (s1, rt, e1) = g5_infer_e r env sc s0 in
+  if e1 == "" then
+    let (s2, ft) = g5_fresh s1 in
+    let (s3, rid) = g5_fresh_row s2 in
+    let want = TRec5 [(lb, TVI5 ft)] (ROpen5 rid) in
+    let (s4, e2) = g5_unify rt want s3 "" in
+    if e2 == "" then
+      (g5_record s4 nid sp (TVI5 ft) (0 - 1) g5_null_sch [] g5_no_expected "projection", TVI5 ft, "")
+    else (s4, TC5 "@err", "unknown record field `" ++ lb ++ "`: " ++ e2)
+  else (s1, TC5 "@err", e1)
+
+and g5_infer_with s e b lb u sp env sc =
+  let (s0, nid) = g5_fresh_node s in
+  let (s1, bt, e1) = g5_infer_e b env sc s0 in
+  if e1 == "" then
+    let (s2, nt, e2) = g5_infer_e u env sc s1 in
+    if e2 == "" then
+      let (s3, rid) = g5_fresh_row s2 in
+      let want = TRec5 [(lb, nt)] (ROpen5 rid) in
+      let (s4, e3) = g5_unify bt want s3 "" in
+      if e3 == "" then
+        (g5_record s4 nid sp bt (0 - 1) g5_null_sch [] g5_no_expected "record update", bt, "")
+      else (s4, TC5 "@err", "record update for `" ++ lb ++ "`: " ++ e3)
+    else (s2, TC5 "@err", e2)
+  else (s1, TC5 "@err", e1)
+
+and g5_infer_hole s e nm sp env sc =
+  let (s0, nid) = g5_fresh_node s in
+  let (s1, v) = g5_fresh s0 in
+  let s2 = g5s_with_holevars s1 (v :: g5s_holevars s1) in
+  let (s3, cands, cap) = g5_hole_cands env (TVI5 v) s2 12 in
+  let s4 = g5s_with_holes s3 (HoleE5 nid nm (TVI5 v) cands cap :: g5s_holes s3) in
+  (g5_record s4 nid sp (TVI5 v) (0 - 1) g5_null_sch [] g5_no_expected "hole (partial)", TVI5 v, "")
+
+and g5_hole_cands env hty s limit = case env of
+    [] -> (s, [], false)
+  | kv :: rest -> case kv of
+      | (nm, sch) ->
+          if limit == 0 then (s, [], true)
+          else case sch of
+            | Sch5 qvars qrows sty p ->
+                if p then g5_hole_cands rest hty s limit
+                else
+                  let (s1, inst, _, _) = g5_instantiate qvars qrows sty s in
+                  if g5_mentions_hole inst s1 then g5_hole_cands rest hty s1 limit
+                  else
+                    let snap = g5_snapshot s1 in
+                    let (s2, e1) = g5_unify inst hty s1 "" in
+                    if e1 == "" then
+                      let ninst = g5_norm_ty_here s2 inst in
+                      let s3 = g5_rollback s2 snap in
+                      let dsp = g5_decl_span_of s3 nm in
+                      let (s4, more, cap) = g5_hole_cands rest hty s3 (limit - 1) in
+                      (s4, (nm, ninst, dsp) :: more, cap)
+                    else
+                      let s3 = g5_rollback s2 snap in
+                      g5_hole_cands rest hty s3 limit
+
+and g5_mentions_hole inst s =
+  g5_any_mem (g5_free_chase inst s []) (g5s_holevars s)
+
+and g5_decl_span_of s nm =
+  let sid = g5_sym_find_name (g5s_syms s) nm in
+  if sid == (0 - 1) then span_dummy
+  else case g5_sym_find5 (g5s_syms s) sid of
+    | SymE5 _ _ dsp _ _ -> dsp
+
+-- ---------- match diagnostics (advisory warnings, Maranget-lite) ----------
+
+and g5_check_match st brs sp s =
+  let covered = g5_covered brs [] [] in
+  case covered of
+    | (ctors, lits, wild) ->
+        if wild then s
+        else g5_missing_warn st ctors lits sp s
+
+and g5_covered brs ctors lits = case brs of
+    [] -> (ctors, lits, false)
+  | br :: rest -> case br of
+      | (p, _) ->
+          if g5_pat_is_wild p then (ctors, lits, true)
+          else case p of
+            | PCtor5 n _ _ -> g5_covered rest (n :: ctors) lits
+            | PBool5 b _ -> g5_covered rest ctors ((if b then "true" else "false") :: lits)
+            | PUnit5 _ -> g5_covered rest ctors ("unit" :: lits)
+            | PTup5 _ _ -> (ctors, lits, true)
+            | _ -> g5_covered rest ctors lits
+
+and g5_pat_is_wild p = case p of
+  | PWild5 _ -> true
+  | PVar5 _ _ -> true
+  | _ -> false
+
+and g5_missing_warn st ctors lits sp s = case g5_chase (g5s_subst s) st of
+    TC5 "Bool" -> g5_missing_lits ["true", "false"] lits sp s
+  | TC5 "Unit" -> g5_missing_lits ["unit"] lits sp s
+  | TApp5 "List" _ -> g5_missing_ctors ["Nil", "Cons"] ctors sp s
+  | TApp5 n _ ->
+      case g5_tydef_ctors (g5s_tydefs s) n of
+        | [] -> s
+        | cs -> g5_missing_ctors cs ctors sp s
+  | _ -> s
+
+and g5_tydef_ctors tydefs n = case tydefs of
+    [] -> []
+  | kv :: rest -> case kv of
+      | (k, _, cs) -> if k == n then cs else g5_tydef_ctors rest n
+
+and g5_missing_lits want have sp s =
+  let miss = g5_sub_str want have in
+  if miss == [] then s
+  else g5_add_warn s (Warn5 "non-exhaustive" ("non-exhaustive match: missing " ++ g5_join_labels_str miss) sp miss [])
+
+and g5_missing_ctors want have sp s =
+  let miss = g5_sub_str want have in
+  if miss == [] then s
+  else g5_add_warn s (Warn5 "non-exhaustive" ("non-exhaustive match: missing " ++ g5_join_labels_str miss) sp miss [])
+
+and g5_sub_str xs ys = case xs of
+    [] -> []
+  | h :: rest -> if g5_mem_str5 h ys then g5_sub_str rest ys else h :: g5_sub_str rest ys
+
+and g5_join_labels_str xs = case xs of
+    [] -> ""
+  | h :: [] -> h
+  | h :: rest -> h ++ ", " ++ g5_join_labels_str rest
+
+-- ---------- sig contracts (rigid skolems, trial unify + rollback) ----------
+
+and g5_sig_check sch sig5 s = case sig5 of
+  | Sig5 nm fall ty _ ->
+      let (tns, rns) = g5_ann_vars ty [] [] in
+      let (tvs, rvs) = g5_split_forall fall tns rns in
+      let (s1, tscope, rscope) = g5_sig_scope tvs rvs s [] [] in
+      let (s2, declared, er1) = g5_resolve_sig ty tscope rscope s1 in
+      if er1 == "" then
+        case sch of
+          | Sch5 qvars qrows sty _ ->
+              let (s3, inst, _, _) = g5_instantiate qvars qrows sty s2 in
+              let snap = g5_snapshot s3 in
+              let (s4, e1) = g5_unify inst declared s3 "" in
+              let s5 = g5_rollback s4 snap in
+              if e1 == "" then (s5, "") else (s5, e1)
+      else (s2, er1)
+
+and g5_split_forall fall tns rns = (g5_split_ty fall tns, g5_split_row fall rns)
+
+and g5_split_ty fall tns = case fall of
+    [] -> []
+  | v :: rest -> if g5_mem_str5 v tns then v :: g5_split_ty rest tns else g5_split_ty rest tns
+
+and g5_split_row fall rns = case fall of
+    [] -> []
+  | v :: rest -> if g5_mem_str5 v rns then v :: g5_split_row rest rns else g5_split_row rest rns
+
+and g5_resolve_sig ty tscope rscope s = g5_resolve_sig_go ty tscope rscope s
+
+and g5_resolve_sig_go ty tscope rscope s = case ty of
+    TTVar5 v _ -> g5_resolve_sig_var v tscope rscope s
+  | TTCon5 n args _ ->
+      if n == "Int" then g5_sig_base n args (TC5 "Int") tscope rscope s
+      else if n == "Bool" then g5_sig_base n args (TC5 "Bool") tscope rscope s
+      else if n == "String" then g5_sig_base n args (TC5 "String") tscope rscope s
+      else if n == "Unit" then g5_sig_base n args (TC5 "Unit") tscope rscope s
+      else if n == "List" then (case args of
+        | [e] ->
+            let (s1, t1, er1) = g5_resolve_sig_go e tscope rscope s in
+            if er1 == "" then (s1, TApp5 "List" [t1], "") else (s1, TC5 "@err", er1)
+        | _ -> (s, TC5 "@err", g5s_ectx s ++ "`List` expects exactly one argument"))
+      else
+        let ar = g5_tydef_arity (g5s_tydefs s) n in
+        if ar == (0 - 2) then (s, TC5 "@err", g5s_ectx s ++ "unknown type `" ++ n ++ "`")
+        else if ar == len args then
+          let (s1, ts, er1) = g5_resolve_sig_list args tscope rscope s in
+          if er1 == "" then (s1, TApp5 n ts, "") else (s1, TC5 "@err", er1)
+        else (s, TC5 "@err", g5s_ectx s ++ ("type `" ++ n ++ "` expects " ++ int_to_string ar ++ " arguments, got " ++ int_to_string (len args)))
+  | TTArr5 a b _ ->
+      let (s1, t1, e1) = g5_resolve_sig_go a tscope rscope s in
+      if e1 == "" then
+        let (s2, t2, e2) = g5_resolve_sig_go b tscope rscope s1 in
+        if e2 == "" then (s2, TAr5 t1 t2, "") else (s2, TC5 "@err", e2)
+      else (s1, TC5 "@err", e1)
+  | TTTup5 ts _ ->
+      let (s1, out, er1) = g5_resolve_sig_list ts tscope rscope s in
+      if er1 == "" then (s1, TTup5 out, "") else (s1, TC5 "@err", er1)
+  | TTRec5 flds row _ ->
+      let (s1, out, er1) = g5_resolve_sig_rec flds tscope rscope s [] in
+      if er1 == "" then
+        if row == "" then (s1, TRec5 out RClosed5, "")
+        else
+          let rid = g5_lookup_str5 rscope row in
+          if rid == (0 - 1) then (s1, TC5 "@err", g5s_ectx s1 ++ "unbound row variable `" ++ row ++ "` in sig (bind with forall)")
+          else (s1, TRec5 out (ROpen5 rid), "")
+      else (s1, TC5 "@err", er1)
+
+and g5_find_ty_scope tscope v = case tscope of
+    [] -> NoneTy5
+  | kv :: rest -> case kv of
+      | (k, t) -> if k == v then SomeTy5 t else g5_find_ty_scope rest v
+
+and g5_sig_base n args ty tscope rscope s = case args of
+    [] -> (s, ty, "")
+  | _ -> (s, TC5 "@err", g5s_ectx s ++ "unknown type `" ++ n ++ "`")
+
+and g5_resolve_sig_list ts tscope rscope s = case ts of
+    [] -> (s, [], "")
+  | h :: rest ->
+      let (s1, t1, e1) = g5_resolve_sig_go h tscope rscope s in
+      if e1 == "" then
+        let (s2, tr, e2) = g5_resolve_sig_list rest tscope rscope s1 in
+        if e2 == "" then (s2, t1 :: tr, "") else (s2, [], e2)
+      else (s1, [], e1)
+
+and g5_resolve_sig_rec flds tscope rscope s acc = case flds of
+    [] -> (s, rev_acc [] acc, "")
+  | kv :: rest -> case kv of
+      | (lb, ty) ->
+          if g5_mem_field acc lb then (s, [], "duplicate record label `" ++ lb ++ "` in type")
+          else
+            let (s1, t1, e1) = g5_resolve_sig_go ty tscope rscope s in
+            if e1 == "" then g5_resolve_sig_rec rest tscope rscope s1 ((lb, t1) :: acc)
+            else (s1, [], e1)
+
+-- tentative downgrade predicate (hole-connected failure -> partial, not invalid)
+and g5_is_tentative msg s =
+  if g5s_holevars s == [] then false
+  else if g5_contains msg "record mismatch" then true
+  else if g5_contains msg "in application" then true
+  else if g5_contains msg "type mismatch" then true
+  else if g5_contains msg "case branch" then true
+  else if g5_contains msg "if branches" then true
+  else false
+
+and g5_contains hay needle = g5_contains_at hay needle 0
+
+and g5_contains_at hay needle i =
+  if needle == "" then true
+  else
+    let h = string_get hay i in
+    if h == -1 then false
+    else if g5_starts_with_at hay needle i 0 then true
+    else g5_contains_at hay needle (i + 1)
+
+and g5_starts_with_at hay needle i j =
+  let n = string_get needle j in
+  if n == -1 then true
+  else
+    let h = string_get hay (i + j) in
+    if h == n then g5_starts_with_at hay needle i (j + 1) else false
+
+-- ---------- top-level definition groups ----------
+
+let rec g5_dup_def ds s = case ds of
+    [] -> (s, "")
+  | d :: rest -> case d of
+      | Def5 _ nm _ _ _ _ _ ->
+          if g5_mem_str5 nm (g5_def_names rest) then (s, g5s_ectx s ++ "duplicate definition `" ++ nm ++ "`")
+          else g5_dup_def rest s
+
+and g5_def_names ds = case ds of
+    [] -> []
+  | d :: rest -> case d of
+      | Def5 _ nm _ _ _ _ _ -> nm :: g5_def_names rest
+
+and g5_place ds env sc s n = case ds of
+    [] -> (s, env, sc, "")
+  | d :: rest -> case d of
+      | Def5 isrec nm nsp _ _ _ _ ->
+          if isrec then
+            let (s1, v) = g5_fresh s in
+            let (s2, sid) = g5_fresh_sym s1 in
+            let nsch0 = Sch5 [] [] (TVI5 v) false in
+            let s3 = g5_add_sym s2 (SymE5 sid nm nsp (0 - 1) nsch0) in
+            g5_place rest ((nm, Sch5 [] [] (TVI5 v) false) :: env) ((nm, sid) :: sc) s3 n
+          else if n > 1 then (s, env, sc, (g5s_ectx s ++ "`" ++ nm ++ "`: all members of an `and` group must be recursive"))
+          else g5_place rest env sc s n
+
+and g5_peel_ann bd = case bd of
+    EAnn5 inner ty _ -> (inner, SomeTy5 ty)
+  | _ -> (bd, NoneTy5)
+
+and g5_bodies ds env_outer env_full sc_full s acc = case ds of
+    [] -> (s, rev_acc [] acc, "")
+  | d :: rest -> case d of
+      | Def5 isrec nm nsp ps ann bd sp ->
+          let e0 = g5s_ectx s in
+          let s_pushed = g5_push_ctx s ("in def `" ++ nm ++ "`: ") in
+          case g5_peel_ann bd of
+            | (inner, man) ->
+                let (s1, bt, e1) = g5_infer_e inner env_full sc_full s_pushed in
+                if e1 == "" then
+                  let s1p = g5s_with_ectx s1 e0 in
+                  case g5_tie_rec isrec nm env_full bt s1p of
+                    | (s2, e2) ->
+                        if e2 == "" then
+                          case man of
+                            | NoneTy5 ->
+                                g5_bodies rest env_outer env_full sc_full s2 ((nm, bt) :: acc)
+                            | SomeTy5 ty ->
+                                let (s3, tscope, rscope) = g5_fresh_scope ty s2 in
+                                let (s4, rty, er1) = g5_resolve ty tscope rscope s3 in
+                                if er1 == "" then
+                                  let (s5, e3) = g5_unify_wrap_msg bt rty s4 ("annotation on `" ++ nm ++ "`: ") in
+                                  if e3 == "" then g5_bodies rest env_outer env_full sc_full s5 ((nm, bt) :: acc)
+                                  else (s5, [], e3)
+                                else (s4, [], er1)
+                        else (s2, [], e2)
+                else (s1, [], e1)
+
+and g5_tie_rec isrec nm env_full bt s =
+  if isrec then
+    let sch = g5_env_find5 env_full nm in
+    case sch of
+      | Sch5 _ _ (TVI5 v) _ -> g5_unify_wrap_msg (TVI5 v) bt s ("in `" ++ nm ++ "`: ")
+      | _ -> (s, "")
+  else (s, "")
+
+and g5_gen_all tys env_outer s acc = case tys of
+    [] -> (s, rev_acc [] acc, "")
+  | kv :: rest -> case kv of
+      | (nm, bt) ->
+          let sch = g5_generalize env_outer bt s in
+          g5_gen_all rest env_outer s ((nm, sch) :: acc)
+
+and g5_infer_def_group ds env sc s =
+  let (s0, e0) = g5_dup_def ds s in
+  if e0 == "" then
+    let n = len ds in
+    let (s1, env_full, sc_full, e1) = g5_place ds env sc s0 n in
+    if e1 == "" then
+      let (s2, btys, e2) = g5_bodies ds env env_full sc_full s1 [] in
+      if e2 == "" then
+        let (s3, schs, e3) = g5_gen_all btys env s2 [] in
+        if e3 == "" then (s3, schs, sc_full, "") else (s3, [], sc, e3)
+      else (s2, [], sc, e2)
+    else (s1, [], sc, e1)
+  else (s0, [], sc, e0)
+
+-- ---------- initial environment (mirrors Gen4 builtins) ----------
+
+let g5_init_env s =
+  let (s1, a1) = g5_fresh s in
+  let nilsch = Sch5 [a1] [] (TApp5 "List" [TVI5 a1]) false in
+  let (s2, a2) = g5_fresh s1 in
+  let conssch = Sch5 [a2] [] (TAr5 (TVI5 a2) (TAr5 (TApp5 "List" [TVI5 a2]) (TApp5 "List" [TVI5 a2]))) false in
+  let monos = [("print_int", Sch5 [] [] (TAr5 (TC5 "Int") (TC5 "Unit")) false),
+    ("print_string", Sch5 [] [] (TAr5 (TC5 "String") (TC5 "Unit")) false),
+    ("int_to_string", Sch5 [] [] (TAr5 (TC5 "Int") (TC5 "String")) false),
+    ("bool_to_string", Sch5 [] [] (TAr5 (TC5 "Bool") (TC5 "String")) false),
+    ("string_length", Sch5 [] [] (TAr5 (TC5 "String") (TC5 "Int")) false),
+    ("str_concat", Sch5 [] [] (TAr5 (TC5 "String") (TAr5 (TC5 "String") (TC5 "String"))) false),
+    ("read_file", Sch5 [] [] (TAr5 (TC5 "String") (TC5 "String")) false),
+    ("write_file", Sch5 [] [] (TAr5 (TC5 "String") (TAr5 (TC5 "String") (TC5 "Unit"))) false),
+    ("exit", Sch5 [] [] (TAr5 (TC5 "Int") (TC5 "Unit")) false),
+    ("chr", Sch5 [] [] (TAr5 (TC5 "Int") (TC5 "String")) false),
+    ("ord", Sch5 [] [] (TAr5 (TC5 "String") (TC5 "Int")) false),
+    ("string_get", Sch5 [] [] (TAr5 (TC5 "String") (TAr5 (TC5 "Int") (TC5 "Int"))) false),
+    ("substring", Sch5 [] [] (TAr5 (TC5 "String") (TAr5 (TC5 "Int") (TAr5 (TC5 "Int") (TC5 "String")))) false),
+    ("string_to_int", Sch5 [] [] (TAr5 (TC5 "String") (TC5 "Int")) false),
+    ("argv", Sch5 [] [] (TAr5 (TC5 "Int") (TC5 "String")) false),
+    ("system", Sch5 [] [] (TAr5 (TC5 "String") (TC5 "Int")) false)] in
+  let (s3, a3) = g5_fresh s2 in
+  let errsch = Sch5 [a3] [] (TAr5 (TC5 "String") (TVI5 a3)) false in
+  let (s4, a4) = g5_fresh s3 in
+  let showsch = Sch5 [a4] [] (TAr5 (TVI5 a4) (TC5 "String")) false in
+  (s4, ("Nil", nilsch) :: ("Cons", conssch) :: ("error", errsch) :: ("show", showsch) :: monos)
+
+-- ---------- top-level driver state ----------
+-- Diag5 idx kind msg | ItemRes5 sums ckpts diags status errmsg
+-- status: checked | partial | invalid
+type Diag5 = Diag5 Int String String
+type ItemRes5 = ItemRes5 (List ItemSum5) (List Ckpt5) (List Diag5) String String
+
+let rec g5_def_names5 ds = case ds of
+    [] -> []
+  | d :: rest -> def5_name d :: g5_def_names5 rest
+
+let rec g5_join_names ns = case ns of
+    [] -> ""
+  | h :: rest -> case rest of
+      | [] -> h
+      | _ -> h ++ " / " ++ g5_join_names rest
+
+let g5_tydecl_name td = case td of | TyDecl5 n _ _ -> n
+
+let g5_item_kind_def ds = case ds of
+  | [] -> "let ?"
+  | d :: _ -> "let " ++ def5_name d
+
+let g5_item_kind_rec ds = "let rec " ++ g5_join_names (g5_def_names5 ds)
+
+-- normalize env + clear subst at item boundary (Gen4 rule, extended:
+-- rowsubst entries for QUANTIFIED rows are droppable; open flex rows in
+-- schemes stay quantified. holevars persist (holes span items).)
+-- hole expected types are refreshed with live subst before clearing.
+let rec g5_refresh_holes s =
+  g5s_with_holes s (g5_refresh_hole_list (g5s_holes s) s)
+
+and g5_refresh_hole_list hs s = case hs of
+    [] -> []
+  | he :: rest -> case he of
+      | HoleE5 nid nm ty cands cap -> HoleE5 nid nm (g5_norm_ty_here s ty) (g5_refresh_cands cands s) cap :: g5_refresh_hole_list rest s
+
+and g5_refresh_cands cs s = case cs of
+    [] -> []
+  | kv :: rest -> case kv of
+      | (nm, ty, dsp) -> (nm, g5_norm_ty_here s ty, dsp) :: g5_refresh_cands rest s
+
+let rec g5_norm_env env s = case env of
+    [] -> []
+  | kv :: rest -> case kv of
+      | (nm, sch) -> case sch of
+          | Sch5 q qr ty p -> (nm, Sch5 q qr (g5_norm_ty_here s ty) p) :: g5_norm_env rest s
+
+-- refresh recorded nodes/syms with live subst before clearing (RFC 6.2:
+-- occurrence types must reflect final constraints, not the fresh vars at
+-- record time; e.g. `id` in `id 1` is `Int -> Int`, not `a -> a`).
+-- Only the current item's suffix (n0/y0 = counts before the item) is
+-- refreshed: earlier items are already final (later fresh ids never collide),
+-- so per-boundary work stays linear in the item, not the whole program.
+let rec g5_refresh_nodes s =
+  g5s_with_nodes s (g5_refresh_node_list (g5s_nodes s) s)
+
+and g5_refresh_node_list ns s = case ns of
+    [] -> []
+  | nd :: rest -> case nd of
+      | NodeE5 nid sp ty symid sch inst exp reason ->
+          NodeE5 nid sp (g5_norm_ty_here s ty) symid (g5_norm_sch s sch) (g5_norm_inst s inst) (g5_norm_exp s exp) reason :: g5_refresh_node_list rest s
+
+and g5_norm_exp s exp = case exp of
+  | TC5 "@none" -> exp
+  | _ -> g5_norm_ty_here s exp
+
+and g5_refresh_syms s =
+  g5s_with_syms s (g5_refresh_sym_list (g5s_syms s) s)
+
+and g5_refresh_sym_list syms s = case syms of
+    [] -> []
+  | sy :: rest -> case sy of
+      | SymE5 sid nm dsp nid sch -> SymE5 sid nm dsp nid (g5_norm_sch s sch) :: g5_refresh_sym_list rest s
+
+-- polymorphic split lives in its own let-group so two uses (nodes/syms)
+-- generalize independently (HM let-poly; cf. RFC 3.1 rec placeholders mono)
+let rec g5_split_at n xs =
+  if n == 0 then ([], xs)
+  else case xs of
+    | [] -> ([], [])
+    | h :: rest -> case g5_split_at (n - 1) rest of | (a, b) -> (h :: a, b)
+
+let g5_refresh_nodes_suffix s n0 =
+  let knew = len (g5s_nodes s) - n0 in
+  case g5_split_at knew (g5s_nodes s) of
+    | (fresh, old) -> g5s_with_nodes s (app_list (g5_refresh_node_list fresh s) old)
+
+let g5_refresh_syms_suffix s y0 =
+  let knew = len (g5s_syms s) - y0 in
+  case g5_split_at knew (g5s_syms s) of
+    | (fresh, old) -> g5s_with_syms s (app_list (g5_refresh_sym_list fresh s) old)
+
+let g5_boundary_go s1 env =
+  (g5s_with_tracelog (g5s_with_subst s1 []) [], g5_norm_env env s1)
+
+let g5_boundary s env =
+  g5_boundary_go (g5_refresh_nodes (g5_refresh_syms (g5_refresh_holes s))) env
+
+let g5_boundary_item s env n0 y0 =
+  g5_boundary_go (g5_refresh_nodes_suffix (g5_refresh_syms_suffix (g5_refresh_holes s) y0) n0) env
+
+-- collect sig table (reject duplicates)
+let rec g5_collect_sigs items acc = case items of
+    [] -> (acc, "")
+  | it :: rest -> (case it of
+      | ISig5 sg -> (case sg of
+          | Sig5 nm _ _ _ ->
+              if g5_mem_str5 nm (g5_sig_names acc) then (acc, "duplicate sig for `" ++ nm ++ "`")
+              else g5_collect_sigs rest ((nm, sg) :: acc))
+      | _ -> g5_collect_sigs rest acc)
+
+and g5_sig_names sigs = case sigs of
+    [] -> []
+  | kv :: rest -> case kv of
+      | (nm, _) -> nm :: g5_sig_names rest
+
+and g5_sig_find sigs nm = case sigs of
+    [] -> Sig5 "" [] (TTCon5 "Unit" [] span_dummy) span_dummy
+  | kv :: rest -> case kv of
+      | (k, sg) -> if k == nm then sg else g5_sig_find rest nm
+
+and g5_sig_has sigs nm = case sigs of
+    [] -> false
+  | kv :: rest -> case kv of
+      | (k, _) -> if k == nm then true else g5_sig_has rest nm
+
+-- main item loop: (s, env, sc, sums, ckpts, diags, status)
+-- straight-line code; per-item snapshot/rollback; first hard error stops.
+
+let g5_sig_of sigs nm = if g5_sig_has sigs nm then g5_sig_find sigs nm else g5_no_sig5
+
+let rec g5_def_span ds nm = case ds of
+    [] -> span_dummy
+  | d :: rest -> case d of
+      | Def5 _ n nsp _ _ _ _ -> if n == nm then nsp else g5_def_span rest nm
+
+let rec g5_sum_binds schs ds acc = case schs of
+    [] -> rev_acc [] acc
+  | kv :: rest -> case kv of
+      | (nm, sch) -> case sch of
+          | Sch5 _ _ _ p -> g5_sum_binds rest ds (BindTy5 nm (g5_def_span ds nm) sch (if p then "partial" else "checked") g5_no_sig5 :: acc)
+
+-- rebuild summaries from NORMALIZED env (post-boundary schemes)
+let rec g5_sum_binds_env schs env ds sigs acc = case schs of
+    [] -> rev_acc [] acc
+  | kv :: rest -> case kv of
+      | (nm, _) ->
+          let sch = g5_env_find5 env nm in
+          case sch of
+            | Sch5 _ _ _ p -> g5_sum_binds_env rest env ds sigs (BindTy5 nm (g5_def_span ds nm) sch (if p then "partial" else "checked") (g5_sig_of sigs nm) :: acc)
+
+let rec g5_check_sig_binds schs sigs s idx kind = case schs of
+    [] -> (s, "")
+  | kv :: rest -> case kv of
+      | (nm, sch) ->
+          if g5_sig_has sigs nm then
+            let sg = g5_sig_find sigs nm in
+            let (s1, e1) = g5_sig_check sch sg s in
+            if e1 == "" then g5_check_sig_binds rest sigs s1 idx kind
+            else (s1, e1 ++ " [sig contract for `" ++ nm ++ "`]")
+          else g5_check_sig_binds rest sigs s idx kind
+
+let rec g5_gen_reason sch = case sch of
+  | Sch5 qvars qrows _ p ->
+      if p then "hole-dependent: quantified here but partial for public output"
+      else if qvars == [] then (if qrows == [] then "monomorphic here (no free vars beyond env)" else "generalized over rows (let-polymorphism)")
+      else "generalized over type vars (let-polymorphism)"
+
+let rec g5_top_def_syms schs ds s sc = case schs of
+    [] -> (s, sc)
+  | kv :: rest -> case kv of
+      | (nm, sch) ->
+          let (s1, sid) = g5_fresh_sym s in
+          let (s2, nid) = g5_fresh_node s1 in
+          let dsp = g5_def_span ds nm in
+          let s3 = g5_add_sym s2 (SymE5 sid nm dsp nid (g5_norm_sch s2 sch)) in
+          case sch of
+            | Sch5 _ _ ty _ ->
+                let s4 = g5_record s3 nid dsp ty sid sch [] g5_no_expected (g5_gen_reason sch) in
+                let (s5, sc2) = g5_top_def_syms rest ds s4 ((nm, sid) :: sc) in
+                (s5, sc2)
+
+let rec g5_top_ctor_syms schs sp s sc = case schs of
+    [] -> (s, sc)
+  | kv :: rest -> case kv of
+      | (nm, sch) ->
+          let (s1, sid) = g5_fresh_sym s in
+          let s2 = g5_add_sym s1 (SymE5 sid nm sp (0 - 1) (g5_norm_sch s1 sch)) in
+          g5_top_ctor_syms rest sp s2 ((nm, sid) :: sc)
+
+-- ---------- failure-dependency marking (§7 recovery) ----------
+-- Free names referenced by an item, minus names it binds. Over-approximation
+-- is safe: it only skips analysis (marks "lacking"), never fabricates results.
+-- Text output keeps the FIRST hard error only; continuation diags are JSON-only.
+let rec g5_fv_p p bound = case p of
+  | PVar5 n _ -> n :: bound
+  | PTup5 ps _ -> g5_fv_ps ps bound
+  | PCtor5 _ ps _ -> g5_fv_ps ps bound
+  | _ -> bound
+
+and g5_fv_ps ps bound = case ps of
+    [] -> bound
+  | p :: rest -> g5_fv_ps rest (g5_fv_p p bound)
+
+and g5_fv_ty t acc = case t of
+  | TTVar5 n _ -> n :: acc
+  | TTCon5 n args _ -> g5_fv_tys args (n :: acc)
+  | TTArr5 l r _ -> g5_fv_ty l (g5_fv_ty r acc)
+  | TTTup5 ts _ -> g5_fv_tys ts acc
+  | TTRec5 flds row _ -> g5_fv_row row (g5_fv_fields flds acc)
+
+and g5_fv_tys ts acc = case ts of
+    [] -> acc
+  | t :: rest -> g5_fv_tys rest (g5_fv_ty t acc)
+
+and g5_fv_fields flds acc = case flds of
+    [] -> acc
+  | kv :: rest -> case kv of
+      | (_, ty) -> g5_fv_fields rest (g5_fv_ty ty acc)
+
+and g5_fv_row row acc = if row == "" then acc else row :: acc
+
+and g5_fv_opt o acc = case o of
+  | NoneTy5 -> acc
+  | SomeTy5 ty -> g5_fv_ty ty acc
+
+and g5_fv_e e bound acc = case e of
+  | EVar5 n _ -> if g5_mem_str5 n bound then acc else n :: acc
+  | ECtor5 c _ -> if g5_mem_str5 c bound then acc else c :: acc
+  | ELam5 p b _ -> g5_fv_e b (g5_fv_p p bound) acc
+  | EApp5 f a _ -> g5_fv_e f bound (g5_fv_e a bound acc)
+  | EBin5 _ l r _ -> g5_fv_e l bound (g5_fv_e r bound acc)
+  | EIf5 c t el _ -> g5_fv_e c bound (g5_fv_e t bound (g5_fv_e el bound acc))
+  | ECase5 sc brs _ -> g5_fv_e sc bound (g5_fv_brs brs bound acc)
+  | ELet5 isrec nm rhs body _ ->
+      let acc2 = g5_fv_e rhs (if isrec then nm :: bound else bound) acc in
+      g5_fv_e body (nm :: bound) acc2
+  | ETup5 es _ -> g5_fv_list es bound acc
+  | EAnn5 x ty _ -> g5_fv_ty ty (g5_fv_e x bound acc)
+  | ERec5 flds _ -> g5_fv_efields flds bound acc
+  | EProj5 r _ _ -> g5_fv_e r bound acc
+  | EWith5 b _ u _ -> g5_fv_e b bound (g5_fv_e u bound acc)
+  | _ -> acc
+
+and g5_fv_list es bound acc = case es of
+    [] -> acc
+  | e :: rest -> g5_fv_list rest bound (g5_fv_e e bound acc)
+
+and g5_fv_efields flds bound acc = case flds of
+    [] -> acc
+  | kv :: rest -> case kv of
+      | (_, e) -> g5_fv_efields rest bound (g5_fv_e e bound acc)
+
+and g5_fv_brs brs bound acc = case brs of
+    [] -> acc
+  | br :: rest -> case br of
+      | (p, b) -> g5_fv_brs rest bound (g5_fv_e b (g5_fv_p p bound) acc)
+
+and g5_defs_names ds = case ds of
+    [] -> []
+  | d :: rest -> def5_name d :: g5_defs_names rest
+
+and g5_defs_deps ds gnames acc = case ds of
+    [] -> acc
+  | d :: rest -> case d of
+      | Def5 _ _ _ ps ann body _ ->
+          let bound = g5_fv_ps ps gnames in
+          g5_defs_deps rest gnames (g5_fv_opt ann (g5_fv_e body bound acc))
+
+and g5_ty_names td = case td of
+  | TyDecl5 n _ cds -> n :: g5_ctors_names cds []
+
+and g5_ctors_names cds acc = case cds of
+    [] -> acc
+  | cd :: rest -> case cd of
+      | CtorDecl5 nm fs -> g5_ctors_names rest (nm :: g5_fv_tys fs acc)
+
+and g5_ty_deps td = case td of
+  | TyDecl5 n ps cds -> g5_ctors_deps cds (n :: ps) []
+
+and g5_ctors_deps cds bound acc = case cds of
+    [] -> acc
+  | cd :: rest -> case cd of
+      | CtorDecl5 _ fs -> g5_ctors_deps rest bound (g5_fv_tys_bound fs bound acc)
+
+and g5_fv_tys_bound ts bound acc = case ts of
+    [] -> acc
+  | t :: rest -> g5_fv_tys_bound rest bound (g5_fv_ty_bound t bound acc)
+
+and g5_fv_ty_bound t bound acc = case t of
+  | TTVar5 n _ -> if g5_mem_str5 n bound then acc else n :: acc
+  | TTCon5 n args _ -> g5_fv_tys_bound args bound (if g5_mem_str5 n bound then acc else n :: acc)
+  | TTArr5 l r _ -> g5_fv_ty_bound l bound (g5_fv_ty_bound r bound acc)
+  | TTTup5 ts _ -> g5_fv_tys_bound ts bound acc
+  | TTRec5 flds row _ -> g5_fv_fields_bound flds row bound acc
+
+and g5_fv_fields_bound flds row bound acc =
+  let acc2 = if row == "" then acc else (if g5_mem_str5 row bound then acc else row :: acc) in
+  g5_fv_ffield_list flds bound acc2
+
+and g5_fv_ffield_list flds bound acc = case flds of
+    [] -> acc
+  | kv :: rest -> case kv of
+      | (_, ty) -> g5_fv_ffield_list rest bound (g5_fv_ty_bound ty bound acc)
+
+and g5_item_deps it = case it of
+  | IDef5 ds _ -> g5_defs_deps ds (g5_defs_names ds) []
+  | ITy5 td _ -> g5_ty_deps td
+  | _ -> []
+
+and g5_first_failed deps failed = case deps of
+    [] -> ""
+  | d :: rest -> if g5_mem_str5 d failed then d ++ g5_more_failed rest failed else g5_first_failed rest failed
+
+and g5_more_failed deps failed = case deps of
+    [] -> ""
+  | d :: rest -> if g5_mem_str5 d failed then ", `" ++ d ++ "`" ++ g5_more_failed rest failed else g5_more_failed rest failed
+
+and g5_lacking_msg deps failed =
+  let f = g5_first_failed deps failed in
+  if f == "" then "" else "unchecked: depends on failed definition(s) `" ++ f ++ "`"
+
+let rec g5_run_items hd items env sc s sigs idx sums ckpts diags status failed errmsg = case items of
+    [] -> if status == "invalid" then (s, sums, ckpts, diags, status, errmsg)
+          else g5_finish hd env sc s sigs sums ckpts diags status
+  | it :: rest -> case it of
+      | ITy5 td sp ->
+          let kind0 = "type " ++ g5_tydecl_name td in
+          let lack = g5_lacking_msg (g5_item_deps it) failed in
+          if lack == "" then
+            let ectx0 = g5s_ectx s in
+            let s0 = g5_push_ctx s ("[item " ++ int_to_string idx ++ ": " ++ kind0 ++ "] ") in
+            let n0 = len (g5s_nodes s0) in
+            let y0 = len (g5s_syms s0) in
+            let (s1, schs, e1) = g5_check_tydef td s0 in
+            if e1 == "" then
+              let env2 = g5_app_binds5 schs env in
+              let (s1b, sc1) = g5_top_ctor_syms schs sp s1 sc in
+              let tlg = g5s_tracelog s1b in
+              let (s2, env3) = g5_boundary_item (g5s_with_ectx s1b ectx0) env2 n0 y0 in
+              g5_run_items hd rest env3 sc1 s2 sigs (idx + 1) (ItemSum5 "type" sp [] tlg "checked" :: sums) ckpts diags status failed errmsg
+            else g5_continue_item (g5s_with_ectx s1 ectx0) idx "type" sp e1 sums ckpts diags status failed errmsg (g5_ty_names td) rest hd env sc sigs
+          else
+            let dg = Diag5 idx "lacking" lack in
+            g5_run_items hd rest env sc s sigs (idx + 1) sums ckpts (dg :: diags) status failed errmsg
+      | IDef5 ds sp ->
+          let kind = if len ds == 1 then g5_item_kind_def ds else g5_item_kind_rec ds in
+          let lack = g5_lacking_msg (g5_item_deps it) failed in
+          if lack == "" then
+            let ectx0 = g5s_ectx s in
+            let s0 = g5_push_ctx s ("[item " ++ int_to_string idx ++ ": " ++ kind ++ "] ") in
+            let snap = g5_snapshot s0 in
+            let n0 = len (g5s_nodes s0) in
+            let y0 = len (g5s_syms s0) in
+            let (s1, schs, sc1, e1) = g5_infer_def_group ds env sc s0 in
+            if e1 == "" then
+              let (s2, e2) = g5_check_sig_binds schs sigs s1 idx kind in
+              if e2 == "" then
+                let env2 = g5_app_binds5 schs env in
+                let (s2b, sc2) = g5_top_def_syms schs ds s2 sc1 in
+                let tlg = g5s_tracelog s2b in
+                let (s3, env3) = g5_boundary_item (g5s_with_ectx s2b ectx0) env2 n0 y0 in
+                let binds = g5_sum_binds_env schs env3 ds sigs [] in
+                g5_run_items hd rest env3 sc2 s3 sigs (idx + 1) (ItemSum5 kind sp binds tlg "checked" :: sums) ckpts diags status failed errmsg
+              else g5_continue_item (g5s_with_ectx (g5_rollback s2 snap) ectx0) idx kind sp e2 sums ckpts diags status failed errmsg (g5_defs_names ds) rest hd env sc sigs
+            else if g5_is_tentative e1 s1 then
+              let s2 = g5_refresh_holes (g5_rollback s1 snap) in
+              let dg = Diag5 idx kind ("tentative: " ++ e1) in
+              let st2 = if status == "invalid" then status else "partial" in
+              g5_run_items hd rest env sc (g5s_with_ectx s2 ectx0) sigs (idx + 1) (ItemSum5 kind sp [] (g5s_tracelog s2) "partial" :: sums) ckpts (dg :: diags) st2 failed errmsg
+            else g5_continue_item (g5s_with_ectx (g5_rollback s1 snap) ectx0) idx kind sp e1 sums ckpts diags status failed errmsg (g5_defs_names ds) rest hd env sc sigs
+          else
+            let dg = Diag5 idx "lacking" lack in
+            g5_run_items hd rest env sc s sigs (idx + 1) sums ckpts (dg :: diags) status failed errmsg
+
+      | ISig5 _ -> g5_run_items hd rest env sc s sigs idx sums ckpts diags status failed errmsg
+      | IImport5 nm sp -> g5_run_items hd rest env sc s sigs idx sums ckpts diags status failed errmsg
+
+and g5_continue_item s idx kind sp emsg sums ckpts diags status failed errmsg newfailed rest hd env sc sigs =
+  let em2 = if errmsg == "" then emsg else errmsg in
+  let dg = Diag5 idx kind emsg in
+  g5_run_items hd rest env sc s sigs (idx + 1) sums ckpts (dg :: diags) "invalid" (app_list newfailed failed) em2
+
+-- end of items: sig-without-def check, exps validation, hole->partial
+and g5_finish hd env sc s sigs sums ckpts diags status =
+  g5_finish_sigs hd sigs env sc s sums ckpts diags status
+
+and g5_finish_sigs hd sigs env sc s sums ckpts diags status = case sigs of
+    [] -> g5_finish_exposing hd env sc s sums ckpts diags status
+  | kv :: rest -> case kv of
+      | (nm, sg) ->
+          if g5_env_has5 env nm then g5_finish_sigs hd rest env sc s sums ckpts diags status
+          else
+            let sp = g5_sig_span sg in
+            (s, sums, ckpts, Diag5 (0 - 1) "sig" ("sig for undefined `" ++ nm ++ "`") :: diags, "invalid", "sig for undefined `" ++ nm ++ "`")
+
+and g5_sig_span sg = case sg of | Sig5 _ _ _ sp -> sp
+
+and g5_finish_exposing hd env sc s sums ckpts diags status =
+  case hd of
+    | NoMod5 -> (s, sums, ckpts, diags, g5_hole_status s status, "")
+    | Mod5 _ exps _ -> g5_check_exposing exps env sc s sums ckpts diags status
+
+and g5_check_exposing exps env sc s sums ckpts diags status = case exps of
+    [] -> (s, sums, ckpts, diags, g5_hole_status s status, "")
+  | nm :: rest ->
+      if g5_env_has5 env nm then g5_check_exposing rest env sc s sums ckpts diags status
+      else (s, sums, ckpts, Diag5 (0 - 1) "module" ("module exposes undefined `" ++ nm ++ "`") :: diags, "invalid", "module exposes undefined `" ++ nm ++ "`")
+
+and g5_hole_status s status =
+  if status == "invalid" then "invalid"
+  else if g5s_holes s == [] then status
+  else "partial"
+
+and g5_fail_item s idx kind sp msg sums ckpts diags =
+  (s, sums, ckpts, Diag5 idx kind msg :: diags, "invalid", msg)
+
+and g5_app_binds5 schs env = case schs of
+    [] -> env
+  | kv :: rest -> case kv of
+      | (nm, sch) -> g5_app_binds5 rest ((nm, sch) :: env)
+

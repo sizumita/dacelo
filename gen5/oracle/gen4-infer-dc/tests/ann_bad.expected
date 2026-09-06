@@ -1,0 +1,2 @@
+exit=1
+dacelo: [item 0: let n] annotation on `n`: type mismatch: expected `String`, found `Int`

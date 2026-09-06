@@ -1,0 +1,27 @@
+-- GC stress: large live heap + churn of short-lived garbage.
+-- `big` (20000 conses) must survive collections triggered by `churn`
+-- (200 temp 500-element lists). Exact sums catch sweeping live data.
+-- Run: ./dcc_6 examples/gc_stress.dc /tmp/gc && /tmp/gc
+-- Expect:
+--   200010000
+--   402000
+--   200010000
+
+let rec range n acc = if n == 0 then acc else range (n - 1) (n :: acc)
+
+let rec sum xs acc = case xs of
+  | [] -> acc
+  | h :: t -> sum t (acc + h)
+
+let rec churn n acc =
+  if n == 0 then acc else churn (n - 1) (sum (range 200 []) 0 + acc)
+
+let big = range 20000 []
+
+let main () =
+  print_int (sum big 0) ;
+  print_string "\n" ;
+  print_int (churn 20 0) ;
+  print_string "\n" ;
+  print_int (sum big 0) ;
+  print_string "\n"

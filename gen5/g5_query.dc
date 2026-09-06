@@ -1,0 +1,1041 @@
+-- ============================================================
+-- gen5/g5_query.dc -- Gen5 query service in Dacelo (fresh lineage)
+--
+-- Pure layer (no I/O): JSON escaping/builders, hashing, snapshots,
+-- structured types, focus/why/holes/interface/diff envelopes with byte
+-- budgets, formatter + reparse check. I/O (read_file/write_file/argv)
+-- lives in g5_driver.dc. Only Gen4-subset syntax is used here.
+-- Conventions mirror g5_infer.dc (fresh g5_ names; hoist nested
+-- multi-arm cases out of arm bodies; parens otherwise).
+-- ============================================================
+
+-- ---------- JSON basics ----------
+
+-- JSON-escape a string body (no surrounding quotes); UTF-8 bytes >= 32
+-- pass through, `"` `\` and C0 controls escaped.
+let rec g5_json_esc s i acc =
+  let c = string_get s i in
+  if c == -1 then acc
+  else if c == 34 then g5_json_esc s (i + 1) (acc ++ "\\\"")
+  else if c == 92 then g5_json_esc s (i + 1) (acc ++ "\\\\")
+  else if c == 10 then g5_json_esc s (i + 1) (acc ++ "\\n")
+  else if c == 13 then g5_json_esc s (i + 1) (acc ++ "\\r")
+  else if c == 9 then g5_json_esc s (i + 1) (acc ++ "\\t")
+  else if c >= 0 && c < 32 then g5_json_esc s (i + 1) (acc ++ g5_unicode_esc c)
+  else g5_json_esc s (i + 1) (acc ++ substring s i 1)
+
+and g5_unicode_esc c =
+  "\\u00" ++ g5_hexdig (c / 16) ++ g5_hexdig (c % 16)
+
+and g5_hexdig n =
+  if n < 10 then int_to_string n
+  else if n == 10 then "a"
+  else if n == 11 then "b"
+  else if n == 12 then "c"
+  else if n == 13 then "d"
+  else if n == 14 then "e"
+  else "f"
+
+let g5_json_str s = "\"" ++ g5_json_esc s 0 "" ++ "\""
+
+let g5_json_bool b = if b then "true" else "false"
+
+-- ---------- hashing (deterministic FNV-ish poly over bytes; non-crypto) ----------
+
+let rec g5_hash_bytes s i h =
+  let c = string_get s i in
+  if c == -1 then h
+  else g5_hash_bytes s (i + 1) ((h * 31 + c) % 2147483647)
+
+let g5_hash_str s = g5_hash_bytes s 0 0
+
+let g5_hex8 h = g5_hexdig ((h / 16) % 16) ++ g5_hexdig (h % 16)
+
+-- short hex of an int (low 32 bits, 8 digits)
+let g5_hex32 h =
+  g5_hexdig ((h / 268435456) % 16) ++ g5_hexdig ((h / 16777216) % 16) ++
+  g5_hexdig ((h / 1048576) % 16) ++ g5_hexdig ((h / 65536) % 16) ++
+  g5_hexdig ((h / 4096) % 16) ++ g5_hexdig ((h / 256) % 16) ++ g5_hex8 h
+
+-- ---------- snapshots ----------
+
+let g5_lang_tag = "dacelo-gen5/1"
+let g5_build_tag = "g5-1"
+
+-- Snap5 file src_hash src_len lang build deps[(mod,file,hash)]
+type Snap5 = Snap5 String Int Int String String (List (String, String, Int))
+
+let g5_make_snap file src deps =
+  Snap5 file (g5_hash_str src) (string_length src) g5_lang_tag g5_build_tag deps
+
+let rec g5_deps_json deps = case deps of
+    [] -> ""
+  | kv :: rest -> case kv of
+      | (m, f, h) ->
+          let here = "{\"module\":" ++ g5_json_str m ++ ",\"file\":" ++ g5_json_str f ++ ",\"hash\":\"" ++ g5_hex32 h ++ "\"}" in
+          case rest of
+            | [] -> here
+            | _ -> here ++ "," ++ g5_deps_json rest
+
+let g5_snap_json snap = case snap of
+  | Snap5 file hh len lang build deps ->
+      "{\"file\":" ++ g5_json_str file ++ ",\"src_hash\":\"" ++ g5_hex32 hh ++ "\",\"src_len\":" ++ int_to_string len ++ ",\"lang\":" ++ g5_json_str lang ++ ",\"build\":" ++ g5_json_str build ++ ",\"deps\":[" ++ g5_deps_json deps ++ "]}"
+
+let g5_span_json sp = case sp of
+  | Span a b -> "{\"start\":" ++ int_to_string a ++ ",\"end\":" ++ int_to_string b ++ "}"
+
+-- ---------- structured types (versioned, no raw solver ids) ----------
+-- Names: bound fall vars keep canonical letters (same as scheme text);
+-- unbound metas become m0,m1.. in encounter order; rigid skolems raw.
+
+let rec g5_ty_json_go t tn rn um = case t of
+    TVI5 x ->
+      let f = g5_find_str tn x in
+      if f == "" then
+        let key = "m" ++ int_to_string um in
+        ("{\"u\":" ++ g5_json_str key ++ "}", tn, rn, um + 1)
+      else ("{\"b\":" ++ g5_json_str f ++ "}", tn, rn, um)
+  | TC5 s ->
+      if g5_is_skolem s then ("{\"sk\":" ++ g5_json_str s ++ "}", tn, rn, um)
+      else ("{\"c\":" ++ g5_json_str s ++ "}", tn, rn, um)
+  | TAr5 a b ->
+      let (ja, tn1, rn1, um1) = g5_ty_json_go a tn rn um in
+      let (jb, tn2, rn2, um2) = g5_ty_json_go b tn1 rn1 um1 in
+      ("{\"arr\":[" ++ ja ++ "," ++ jb ++ "]}", tn2, rn2, um2)
+  | TTup5 ts ->
+      let (js, tn1, rn1, um1) = g5_ty_json_list ts tn rn um in
+      ("{\"tup\":[" ++ js ++ "]}", tn1, rn1, um1)
+  | TApp5 n ts ->
+      let (js, tn1, rn1, um1) = g5_ty_json_list ts tn rn um in
+      ("{\"app\":[" ++ g5_json_str n ++ (if js == "" then "" else "," ++ js) ++ "]}", tn1, rn1, um1)
+  | TRec5 flds tl ->
+      let (jf, tn1, rn1, um1) = g5_ty_json_fields (g5_sort_fields flds []) tn rn um in
+      let (jt, tn2, rn2, um2) = g5_ty_json_tail tl tn1 rn1 um1 in
+      ("{\"rec\":{\"fields\":{" ++ jf ++ "},\"row\":" ++ jt ++ "}}", tn2, rn2, um2)
+
+and g5_is_skolem s = g5_starts_at s "@sk" 0
+
+and g5_starts_at hay needle i =
+  let n = string_get needle i in
+  if n == -1 then true
+  else
+    let h = string_get hay i in
+    if h == n then g5_starts_at hay needle (i + 1) else false
+
+and g5_ty_json_list ts tn rn um = case ts of
+    [] -> ("", tn, rn, um)
+  | h :: rest ->
+      let (jh, tn1, rn1, um1) = g5_ty_json_go h tn rn um in
+      case rest of
+        | [] -> (jh, tn1, rn1, um1)
+        | _ ->
+            let (jr, tn2, rn2, um2) = g5_ty_json_list rest tn1 rn1 um1 in
+            (jh ++ "," ++ jr, tn2, rn2, um2)
+
+and g5_ty_json_fields flds tn rn um = case flds of
+    [] -> ("", tn, rn, um)
+  | kv :: rest -> case kv of
+      | (lb, t) ->
+          let (jt, tn1, rn1, um1) = g5_ty_json_go t tn rn um in
+          let here = g5_json_str lb ++ ":" ++ jt in
+          case rest of
+            | [] -> (here, tn1, rn1, um1)
+            | _ ->
+                let (jr, tn2, rn2, um2) = g5_ty_json_fields rest tn1 rn1 um1 in
+                (here ++ "," ++ jr, tn2, rn2, um2)
+
+and g5_ty_json_tail tl tn rn um = case tl of
+    RClosed5 -> ("null", tn, rn, um)
+  | ROpen5 id ->
+      let f = g5_find_str rn id in
+      if f == "" then
+        let key = "m" ++ int_to_string um in
+        ("{\"u\":" ++ g5_json_str key ++ "}", tn, rn, um + 1)
+      else ("{\"r\":" ++ g5_json_str f ++ "}", tn, rn, um)
+
+-- scheme -> (text already via g5_scheme_text) + structured json
+let rec g5_json_strs xs = case xs of
+    [] -> ""
+  | h :: rest ->
+      case rest of
+        | [] -> g5_json_str h
+        | _ -> g5_json_str h ++ "," ++ g5_json_strs rest
+
+let g5_scheme_json s sch = case sch of
+  | Sch5 qvars qrows ty p ->
+      let (qn, qr) = g5_canon_order (g5_apply s ty) qvars qrows in
+      let (jb, _, _, _) = g5_ty_json_go ty qn qr 0 in
+      "{\"fall\":[" ++ g5_json_strs (g5_names_of qn) ++ "],\"rows\":[" ++ g5_json_strs (g5_names_of qr) ++ "],\"partial\":" ++ g5_json_bool p ++ ",\"body\":" ++ jb ++ "}"
+
+
+-- ---------- query context (assembled by driver from check results) ----------
+
+type QCtx5 = QCtx5 String Snap5 (List ItemSum5) (List NodeE5) (List SymE5) (List HoleE5) (List Warn5) (List Diag5) String String TIS5
+
+let q_src q = case q of | QCtx5 a _ _ _ _ _ _ _ _ _ _ -> a
+let q_snap q = case q of | QCtx5 _ a _ _ _ _ _ _ _ _ _ -> a
+let q_sums q = case q of | QCtx5 _ _ a _ _ _ _ _ _ _ _ -> a
+let q_nodes q = case q of | QCtx5 _ _ _ a _ _ _ _ _ _ _ -> a
+let q_syms q = case q of | QCtx5 _ _ _ _ a _ _ _ _ _ _ -> a
+let q_holes q = case q of | QCtx5 _ _ _ _ _ a _ _ _ _ _ -> a
+let q_warns q = case q of | QCtx5 _ _ _ _ _ _ a _ _ _ _ -> a
+let q_diags q = case q of | QCtx5 _ _ _ _ _ _ _ a _ _ _ -> a
+let q_status q = case q of | QCtx5 _ _ _ _ _ _ _ _ a _ _ -> a
+let q_errmsg q = case q of | QCtx5 _ _ _ _ _ _ _ _ _ a _ -> a
+let q_state q = case q of | QCtx5 _ _ _ _ _ _ _ _ _ _ a -> a
+
+-- ---------- envelope with byte budget (two-tier truncation) ----------
+
+let g5_envelope full maxb reduced =
+  if string_length full <= maxb then
+    "{\"result\":" ++ full ++ ",\"truncated\":false,\"bytes\":" ++ int_to_string (string_length full) ++ ",\"max_bytes\":" ++ int_to_string maxb ++ ",\"continuation\":null}"
+  else if string_length reduced <= maxb then
+    "{\"result\":" ++ reduced ++ ",\"truncated\":true,\"bytes\":" ++ int_to_string (string_length full) ++ ",\"max_bytes\":" ++ int_to_string maxb ++ ",\"continuation\":\"narrow --at range or raise --max-bytes\"}"
+  else
+    "{\"result\":null,\"truncated\":true,\"bytes\":" ++ int_to_string (string_length full) ++ ",\"max_bytes\":" ++ int_to_string maxb ++ ",\"continuation\":\"narrow --at range or raise --max-bytes\"}"
+
+-- ---------- node lookup: smallest enclosing span ----------
+
+let rec g5_find_node nodes off best bestw = case nodes of
+    [] -> best
+  | nd :: rest -> case nd of
+      | NodeE5 nid sp _ _ _ _ _ _ ->
+          case sp of
+            | Span a b ->
+                if a <= off then (if off < b then
+                  let w = b - a in
+                  if bestw == (0 - 1) then g5_find_node rest off nid w
+                  else if w < bestw then g5_find_node rest off nid w
+                  else g5_find_node rest off best bestw
+                else g5_find_node rest off best bestw)
+                else g5_find_node rest off best bestw
+
+let g5_node_at nodes off = g5_find_node nodes off (0 - 1) (0 - 1)
+
+let rec g5_node_get nodes id = case nodes of
+    [] -> NodeE5 (0 - 1) span_dummy (TC5 "@none") (0 - 1) g5_null_sch [] g5_no_expected ""
+  | nd :: rest -> case nd of
+      | NodeE5 i _ _ _ _ _ _ _ -> if i == id then nd else g5_node_get rest id
+
+let rec g5_sym_get syms id = case syms of
+    [] -> SymE5 (0 - 1) "" span_dummy (0 - 1) g5_null_sch
+  | sy :: rest -> case sy of
+      | SymE5 i _ _ _ _ -> if i == id then sy else g5_sym_get rest id
+
+-- ---------- focus ----------
+
+let rec g5_local_env syms noff acc n = case syms of
+    [] -> acc
+  | sy :: rest ->
+      if n == 0 then acc
+      else case sy of
+        | SymE5 _ nm dsp _ sch ->
+            case dsp of
+              | Span a _ ->
+                  if a <= noff then g5_local_env rest noff ((nm, sch, dsp) :: acc) (n - 1)
+                  else g5_local_env rest noff acc n
+
+let rec g5_local_json s envs = case envs of
+    [] -> ""
+  | kv :: rest -> case kv of
+      | (nm, sch, dsp) ->
+          let here = "{\"name\":" ++ g5_json_str nm ++ ",\"scheme\":" ++ g5_json_str (g5_scheme_text s sch) ++ ",\"decl\":" ++ g5_span_json dsp ++ "}" in
+          case rest of
+            | [] -> here
+            | _ -> here ++ "," ++ g5_local_json s rest
+
+let rec g5_inst_json s sch inst = case inst of
+    [] -> ""
+  | kv :: rest -> case kv of
+      | (q, t) ->
+          let nm = g5_qname_of sch q in
+          let here = "{\"var\":" ++ g5_json_str nm ++ ",\"type\":" ++ g5_json_str (g5_show s t) ++ "}" in
+          case rest of
+            | [] -> here
+            | _ -> here ++ "," ++ g5_inst_json s sch rest
+
+and g5_qname_of sch q = case sch of
+  | Sch5 qvars qrows ty _ ->
+      let (qn, qr) = g5_canon_order ty qvars qrows in
+      let f = g5_find_str qn q in
+      if f == "" then
+        let g = g5_find_str qr q in
+        if g == "" then "t" ++ int_to_string q else g
+      else f
+
+let g5_pick_sch a b = case a of
+  | Sch5 _ _ (TC5 "@none") _ -> b
+  | _ -> a
+
+let g5_maybe_ty_json s t = case t of
+  | TC5 "@none" -> "null"
+  | _ -> g5_json_str (g5_show s t)
+
+let g5_drop_brace s = substring s 1 (string_length s - 2)
+
+let g5_snap_wrap q inner =
+  "{\"snapshot\":" ++ g5_snap_json (q_snap q) ++ ",\"status\":" ++ g5_json_str (q_status q) ++ "," ++ g5_drop_brace inner ++ "}"
+
+let g5_binding_json q symid sch =
+  if symid == (0 - 1) then "null"
+  else
+    let sy = g5_sym_get (q_syms q) symid in
+    case sy of
+      | SymE5 _ nm dsp _ ssch ->
+          let sch2 = g5_pick_sch sch ssch in
+          "{\"id\":" ++ int_to_string symid ++ ",\"name\":" ++ g5_json_str nm ++ ",\"decl\":" ++ g5_span_json dsp ++ ",\"scheme\":" ++ g5_json_str (g5_scheme_text (q_state q) sch2) ++ "}"
+
+-- smallest strict super-span node (RFC 6.2 containing context, e.g. app result)
+let rec g5_parent_best nodes ca cb best bestw = case nodes of
+    [] -> best
+  | nd :: rest -> case nd of
+      | NodeE5 nid sp _ _ _ _ _ _ ->
+          case sp of
+            | Span a b ->
+                if a <= ca then (if cb <= b then
+                  let w = b - a in
+                  let cw = cb - ca in
+                  if w > cw then
+                    if bestw == (0 - 1) then g5_parent_best rest ca cb nid w
+                    else if w < bestw then g5_parent_best rest ca cb nid w
+                    else g5_parent_best rest ca cb best bestw
+                  else g5_parent_best rest ca cb best bestw
+                else g5_parent_best rest ca cb best bestw)
+                else g5_parent_best rest ca cb best bestw
+
+let g5_parent_json q nid sp =
+  case sp of
+    | Span ca cb ->
+        let pid = g5_parent_best (q_nodes q) ca cb (0 - 1) (0 - 1) in
+        if pid == (0 - 1) then "null"
+        else if pid == nid then "null"
+        else
+          let pnd = g5_node_get (q_nodes q) pid in
+          case pnd of
+            | NodeE5 _ psp pty _ _ _ _ preason ->
+                "{\"node\":" ++ int_to_string pid ++ ",\"span\":" ++ g5_span_json psp ++ ",\"type\":" ++ g5_json_str (g5_show (q_state q) pty) ++ ",\"reason\":" ++ g5_json_str preason ++ "}"
+
+let g5_focus_json q off maxb =
+  let nid = g5_node_at (q_nodes q) off in
+  if nid == (0 - 1) then
+    let full = "{\"found\":false,\"at\":" ++ int_to_string off ++ "}" in
+    g5_envelope (g5_snap_wrap q full) maxb (g5_snap_wrap q full)
+  else
+    let nd = g5_node_get (q_nodes q) nid in
+    case nd of
+      | NodeE5 _ sp ty symid sch inst exp reason ->
+          let s = q_state q in
+          let bjson = g5_binding_json q symid sch in
+          let locs = g5_local_env (q_syms q) (span_start sp) [] 12 in
+          let cjson = g5_parent_json q nid sp in
+          let full = "{\"found\":true,\"node\":" ++ int_to_string nid ++ ",\"span\":" ++ g5_span_json sp ++ ",\"occurrence\":" ++ g5_json_str (g5_show s ty) ++ ",\"binding\":" ++ bjson ++ ",\"instantiation\":[" ++ g5_inst_json s sch inst ++ "],\"expected\":" ++ g5_maybe_ty_json s exp ++ ",\"reason\":" ++ g5_json_str reason ++ ",\"containing\":" ++ cjson ++ ",\"local_env\":[" ++ g5_local_json s locs ++ "]}" in
+          let reduced = "{\"found\":true,\"node\":" ++ int_to_string nid ++ ",\"span\":" ++ g5_span_json sp ++ ",\"occurrence\":" ++ g5_json_str (g5_show s ty) ++ ",\"binding\":" ++ bjson ++ "}" in
+          g5_envelope (g5_snap_wrap q full) maxb (g5_snap_wrap q reduced)
+
+-- ---------- why ----------
+
+let rec g5_trace_json trs = case trs of
+    [] -> ""
+  | h :: rest ->
+      case rest of
+        | [] -> g5_json_str h
+        | _ -> g5_json_str h ++ "," ++ g5_trace_json rest
+
+let rec g5_item_trace sums sp = g5_item_trace_go sums sp []
+
+and g5_item_trace_go sums sp acc = case sums of
+    [] -> acc
+  | it :: rest -> case it of
+      | ItemSum5 _ isp _ tlg _ ->
+          case isp of
+            | Span a b ->
+                case sp of
+                  | Span x y ->
+                      if a <= x then (if y <= b then tlg else g5_item_trace_go rest sp acc)
+                      else g5_item_trace_go rest sp acc
+
+let g5_why_json q off maxb =
+  let nid = g5_node_at (q_nodes q) off in
+  if nid == (0 - 1) then
+    let full = "{\"found\":false,\"at\":" ++ int_to_string off ++ "}" in
+    g5_envelope (g5_snap_wrap q full) maxb (g5_snap_wrap q full)
+  else
+    let nd = g5_node_get (q_nodes q) nid in
+    case nd of
+      | NodeE5 _ sp ty _ sch _ _ reason ->
+          let s = q_state q in
+          let tr = g5_item_trace (q_sums q) sp in
+          let full = "{\"found\":true,\"node\":" ++ int_to_string nid ++ ",\"span\":" ++ g5_span_json sp ++ ",\"occurrence\":" ++ g5_json_str (g5_show s ty) ++ ",\"reason\":" ++ g5_json_str reason ++ ",\"trace\":[" ++ g5_trace_json tr ++ "]}" in
+          let reduced = "{\"found\":true,\"node\":" ++ int_to_string nid ++ ",\"reason\":" ++ g5_json_str reason ++ "}" in
+          g5_envelope (g5_snap_wrap q full) maxb (g5_snap_wrap q reduced)
+
+-- ---------- holes ----------
+
+let rec g5_holes_json s holes = case holes of
+    [] -> ""
+  | he :: rest -> case he of
+      | HoleE5 nid nm ty cands cap ->
+          let exp = g5_show s ty in
+          let capj = if cap then "true" else "false" in
+          let here = "{\"id\":" ++ int_to_string nid ++ ",\"name\":" ++ g5_json_str nm ++ ",\"expected\":" ++ g5_json_str exp ++ ",\"candidates\":[" ++ g5_cands_json s cands ++ "],\"capped\":" ++ capj ++ ",\"status\":\"unknown\"}" in
+          case rest of
+            | [] -> here
+            | _ -> here ++ "," ++ g5_holes_json s rest
+
+and g5_cands_json s cands = case cands of
+    [] -> ""
+  | kv :: rest -> case kv of
+      | (nm, ty, dsp) ->
+          let here = "{\"name\":" ++ g5_json_str nm ++ ",\"type\":" ++ g5_json_str (g5_show s ty) ++ ",\"decl\":" ++ g5_span_json dsp ++ "}" in
+          case rest of
+            | [] -> here
+            | _ -> here ++ "," ++ g5_cands_json s rest
+
+let g5_holes_query_json q maxb =
+  let s = q_state q in
+  let full = "{\"holes\":[" ++ g5_holes_json s (q_holes q) ++ "]}" in
+  g5_envelope (g5_snap_wrap q full) maxb (g5_snap_wrap q full)
+
+-- ---------- check / types ----------
+
+let rec g5_diags_json diags = case diags of
+    [] -> ""
+  | dg :: rest -> case dg of
+      | Diag5 idx kind msg ->
+          let here = "{\"item\":" ++ int_to_string idx ++ ",\"kind\":" ++ g5_json_str kind ++ ",\"msg\":" ++ g5_json_str msg ++ "}" in
+          case rest of
+            | [] -> here
+            | _ -> here ++ "," ++ g5_diags_json rest
+
+let rec g5_spans_json sps = case sps of
+    [] -> ""
+  | sp :: rest -> case rest of
+      | [] -> g5_span_json sp
+      | _ -> g5_span_json sp ++ "," ++ g5_spans_json rest
+
+let rec g5_warns_json warns = case warns of
+    [] -> ""
+  | w :: rest -> case w of
+      | Warn5 kind msg sp miss sites ->
+          let here = "{\"kind\":" ++ g5_json_str kind ++ ",\"msg\":" ++ g5_json_str msg ++ ",\"span\":" ++ g5_span_json sp ++ ",\"missing\":[" ++ g5_json_strs miss ++ "],\"sites\":[" ++ g5_spans_json sites ++ "]}" in
+          case rest of
+            | [] -> here
+            | _ -> here ++ "," ++ g5_warns_json rest
+
+-- ---------- doc comments (`---` lines) ----------
+-- A `--- text` line (first non-space chars exactly `---` + space/EOL) is a doc
+-- comment. Maximal adjacent runs attach to the item starting on the next line.
+-- Quote-aware: lines starting inside a multiline string are never doc lines.
+-- Code itself stays ASCII-only; comments/strings may hold any UTF-8 bytes.
+-- Returns ((target-line, text) list, target = run_end + 1).
+let rec g5_collect_docs src = case g5_docs_lines src 0 1 false ([], 0, "") of
+  | (docs, rend, rtext) ->
+      if rend == 0 then rev_acc [] docs else rev_acc [] ((rend + 1, rtext) :: docs)
+
+and g5_docs_lines src i line instr acc =
+  let e = g5_line_end src i in
+  let ln = substring src i (e - i) in
+  let instr2 = g5_line_instr ln 0 instr in
+  let acc2 = if instr then acc else g5_docs_line ln line acc in
+  if e >= string_length src then acc2
+  else g5_docs_lines src (e + 1) (line + 1) instr2 acc2
+
+and g5_line_end src i =
+  let c = string_get src i in
+  if c == -1 then i
+  else if c == 10 then i
+  else g5_line_end src (i + 1)
+
+and g5_line_instr ln i ins =
+  let c = string_get ln i in
+  if c == -1 then ins
+  else if c == 92 then g5_line_instr ln (i + 2) ins
+  else if c == 34 then g5_line_instr ln (i + 1) (if ins then false else true)
+  else g5_line_instr ln (i + 1) ins
+
+and g5_docs_line ln line acc = case acc of
+  | (docs, rend, rtext) ->
+      let t = g5_doc_text ln 0 in
+      if t == "@@none@@" then
+        if rend == 0 then acc else ((rend + 1, rtext) :: docs, 0, "")
+      else if rend == 0 then (docs, line, t)
+      else if line == rend + 1 then (docs, line, if rtext == "" then t else rtext ++ " " ++ t)
+      else ((rend + 1, rtext) :: docs, line, t)
+
+and g5_doc_text ln i =
+  let c = string_get ln i in
+  if c == -1 then "@@none@@"
+  else if c == 32 || c == 9 then g5_doc_text ln (i + 1)
+  else if c == 45 && string_get ln (i + 1) == 45 && string_get ln (i + 2) == 45 then
+    let d = string_get ln (i + 3) in
+    if d == -1 then ""
+    else if d == 32 || d == 9 then g5_sub_from ln (i + 4)
+    else "@@none@@"
+  else "@@none@@"
+
+and g5_sub_from s i = substring s i (string_length s - i)
+
+and g5_doc_at docs line = case docs of
+    [] -> ""
+  | kv :: rest -> case kv of
+      | (ln, t) -> if ln == line then t else g5_doc_at rest line
+
+and g5_span_line src sp = case g5_off_lc src 0 (span_start sp) 1 0 of
+  | (ln, _) -> ln
+
+let rec g5_sct_ty t = case t of
+  | TTVar5 v _ -> v
+  | TTCon5 n args _ -> if args == [] then n else n ++ " " ++ g5_sct_args args
+  | TTArr5 a b _ -> g5_sct_paren a ++ " -> " ++ g5_sct_ty b
+  | TTTup5 ts _ -> "(" ++ g5_sct_comma ts ++ ")"
+  | TTRec5 flds row _ -> "{ " ++ g5_sct_fields (g5_sort_fields flds []) ++ (if row == "" then " }" else " | " ++ row ++ " }")
+
+and g5_sct_paren t = case t of
+  | TTArr5 _ _ _ -> "(" ++ g5_sct_ty t ++ ")"
+  | _ -> g5_sct_atom t
+
+and g5_sct_atom t = case t of
+  | TTVar5 _ _ -> g5_sct_ty t
+  | TTCon5 _ args _ -> if args == [] then g5_sct_ty t else "(" ++ g5_sct_ty t ++ ")"
+  | _ -> "(" ++ g5_sct_ty t ++ ")"
+
+and g5_sct_args ts = case ts of
+    [] -> ""
+  | t :: [] -> g5_sct_paren t
+  | t :: rest -> g5_sct_paren t ++ " " ++ g5_sct_args rest
+
+and g5_sct_comma ts = case ts of
+    [] -> ""
+  | t :: [] -> g5_sct_ty t
+  | t :: rest -> g5_sct_ty t ++ ", " ++ g5_sct_comma rest
+
+and g5_sct_fields flds = case flds of
+    [] -> ""
+  | kv :: rest -> case kv of
+      | (lb, t) ->
+          case rest of
+            | [] -> lb ++ " : " ++ g5_sct_ty t
+            | _ -> lb ++ " : " ++ g5_sct_ty t ++ ", " ++ g5_sct_fields rest
+
+and g5_sct_sp vs = case vs of
+    [] -> ""
+  | v :: [] -> v
+  | v :: rest -> v ++ " " ++ g5_sct_sp rest
+let g5_sig_contract_text sg = case sg of
+  | Sig5 cn vs ty _ ->
+      if cn == "" then ""
+      else (if vs == [] then g5_sct_ty ty else "forall " ++ g5_sct_sp vs ++ ". " ++ g5_sct_ty ty)
+
+let g5_contract_json sg =
+  if g5_sig_contract_text sg == "" then "null"
+  else g5_json_str (g5_sig_contract_text sg)
+
+let rec g5_binds_json s src docs binds = case binds of
+    [] -> ""
+  | b :: rest -> case b of
+      | BindTy5 nm sp sch st sg ->
+          let dt = g5_doc_at docs (g5_span_line src sp) in
+          let dj = if dt == "" then "null" else g5_json_str dt in
+          let here = "{\"name\":" ++ g5_json_str nm ++ ",\"span\":" ++ g5_span_json sp ++ ",\"scheme\":" ++ g5_json_str (g5_scheme_text s sch) ++ ",\"structured\":" ++ g5_scheme_json s sch ++ ",\"contract\":" ++ g5_contract_json sg ++ ",\"status\":" ++ g5_json_str st ++ ",\"doc\":" ++ dj ++ "}" in
+          case rest of
+            | [] -> here
+            | _ -> here ++ "," ++ g5_binds_json s src docs rest
+
+let rec g5_sums_json s src docs sums = case sums of
+    [] -> ""
+  | it :: rest -> case it of
+      | ItemSum5 kind sp binds _ st ->
+          let here = "{\"kind\":" ++ g5_json_str kind ++ ",\"span\":" ++ g5_span_json sp ++ ",\"binds\":[" ++ g5_binds_json s src docs binds ++ "],\"status\":" ++ g5_json_str st ++ "}" in
+          case rest of
+            | [] -> here
+            | _ -> here ++ "," ++ g5_sums_json s src docs rest
+
+let g5_check_json q maxb =
+  let full = "{\"diags\":[" ++ g5_diags_json (q_diags q) ++ "],\"warnings\":[" ++ g5_warns_json (q_warns q) ++ "],\"holes\":" ++ int_to_string (len (q_holes q)) ++ ",\"items\":[" ++ g5_sums_json (q_state q) (q_src q) (g5_collect_docs (q_src q)) (q_sums q) ++ "]}" in
+  g5_envelope (g5_snap_wrap q full) maxb (g5_snap_wrap q full)
+
+-- RFC 5.3: principal (inferred) vs contract (sig) in separate fields.
+-- `scheme`/`structured` stay principal for compat; `contract` is null or text.
+-- Self-contained TyAst printer (early section cannot use g5_fmt_ty below).
+
+
+
+let g5_types_json q maxb =
+  let full = "{\"items\":[" ++ g5_sums_json (q_state q) (q_src q) (g5_collect_docs (q_src q)) (q_sums q) ++ "],\"warnings\":[" ++ g5_warns_json (q_warns q) ++ "]}" in
+  g5_envelope (g5_snap_wrap q full) maxb (g5_snap_wrap q full)
+
+-- ---------- interface (.dci text) + diff ----------
+
+-- public binds: exposed names (or all if NoMod5), checked status only
+let rec g5_public_binds sums all_pub exps acc = case sums of
+    [] -> rev_acc [] acc
+  | it :: rest -> case it of
+      | ItemSum5 _ _ binds _ _ -> g5_public_binds rest all_pub exps (g5_pub_binds binds all_pub exps acc)
+
+and g5_pub_binds binds all_pub exps acc = case binds of
+    [] -> acc
+  | b :: rest -> case b of
+      | BindTy5 nm sp sch st sg ->
+          if st == "checked" then
+            if all_pub then g5_pub_binds rest all_pub exps ((nm, sp, sch, sg) :: acc)
+            else if g5_mem_str2 nm exps then g5_pub_binds rest all_pub exps ((nm, sp, sch, sg) :: acc)
+            else g5_pub_binds rest all_pub exps acc
+          else g5_pub_binds rest all_pub exps acc
+
+and g5_mem_str2 x xs = case xs of
+    [] -> false
+  | h :: rest -> if h == x then true else g5_mem_str2 x rest
+
+let rec g5_pub_lines s pubs acc = case pubs of
+    [] -> rev_acc [] acc
+  | kv :: rest -> case kv of
+      | (nm, _, sch, sg) ->
+          let body = if g5_sig_contract_text sg == "" then g5_scheme_text s sch else g5_sig_contract_text sg in
+          g5_pub_lines s rest (("val " ++ nm ++ " : " ++ body) :: acc)
+
+let rec g5_join_nl xs = case xs of
+    [] -> ""
+  | h :: rest ->
+      case rest of
+        | [] -> h
+        | _ -> h ++ "\n" ++ g5_join_nl rest
+
+and g5_pub_doc_lines src docs pubs acc = case pubs of
+    [] -> (case acc of
+      | [] -> ""
+      | _ -> g5_join_nl (rev_acc [] acc) ++ "\n")
+  | kv :: rest -> case kv of
+      | (nm, sp, _, _) ->
+          let dt = g5_doc_at docs (g5_span_line src sp) in
+          if dt == "" then g5_pub_doc_lines src docs rest acc
+          else g5_pub_doc_lines src docs rest (("-- | " ++ nm ++ ": " ++ dt) :: acc)
+
+-- .dci text: header, hashes, types, public schemes
+let rec g5_join_sp2 xs = case xs of
+    [] -> ""
+  | h :: rest ->
+      case rest of
+        | [] -> h ++ " "
+        | _ -> h ++ " " ++ g5_join_sp2 rest
+
+let rec g5_ty_to_string t = case t of
+    TTVar5 v _ -> v
+  | TTCon5 n args _ -> if args == [] then n else "(" ++ n ++ g5_tyfs args ++ " )"
+  | TTArr5 a b _ -> "(" ++ g5_ty_to_string a ++ " -> " ++ g5_ty_to_string b ++ ")"
+  | TTTup5 ts _ -> "(" ++ g5_tys_comma ts ++ ")"
+  | TTRec5 flds row _ -> "{ " ++ g5_trec_fields (g5_sort_fields flds []) ++ (if row == "" then " }" else " | " ++ row ++ " }")
+
+and g5_tys_comma ts = case ts of
+    [] -> ""
+  | t :: [] -> g5_ty_to_string t
+  | t :: rest -> g5_ty_to_string t ++ ", " ++ g5_tys_comma rest
+
+and g5_trec_fields flds = case flds of
+    [] -> ""
+  | kv :: rest -> case kv of
+      | (lb, t) ->
+          case rest of
+            | [] -> lb ++ " : " ++ g5_ty_to_string t
+            | _ -> lb ++ " : " ++ g5_ty_to_string t ++ ", " ++ g5_trec_fields rest
+
+and g5_tyfs fs = case fs of
+    [] -> ""
+  | t :: rest -> " " ++ g5_ty_paren_tyfs t ++ g5_tyfs rest
+
+and g5_ty_paren_tyfs t = case t of
+  | TTVar5 _ _ -> g5_ty_to_string t
+  | TTCon5 _ _ _ -> g5_ty_to_string t
+  | _ -> "(" ++ g5_ty_to_string t ++ ")"
+
+and g5_cdors cds = case cds of
+    [] -> ""
+  | cd :: rest -> case cd of
+      | CtorDecl5 nm fs ->
+          case rest of
+            | [] -> nm ++ g5_tyfs fs
+            | _ -> nm ++ g5_tyfs fs ++ " | " ++ g5_cdors rest
+
+let rec g5_tydecl_lines tyds = case tyds of
+    [] -> ""
+  | td :: rest -> case td of
+      | TyDecl5 nm ps cds ->
+          "type " ++ nm ++ g5_join_sp2 ps ++ "= " ++ g5_cdors cds ++ "\n" ++ g5_tydecl_lines rest
+
+let rec g5_dep_lines deps = case deps of
+    [] -> ""
+  | kv :: rest -> case kv of
+      | (m, f, h) -> "dep " ++ m ++ " " ++ f ++ " " ++ g5_hex32 h ++ "\n" ++ g5_dep_lines rest
+
+let g5_interface_text q modname all_pub exps tydecls =
+  let s = q_state q in
+  let pubs = g5_public_binds (q_sums q) all_pub exps [] in
+  let lines = g5_pub_lines s pubs [] in
+  let sem = g5_hex32 (g5_hash_str (g5_join_nl lines)) in
+  case q_snap q of
+    | Snap5 file hh len _ _ deps ->
+        let head = "#dci g5-1\nmodule " ++ modname ++ "\nsrc " ++ g5_hex32 hh ++ " sem " ++ sem ++ "\n" in
+        let dep_lines = g5_dep_lines deps in
+        let ty_lines = g5_tydecl_lines tydecls in
+        let docs = g5_collect_docs (q_src q) in
+        let doclines = g5_pub_doc_lines (q_src q) docs pubs [] in
+        head ++ dep_lines ++ ty_lines ++ g5_join_nl lines ++ "\n" ++ doclines
+
+let g5_interface_json q modname all_pub exps tydecls maxb =
+  let text = g5_interface_text q modname all_pub exps tydecls in
+  let full = "{\"interface\":" ++ g5_json_str text ++ "}" in
+  g5_envelope (g5_snap_wrap q full) maxb (g5_snap_wrap q full)
+
+-- diff two .dci texts by val-lines (order-insensitive via sort-ish normalize:
+-- compare as sets through membership; report added/removed/changed)
+let rec g5_dci_vals text acc = case text of
+    _ -> g5_dci_vals_lines (g5_split_lines text 0 "" []) acc
+
+and g5_split_lines text i cur acc =
+  let c = string_get text i in
+  if c == -1 then rev_acc [] (cur :: acc)
+  else if c == 10 then g5_split_lines text (i + 1) "" (cur :: acc)
+  else g5_split_lines text (i + 1) (cur ++ substring text i 1) acc
+
+and g5_dci_vals_lines lines acc = case lines of
+    [] -> acc
+  | h :: rest ->
+      if g5_starts_with h "val " then g5_dci_vals_lines rest (h :: acc)
+      else g5_dci_vals_lines rest acc
+
+and g5_starts_with hay needle = g5_starts_with2 hay needle 0
+
+and g5_starts_with2 hay needle i =
+  let n = string_get needle i in
+  if n == -1 then true
+  else
+    let h = string_get hay i in
+    if h == n then g5_starts_with2 hay needle (i + 1) else false
+
+let rec g5_take_word line i acc =
+  let c = string_get line i in
+  if c == -1 then acc
+  else if c == 32 then acc
+  else g5_take_word line (i + 1) (acc ++ substring line i 1)
+
+let g5_val_name line = g5_take_word line 4 ""
+
+let rec g5_find_val lines nm = case lines of
+    [] -> ""
+  | h :: rest -> if g5_val_name h == nm then h else g5_find_val rest nm
+
+let rec g5_sub_lines xs ys = case xs of
+    [] -> []
+  | h :: rest -> if g5_mem_str2 h ys then g5_sub_lines rest ys else h :: g5_sub_lines rest ys
+
+let rec g5_changed_lines vo vn = case vo of
+    [] -> []
+  | h :: rest ->
+      let nm = g5_val_name h in
+      (case g5_find_val vn nm of
+        | "" -> g5_changed_lines rest vn
+        | n2 -> if n2 == h then g5_changed_lines rest vn else ("old: " ++ h ++ "\nnew: " ++ n2) :: g5_changed_lines rest vn)
+
+let rec g5_diff_dci old new =
+  let vo = g5_dci_vals old [] in
+  let vn = g5_dci_vals new [] in
+  let added = g5_added_lines vn vo in
+  let removed = g5_added_lines vo vn in
+  let changed = g5_changed_lines vo vn in
+  if added == [] then (if removed == [] then (if changed == [] then (true, "no public type changes") else (false, "public type specialized:\n" ++ g5_join_nl changed)) else (false, "public type removed:\n" ++ g5_join_nl removed))
+  else (false, "public type added:\n" ++ g5_join_nl added ++ (if removed == [] then "" else "\npublic type removed:\n" ++ g5_join_nl removed) ++ (if changed == [] then "" else "\npublic type specialized:\n" ++ g5_join_nl changed))
+
+and g5_added_lines xs ys = case xs of
+    [] -> []
+  | h :: rest ->
+      if g5_mem_str2 h ys then g5_added_lines rest ys
+      else if g5_val_name h == "" then g5_added_lines rest ys
+      else case g5_find_val ys (g5_val_name h) of
+        | "" -> h :: g5_added_lines rest ys
+        | _ -> g5_added_lines rest ys
+
+
+-- Dacelo-literal string escaping (for lowered/formatted sources)
+let rec g5_dc_esc s i acc =
+  let c = string_get s i in
+  if c == -1 then acc
+  else if c == 34 then g5_dc_esc s (i + 1) (acc ++ "\\\"")
+  else if c == 92 then g5_dc_esc s (i + 1) (acc ++ "\\\\")
+  else if c == 10 then g5_dc_esc s (i + 1) (acc ++ "\\n")
+  else if c == 13 then g5_dc_esc s (i + 1) (acc ++ "\\r")
+  else if c == 9 then g5_dc_esc s (i + 1) (acc ++ "\\t")
+  else if c == 0 then g5_dc_esc s (i + 1) (acc ++ "\\0")
+  else g5_dc_esc s (i + 1) (acc ++ substring s i 1)
+
+let g5_dc_str s = "\"" ++ g5_dc_esc s 0 "" ++ "\""
+
+let rec g5_fmt_pat p = case p of
+  | PWild5 _ -> "_"
+  | PVar5 n _ -> n
+  | PInt5 n _ -> int_to_string n
+  | PBool5 b _ -> if b then "true" else "false"
+  | PStr5 s _ -> g5_dc_str s
+  | PUnit5 _ -> "()"
+  | PTup5 ps _ -> "(" ++ g5_fmt_pats ps ++ ")"
+  | PCtor5 n ps _ ->
+      if n == "Nil" then (if ps == [] then "[]" else "(" ++ n ++ " " ++ g5_fmt_pats_sp ps ++ ")")
+      else if n == "Cons" then case ps of
+        | [a, b] -> "(" ++ g5_fmt_pat a ++ " :: " ++ g5_fmt_pat b ++ ")"
+        | _ -> "(" ++ n ++ " " ++ g5_fmt_pats_sp ps ++ ")"
+      else if ps == [] then n else "(" ++ n ++ " " ++ g5_fmt_pats_sp ps ++ ")"
+
+and g5_fmt_pats ps = case ps of
+    [] -> ""
+  | p :: [] -> g5_fmt_pat p
+  | p :: rest -> g5_fmt_pat p ++ ", " ++ g5_fmt_pats rest
+
+and g5_fmt_pats_sp ps = case ps of
+    [] -> ""
+  | p :: [] -> g5_fmt_pat p
+  | p :: rest -> g5_fmt_pat p ++ " " ++ g5_fmt_pats_sp rest
+
+let rec g5_fmt_ty t = case t of
+  | TTVar5 v _ -> v
+  | TTCon5 n args _ -> if args == [] then n else n ++ " " ++ g5_fmt_tys_sp args
+  | TTArr5 a b _ -> g5_fmt_ty_paren a ++ " -> " ++ g5_fmt_ty b
+  | TTTup5 ts _ -> "(" ++ g5_fmt_tys_comma ts ++ ")"
+  | TTRec5 flds row _ -> "{ " ++ g5_fmt_trec flds ++ (if row == "" then " }" else " | " ++ row ++ " }")
+
+and g5_fmt_ty_paren t = case t of
+  | TTArr5 _ _ _ -> "(" ++ g5_fmt_ty t ++ ")"
+  | _ -> g5_fmt_ty t
+
+and g5_fmt_tys_sp ts = case ts of
+    [] -> ""
+  | t :: [] -> g5_fmt_ty_paren2 t
+  | t :: rest -> g5_fmt_ty_paren2 t ++ " " ++ g5_fmt_tys_sp rest
+
+and g5_fmt_ty_paren2 t = case t of
+  | TTVar5 _ _ -> g5_fmt_ty t
+  | TTCon5 _ args _ -> if args == [] then g5_fmt_ty t else "(" ++ g5_fmt_ty t ++ ")"
+  | _ -> "(" ++ g5_fmt_ty t ++ ")"
+
+and g5_fmt_tys_comma ts = case ts of
+    [] -> ""
+  | t :: [] -> g5_fmt_ty t
+  | t :: rest -> g5_fmt_ty t ++ ", " ++ g5_fmt_tys_comma rest
+
+and g5_fmt_trec flds = case flds of
+    [] -> ""
+  | kv :: rest -> case kv of
+      | (lb, t) ->
+          case rest of
+            | [] -> lb ++ " : " ++ g5_fmt_ty t
+            | _ -> lb ++ " : " ++ g5_fmt_ty t ++ ", " ++ g5_fmt_trec rest
+
+-- atomic: no parens needed when nested
+let rec g5_is_atomic e = case e of
+  | EInt5 _ _ -> true
+  | EBool5 _ _ -> true
+  | EStr5 _ _ -> true
+  | EUnit5 _ -> true
+  | EVar5 _ _ -> true
+  | ECtor5 _ _ -> true
+  | ETup5 _ _ -> true
+  | ERec5 _ _ -> true
+  | EHole5 _ _ -> true
+  | _ -> false
+
+let rec g5_fmt_e e = case e of
+  | EInt5 n _ -> int_to_string n
+  | EBool5 b _ -> if b then "true" else "false"
+  | EStr5 s _ -> g5_dc_str s
+  | EUnit5 _ -> "()"
+  | EVar5 n _ -> n
+  | ECtor5 n _ -> n
+  | ELam5 p b _ -> "fun " ++ g5_fmt_pat p ++ " -> " ++ g5_fmt_e b
+  | EApp5 f a _ -> g5_fmt_e f ++ " " ++ (if g5_is_atomic a then g5_fmt_e a else "(" ++ g5_fmt_e a ++ ")")
+  | EBin5 op l r _ -> "(" ++ g5_fmt_e l ++ " " ++ op ++ " " ++ g5_fmt_e r ++ ")"
+  | EIf5 c t el _ -> "(if " ++ g5_fmt_e c ++ " then " ++ g5_fmt_e t ++ " else " ++ g5_fmt_e el ++ ")"
+  | ECase5 sc brs _ -> "(case " ++ g5_fmt_e sc ++ " of " ++ g5_fmt_brs brs ++ ")"
+  | ELet5 rc n rhs body _ -> "(let " ++ (if rc then "rec " else "") ++ n ++ " = " ++ g5_fmt_e rhs ++ " in " ++ g5_fmt_e body ++ ")"
+  | ETup5 es _ -> "(" ++ g5_fmt_es_comma es ++ ")"
+  | EAnn5 x t _ -> "(" ++ g5_fmt_e x ++ " : " ++ g5_fmt_ty t ++ ")"
+  | ERec5 flds _ -> if g5_fmt_fields flds == "" then "{}" else "{ " ++ g5_fmt_fields flds ++ " }"
+  | EProj5 r lb _ -> (if g5_is_atomic r then g5_fmt_e r else "(" ++ g5_fmt_e r ++ ")") ++ "." ++ lb
+  | EWith5 b lb u _ -> "{ " ++ g5_fmt_e b ++ " with " ++ lb ++ " = " ++ g5_fmt_e u ++ " }"
+  | EHole5 nm _ -> "?" ++ nm
+
+and g5_fmt_es_comma es = case es of
+    [] -> ""
+  | e :: [] -> g5_fmt_e e
+  | e :: rest -> g5_fmt_e e ++ ", " ++ g5_fmt_es_comma rest
+
+and g5_fmt_fields flds = case flds of
+    [] -> ""
+  | kv :: rest -> case kv of
+      | (lb, e) ->
+          case rest of
+            | [] -> lb ++ " = " ++ g5_fmt_e e
+            | _ -> lb ++ " = " ++ g5_fmt_e e ++ ", " ++ g5_fmt_fields rest
+
+and g5_fmt_brs brs = case brs of
+    [] -> ""
+  | br :: rest -> case br of
+      | (p, b) ->
+          let bs = if g5_is_multicase b then "(" ++ g5_fmt_e b ++ ")" else g5_fmt_e b in
+          case rest of
+            | [] -> "| " ++ g5_fmt_pat p ++ " -> " ++ bs
+            | _ -> "| " ++ g5_fmt_pat p ++ " -> " ++ bs ++ " " ++ g5_fmt_brs rest
+
+and g5_is_multicase b = case b of
+  | ECase5 _ brs _ -> if g5_br_count brs 0 > 1 then true else false
+  | _ -> false
+
+and g5_br_count brs acc = case brs of
+    [] -> acc
+  | _ :: rest -> g5_br_count rest (acc + 1)
+
+let rec g5_fmt_def d = case d of
+  | Def5 isrec nm _ ps ann body _ ->
+      "let " ++ (if isrec then "rec " else "") ++ nm ++ g5_fmt_params ps ++ g5_fmt_ann ann ++ " =\n  " ++ g5_fmt_e (g5_unwrap_params body (len ps)) ++ "\n"
+
+and g5_unwrap_params body n =
+  if n == 0 then body
+  else case body of
+    | ELam5 _ b _ -> g5_unwrap_params b (n - 1)
+    | EAnn5 inner _ _ -> g5_unwrap_ann_params inner n
+    | _ -> body
+
+and g5_unwrap_ann_params inner n =
+  if n == 0 then inner
+  else case inner of
+    | ELam5 _ b _ -> g5_unwrap_ann_params b (n - 1)
+    | _ -> inner
+
+and g5_fmt_params ps = case ps of
+    [] -> ""
+  | p :: rest -> " " ++ g5_fmt_pat p ++ g5_fmt_params rest
+
+and g5_fmt_ann ann = case ann of
+  | NoneTy5 -> ""
+  | SomeTy5 t -> " : " ++ g5_fmt_ty t
+
+let rec g5_fmt_items its acc = case its of
+    [] -> acc
+  | it :: rest -> case it of
+      | ITy5 td _ -> g5_fmt_items rest (acc ++ g5_fmt_tydecl td ++ "\n")
+      | IDef5 ds _ -> g5_fmt_items rest (acc ++ g5_fmt_group ds)
+      | ISig5 sg -> (case sg of
+          | Sig5 nm vs ty _ ->
+              g5_fmt_items rest (acc ++ "sig " ++ nm ++ " : " ++ (if vs == [] then "" else "forall " ++ g5_join_sp3 vs ++ ". ") ++ g5_fmt_ty ty ++ "\n"))
+      | IImport5 nm _ -> g5_fmt_items rest (acc ++ "import " ++ nm ++ "\n")
+
+and g5_fmt_group ds = case ds of
+    [] -> ""
+  | d :: rest -> case rest of
+      | [] -> g5_fmt_def d
+      | _ -> g5_fmt_def_and d ++ g5_fmt_group_and rest
+
+and g5_fmt_def_and d = case d of
+  | Def5 _ nm _ ps ann body _ ->
+      "let rec " ++ nm ++ g5_fmt_params ps ++ g5_fmt_ann ann ++ " =\n  " ++ g5_fmt_e (g5_unwrap_params body (len ps)) ++ "\n"
+
+and g5_fmt_group_and ds = case ds of
+    [] -> ""
+  | d :: rest -> case d of
+      | Def5 _ nm _ ps ann body _ ->
+          "and " ++ nm ++ g5_fmt_params ps ++ g5_fmt_ann ann ++ " =\n  " ++ g5_fmt_e (g5_unwrap_params body (len ps)) ++ "\n" ++ g5_fmt_group_and rest
+
+and g5_fmt_tydecl td = case td of
+  | TyDecl5 nm ps cds ->
+      "type " ++ nm ++ g5_fmt_params_ty ps ++ " =\n" ++ g5_fmt_ctors cds
+
+and g5_fmt_params_ty ps = case ps of
+    [] -> ""
+  | p :: rest -> " " ++ p ++ g5_fmt_params_ty rest
+
+and g5_fmt_ctors cds = case cds of
+    [] -> ""
+  | cd :: rest -> case cd of
+      | CtorDecl5 nm fs ->
+          case rest of
+            | [] -> "  | " ++ nm ++ g5_fmt_ty_fields fs ++ "\n"
+            | _ -> "  | " ++ nm ++ g5_fmt_ty_fields fs ++ "\n" ++ g5_fmt_ctors rest
+
+and g5_fmt_ty_fields fs = case fs of
+    [] -> ""
+  | t :: rest -> " " ++ g5_fmt_ty_paren2 t ++ g5_fmt_ty_fields rest
+
+and g5_join_sp3 vs = case vs of
+    [] -> ""
+  | v :: [] -> v
+  | v :: rest -> v ++ " " ++ g5_join_sp3 rest
+
+let rec g5_join_comma xs = case xs of
+    [] -> ""
+  | h :: [] -> h
+  | h :: rest -> h ++ ", " ++ g5_join_comma rest
+
+-- reparse + span-insensitive compare (formatter check)
+let g5_format_prog pr = case pr of
+  | Prog5 hd items ->
+      let hs = case hd of
+        | NoMod5 -> ""
+        | Mod5 nm ex _ -> "module " ++ nm ++ " exposing (" ++ g5_join_comma ex ++ ")\n\n" in
+      hs ++ g5_fmt_items items ""
+
+
+let rec g5_eq_items xs ys = case xs of
+    [] -> (case ys of | [] -> true | _ -> false)
+  | x :: xr -> (case ys of | [] -> false | y :: yr -> if g5_eq_item x y then g5_eq_items xr yr else false)
+
+and g5_eq_item x y = case x of
+  | ITy5 a _ -> (case y of | ITy5 b _ -> g5_eq_tydecl a b | _ -> false)
+  | IDef5 dx _ -> (case y of | IDef5 dy _ -> g5_eq_defs dx dy | _ -> false)
+  | ISig5 a -> (case y of | ISig5 b -> g5_eq_sig a b | _ -> false)
+  | IImport5 a _ -> (case y of | IImport5 b _ -> a == b | _ -> false)
+
+and g5_eq_tydecl a b = case a of
+  | TyDecl5 n1 p1 c1 -> (case b of
+      | TyDecl5 n2 p2 c2 -> if n1 == n2 then (if g5_eq_strs p1 p2 then g5_eq_ctors c1 c2 else false) else false)
+
+and g5_eq_strs xs ys = case xs of
+    [] -> (case ys of | [] -> true | _ -> false)
+  | x :: xr -> (case ys of | [] -> false | y :: yr -> if x == y then g5_eq_strs xr yr else false)
+
+and g5_eq_ctors xs ys = case xs of
+    [] -> (case ys of | [] -> true | _ -> false)
+  | x :: xr -> (case ys of
+      | [] -> false
+      | y :: yr -> case x of
+          | CtorDecl5 n1 f1 -> (case y of
+              | CtorDecl5 n2 f2 -> if n1 == n2 then (if g5_eq_tys f1 f2 then g5_eq_ctors xr yr else false) else false))
+
+and g5_eq_defs xs ys = case xs of
+    [] -> (case ys of | [] -> true | _ -> false)
+  | x :: xr -> (case ys of
+      | [] -> false
+      | y :: yr -> case x of
+          | Def5 r1 n1 _ p1 a1 b1 _ -> (case y of
+              | Def5 r2 n2 _ p2 a2 b2 _ ->
+                  if r1 == r2 then (if n1 == n2 then (if g5_eq_pats p1 p2 then (if g5_eq_ann a1 a2 then (if g5_eq_e b1 b2 then g5_eq_defs xr yr else false) else false) else false) else false) else false))
+
+and g5_eq_ann a b = case a of
+  | NoneTy5 -> (case b of | NoneTy5 -> true | _ -> false)
+  | SomeTy5 t -> (case b of | SomeTy5 u -> g5_eq_ty t u | _ -> false)
+
+and g5_eq_sig a b = case a of
+  | Sig5 n1 v1 t1 _ -> (case b of
+      | Sig5 n2 v2 t2 _ -> if n1 == n2 then (if g5_eq_strs v1 v2 then g5_eq_ty t1 t2 else false) else false)
+
+and g5_eq_prog a b = case a of
+  | Prog5 ha xa -> (case b of
+      | Prog5 hb xb -> if g5_eq_mod ha hb then g5_eq_items xa xb else false)
+
+and g5_eq_mod ha hb = case ha of
+  | NoMod5 -> (case hb of | NoMod5 -> true | _ -> false)
+  | Mod5 n1 e1 _ -> (case hb of
+      | Mod5 n2 e2 _ -> if n1 == n2 then g5_eq_strs e1 e2 else false
+      | _ -> false)
+
+let g5_format_check src =
+  let pr = g5_parse_src src in
+  let out = g5_format_prog pr in
+  let pr2 = g5_parse_src out in
+  if g5_eq_prog pr pr2 then out
+  else error "g5: formatter changed AST (re-parse mismatch)"

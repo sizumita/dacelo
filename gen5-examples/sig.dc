@@ -1,0 +1,14 @@
+-- Gen5 syntax example: sig contracts (rigid forall, distinct from flexible `e : T`)
+-- `sig` is optional and never required for full inference.
+-- Run: ./gen5check check gen5-examples/sig.dc   (wrong is rejected, id/restricted pass)
+
+sig id : forall a. a -> a
+let id x = x
+
+sig restricted : Int -> Int
+let restricted x = x
+
+-- sig wrong : forall a. a -> a
+-- let wrong x = x + 1   -- rejected: implementation is Int -> Int, not fully polymorphic
+
+let main () = print_int (id 41)

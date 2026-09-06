@@ -1,0 +1,6 @@
+-- hole.dc with ?body filled by `user`: plain W must accept (exit 0).
+-- Compare: hole.dc is `partial` (exit 2) with expected `a`; this file checks clean.
+
+let render user = user
+
+let main () = print_string "fill ?body first"

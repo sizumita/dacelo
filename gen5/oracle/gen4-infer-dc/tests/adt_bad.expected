@@ -1,0 +1,2 @@
+exit=1
+dacelo: [item 1: let main] in def `main`: unbound variable `size`

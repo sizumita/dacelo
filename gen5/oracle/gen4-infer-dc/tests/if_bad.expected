@@ -1,0 +1,2 @@
+exit=1
+dacelo: [item 0: let main] in def `main`: `if` condition must be Bool

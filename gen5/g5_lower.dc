@@ -1,0 +1,266 @@
+-- ============================================================
+-- gen5/g5_lower.dc -- Gen5 lowering via text (fresh lineage)
+--
+-- Rationale: legacy and Gen5 ASTs share constructor names, so building
+-- legacy AST values inside Gen5 code is ambiguous to HM resolution.
+-- Instead lowering prints LEGACY-syntax source (records become assoc
+-- lists + helper calls, annotations dropped, sig/import/module dropped)
+-- which is re-parsed with the legacy parser. Benefits:
+--   legacy-only programs skip lowering entirely (original source goes
+--   straight to the legacy backend => byte-identical .s by construction);
+--   record programs carry the prelude text; lowered source is inspectable.
+-- Only Gen4-subset syntax is used in this file.
+-- ============================================================
+
+let g5_rec_get_name = "g5_rec_get"
+let g5_rec_with_name = "g5_rec_with"
+
+let g5_rec_prelude_src = "let rec g5_rec_get xs k = case xs of | (k2, v) :: rest -> if k == k2 then v else g5_rec_get rest k | _ -> error \"unknown record field\"\nlet rec g5_rec_with xs k nv = case xs of | (k2, v) :: rest -> if k == k2 then (k, nv) :: rest else (k2, v) :: g5_rec_with rest k nv | _ -> error \"unknown record field\"\n"
+
+let rec g5_uses_records_prog pr = case pr of
+  | Prog5 _ items -> g5_uses_records_items items
+
+and g5_uses_records_items its = case its of
+    [] -> false
+  | it :: rest ->
+      if g5_uses_records_item it then true else g5_uses_records_items rest
+
+and g5_uses_records_item it = case it of
+  | ITy5 _ _ -> false
+  | IDef5 ds _ -> g5_uses_records_defs ds
+  | ISig5 _ -> false
+  | IImport5 _ _ -> false
+
+and g5_uses_records_defs ds = case ds of
+    [] -> false
+  | d :: rest -> case d of
+      | Def5 _ _ _ _ _ body _ ->
+          if g5_uses_records_e body then true else g5_uses_records_defs rest
+
+and g5_uses_records_e e = case e of
+  | ERec5 _ _ -> true
+  | EProj5 _ _ _ -> true
+  | EWith5 _ _ _ _ -> true
+  | ELam5 _ b _ -> g5_uses_records_e b
+  | EApp5 f a _ -> if g5_uses_records_e f then true else g5_uses_records_e a
+  | EBin5 _ l r _ -> if g5_uses_records_e l then true else g5_uses_records_e r
+  | EIf5 c t el _ ->
+      if g5_uses_records_e c then true
+      else if g5_uses_records_e t then true else g5_uses_records_e el
+  | ECase5 sc brs _ ->
+      if g5_uses_records_e sc then true else g5_uses_records_brs brs
+  | ELet5 _ _ rhs body _ ->
+      if g5_uses_records_e rhs then true else g5_uses_records_e body
+  | ETup5 es _ -> g5_uses_records_list es
+  | EAnn5 x _ _ -> g5_uses_records_e x
+  | _ -> false
+
+and g5_uses_records_brs brs = case brs of
+    [] -> false
+  | br :: rest -> case br of
+      | (_, b) -> if g5_uses_records_e b then true else g5_uses_records_brs rest
+
+and g5_uses_records_list es = case es of
+    [] -> false
+  | e :: rest -> if g5_uses_records_e e then true else g5_uses_records_list rest
+
+-- ---------- legacy-syntax printer (lowering) ----------
+
+let rec g5_lw_pat p = case p of
+  | PWild5 _ -> "_"
+  | PVar5 n _ -> n
+  | PInt5 n _ -> int_to_string n
+  | PBool5 b _ -> if b then "true" else "false"
+  | PStr5 s _ -> "\"" ++ s ++ "\""
+  | PUnit5 _ -> "()"
+  | PTup5 ps _ -> "(" ++ g5_lw_pats ps ++ ")"
+  | PCtor5 n ps _ ->
+      if n == "Nil" then (if ps == [] then "[]" else "(" ++ n ++ " " ++ g5_lw_pats_sp ps ++ ")")
+      else if n == "Cons" then case ps of
+        | [a, b] -> "(" ++ g5_lw_pat a ++ " :: " ++ g5_lw_pat b ++ ")"
+        | _ -> "(" ++ n ++ " " ++ g5_lw_pats_sp ps ++ ")"
+      else if ps == [] then n else "(" ++ n ++ " " ++ g5_lw_pats_sp ps ++ ")"
+
+and g5_lw_pats ps = case ps of
+    [] -> ""
+  | p :: [] -> g5_lw_pat p
+  | p :: rest -> g5_lw_pat p ++ ", " ++ g5_lw_pats rest
+
+and g5_lw_pats_sp ps = case ps of
+    [] -> ""
+  | p :: [] -> g5_lw_pat p
+  | p :: rest -> g5_lw_pat p ++ " " ++ g5_lw_pats_sp rest
+
+and g5_lw_is_atomic e = case e of
+  | EInt5 _ _ -> true
+  | EBool5 _ _ -> true
+  | EStr5 _ _ -> true
+  | EUnit5 _ -> true
+  | EVar5 _ _ -> true
+  | ECtor5 _ _ -> true
+  | ETup5 _ _ -> true
+  | ERec5 _ _ -> true
+  | EHole5 _ _ -> true
+  | _ -> false
+
+and g5_lw_e e = case e of
+  | EInt5 n _ -> int_to_string n
+  | EBool5 b _ -> if b then "true" else "false"
+  | EStr5 s _ -> "\"" ++ s ++ "\""
+  | EUnit5 _ -> "()"
+  | EVar5 n _ -> n
+  | ECtor5 n _ -> n
+  | ELam5 p b _ -> "fun " ++ g5_lw_pat p ++ " -> " ++ g5_lw_e b
+  | EApp5 f a _ -> g5_lw_e f ++ " " ++ (if g5_lw_is_atomic a then g5_lw_e a else "(" ++ g5_lw_e a ++ ")")
+  | EBin5 op l r _ -> "(" ++ g5_lw_e l ++ " " ++ op ++ " " ++ g5_lw_e r ++ ")"
+  | EIf5 c t el _ -> "(if " ++ g5_lw_e c ++ " then " ++ g5_lw_e t ++ " else " ++ g5_lw_e el ++ ")"
+  | ECase5 sc brs _ -> "(case " ++ g5_lw_e sc ++ " of " ++ g5_lw_brs brs ++ ")"
+  | ELet5 rc n rhs body _ -> "(let " ++ (if rc then "rec " else "") ++ n ++ " = " ++ g5_lw_e rhs ++ " in " ++ g5_lw_e body ++ ")"
+  | ETup5 es _ -> "(" ++ g5_lw_es_comma es ++ ")"
+  | EAnn5 x _ _ -> g5_lw_e x
+  | ERec5 flds _ -> "[" ++ g5_lw_fields flds ++ "]"
+  | EProj5 r lb _ -> "(g5_rec_get " ++ g5_lw_e r ++ " \"" ++ lb ++ "\")"
+  | EWith5 b lb u _ -> "(g5_rec_with " ++ g5_lw_e b ++ " \"" ++ lb ++ "\" " ++ g5_lw_e u ++ ")"
+  | EHole5 nm _ -> error "g5: hole reached lowering (refusing partial program)"
+
+and g5_lw_es_comma es = case es of
+    [] -> ""
+  | e :: [] -> g5_lw_e e
+  | e :: rest -> g5_lw_e e ++ ", " ++ g5_lw_es_comma rest
+
+and g5_lw_fields flds = case flds of
+    [] -> ""
+  | kv :: rest -> case kv of
+      | (lb, e) ->
+          case rest of
+            | [] -> "(\"" ++ lb ++ "\", " ++ g5_lw_e e ++ ")"
+            | _ -> "(\"" ++ lb ++ "\", " ++ g5_lw_e e ++ "), " ++ g5_lw_fields rest
+
+and g5_lw_brs brs = case brs of
+    [] -> ""
+  | br :: rest -> case br of
+      | (p, b) ->
+          case rest of
+            | [] -> "| " ++ g5_lw_pat p ++ " -> " ++ g5_lw_e b
+            | _ -> "| " ++ g5_lw_pat p ++ " -> " ++ g5_lw_e b ++ " " ++ g5_lw_brs rest
+
+-- defs: params printed, annotations DROPPED (backend erases EAnn5 anyway)
+and g5_lw_def d = case d of
+  | Def5 isrec nm _ ps _ body _ ->
+      "let " ++ (if isrec then "rec " else "") ++ nm ++ g5_lw_params ps ++ " =\n  " ++ g5_lw_e (g5_unwrap_lw body (len ps)) ++ "\n"
+
+and g5_lw_params ps = case ps of
+    [] -> ""
+  | p :: rest -> " " ++ g5_lw_pat p ++ g5_lw_params rest
+
+and g5_unwrap_lw body n =
+  if n == 0 then body
+  else case body of
+    | ELam5 _ b _ -> g5_unwrap_lw b (n - 1)
+    | EAnn5 inner _ _ -> g5_unwrap_ann_lw inner n
+    | _ -> body
+
+and g5_unwrap_ann_lw inner n =
+  if n == 0 then inner
+  else case inner of
+    | ELam5 _ b _ -> g5_unwrap_ann_lw b (n - 1)
+    | _ -> inner
+
+and g5_lw_group ds = case ds of
+    [] -> ""
+  | d :: rest -> case rest of
+      | [] -> g5_lw_def d
+      | _ -> g5_lw_def_and d ++ g5_lw_group_and rest
+
+and g5_lw_def_and d = case d of
+  | Def5 _ nm _ ps _ body _ ->
+      "let rec " ++ nm ++ g5_lw_params ps ++ " =\n  " ++ g5_lw_e (g5_unwrap_lw body (len ps)) ++ "\n"
+
+and g5_lw_group_and ds = case ds of
+    [] -> ""
+  | d :: rest -> case d of
+      | Def5 _ nm _ ps _ body _ ->
+          "and " ++ nm ++ g5_lw_params ps ++ " =\n  " ++ g5_lw_e (g5_unwrap_lw body (len ps)) ++ "\n" ++ g5_lw_group_and rest
+
+and g5_lw_tydecl td = case td of
+  | TyDecl5 nm ps cds ->
+      "type " ++ nm ++ g5_lw_params_ty ps ++ " =\n" ++ g5_lw_ctors cds
+
+and g5_lw_params_ty ps = case ps of
+    [] -> ""
+  | p :: rest -> " " ++ p ++ g5_lw_params_ty rest
+
+and g5_lw_ctors cds = case cds of
+    [] -> ""
+  | cd :: rest -> case cd of
+      | CtorDecl5 nm fs ->
+          case rest of
+            | [] -> "  | " ++ nm ++ g5_lw_ty_fields fs ++ "\n"
+            | _ -> "  | " ++ nm ++ g5_lw_ty_fields fs ++ "\n" ++ g5_lw_ctors rest
+
+and g5_lw_ty_fields fs = case fs of
+    [] -> ""
+  | t :: rest -> " " ++ g5_lw_ty_field t ++ g5_lw_ty_fields rest
+
+and g5_lw_ty_field t = case t of
+  | TTVar5 _ _ -> g5_fmt_ty t
+  | TTCon5 _ _ _ -> g5_fmt_ty t
+  | _ -> "(" ++ g5_fmt_ty t ++ ")"
+
+and g5_lw_items its acc = case its of
+    [] -> acc
+  | it :: rest -> case it of
+      | ITy5 td _ -> g5_lw_items rest (acc ++ g5_lw_tydecl td ++ "\n")
+      | IDef5 ds _ -> g5_lw_items rest (acc ++ g5_lw_group ds)
+      | ISig5 _ -> g5_lw_items rest acc
+      | IImport5 _ _ -> g5_lw_items rest acc
+
+-- reserved helper names must not be user-defined
+let rec g5_has_reserved_prog pr = case pr of
+  | Prog5 _ items -> g5_has_reserved_items items
+
+and g5_has_reserved_items its = case its of
+    [] -> ""
+  | it :: rest -> case it of
+      | IDef5 ds _ ->
+          let f = g5_has_reserved_defs ds in
+          if f == "" then g5_has_reserved_items rest else f
+      | _ -> g5_has_reserved_items rest
+
+and g5_has_reserved_defs ds = case ds of
+    [] -> ""
+  | d :: rest -> case d of
+      | Def5 _ nm _ _ _ _ _ ->
+          if nm == "g5_rec_get" then nm
+          else if nm == "g5_rec_with" then nm
+          else g5_has_reserved_defs rest
+
+-- entry: Nothing about holes (driver refuses partial first)
+and g5_lower_prog_src pr = case pr of
+  | Prog5 _ items -> g5_lw_items items ""
+
+-- ---------- legacy-syntax detection (dual-path codegen) ----------
+
+-- A program takes the legacy path iff its token stream uses no Gen5-only
+-- tokens: `{', `}', `.', `?', or the new keywords. (Strings/comments are
+-- already excluded at the token level, so no false positives.)
+let rec g5_uses_new_syntax toks = case toks of
+    [] -> false
+  | pt :: rest -> case pt of
+      | PTok (TSym s) _ _ ->
+          if s == "{" then true
+          else if s == "}" then true
+          else if s == "." then true
+          else if s == "?" then true
+          else g5_uses_new_syntax rest
+      | PTok (TKw w) _ _ ->
+          if w == "sig" then true
+          else if w == "module" then true
+          else if w == "exposing" then true
+          else if w == "import" then true
+          else if w == "with" then true
+          else if w == "forall" then true
+          else g5_uses_new_syntax rest
+      | _ -> g5_uses_new_syntax rest
+
+let g5_is_legacy_toks toks = if g5_uses_new_syntax toks then false else true

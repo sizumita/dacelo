@@ -172,15 +172,18 @@ let rec chars_str cs = case cs of
     [] -> ""
   | c :: rest -> chr c ++ chars_str rest
 
+-- string values keep exact source bytes: literal runs are sliced (substring),
+-- escapes synthesize ASCII chars (all escape codes are < 128). Never route
+-- raw bytes through `chr` (native chr encodes >127 as UTF-8, mojibake).
 let rec scan_string s i acc =
   let c = sget s i in
   if c == -1 then error "interp: unterminated string literal"
-  else if c == 34 then (chars_str (rev_acc [] acc), i + 1)
+  else if c == 34 then (join "" (rev_acc [] acc), i + 1)
   else if c == 92 then
     let e = sget s (i + 1) in
     if e == -1 then error "interp: unterminated string literal"
-    else scan_string s (i + 2) (escape_code e :: acc)
-  else scan_string s (i + 1) (c :: acc)
+    else scan_string s (i + 2) (chars_str (escape_code e :: []) :: acc)
+  else scan_string s (i + 1) (substring s i 1 :: acc)
 
 let rec lex_loop s i acc =
   let j = skip_ws s i in

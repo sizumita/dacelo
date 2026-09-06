@@ -1,0 +1,2 @@
+exit=1
+dacelo: [item 0: let f] in def `f`: in application #5: infinite type: cannot unify `a` with `[a]`

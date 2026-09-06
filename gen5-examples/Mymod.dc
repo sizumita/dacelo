@@ -1,0 +1,3 @@
+module Mymod exposing (double)
+
+let double x = x * 2

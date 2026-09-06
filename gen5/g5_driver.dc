@@ -1,0 +1,489 @@
+-- ============================================================
+-- gen5/g5_driver.dc -- Gen5 query driver + module loader (fresh lineage)
+--
+-- Loader: explicit imports only (`import Name` -> sibling `Name.dc`),
+-- depth-first, cycle error, per-file check in shared state with
+-- exps-filtered env between modules (true separate checking:
+-- callers see closed exposed schemes only). Partial deps refused.
+-- CLI: gen5check <cmd> <file> [opts]; opts --format=json --at=L:C
+--   --max-bytes=N --check=PATH --write=PATH. Exit codes: 0 ok,
+--   1 invalid/error, 2 partial (check), 3 interface-changed.
+-- Only Gen4-subset syntax is used in this file.
+-- ============================================================
+
+-- ---------- small CLI helpers ----------
+
+let rec g5_argv_list i acc =
+  if i > 16 then rev_acc [] acc
+  else
+    let a = argv i in
+    if a == "" then rev_acc [] acc
+    else g5_argv_list (i + 1) (a :: acc)
+
+let rec g5_opt_val opts key = case opts of
+    [] -> ""
+  | o :: rest ->
+      if g5_starts_with o key then g5_drop_prefix o key
+      else g5_opt_val rest key
+
+and g5_has_opt opts key = if g5_opt_val opts key == "@@none@@" then false else true
+
+-- returns value or "@@none@@" sentinel
+and g5_drop_prefix o key = g5_drop_prefix_go o key 0
+
+and g5_drop_prefix_go o key i =
+  let c = string_get key i in
+  if c == -1 then substring o i (string_length o - i)
+  else
+    let h = string_get o i in
+    if h == c then g5_drop_prefix_go o key (i + 1) else "@@none@@"
+
+let rec g5_parse_at s = g5_parse_at_go s 0 ""
+
+and g5_parse_at_go s i acc =
+  let c = string_get s i in
+  if c == -1 then (0, 0)
+  else if c == 58 then (string_to_int acc, string_to_int (substring s (i + 1) (string_length s - (i + 1))))
+  else g5_parse_at_go s (i + 1) (acc ++ substring s i 1)
+
+let g5_parse_int_opt s dflt = if s == "" then dflt else string_to_int s
+
+-- dirname of a path ("" if none)
+let rec g5_dirname_r s i last =
+  let c = string_get s i in
+  if c == -1 then last
+  else if c == 47 then g5_dirname_r s (i + 1) (i + 1)
+  else g5_dirname_r s (i + 1) last
+
+let g5_dirname path = substring path 0 (g5_dirname_r path 0 0)
+
+-- ---------- top check assembly (single file, no I/O) ----------
+
+-- returns (state, sums, ckpts, diags, status, errmsg)
+let g5_check_prog pr = case pr of
+  | Prog5 hd items ->
+      let (s0, env0) = g5_init_env g5s_new in
+      let (sigs, e0) = g5_collect_sigs items [] in
+      if e0 == "" then
+        g5_run_items hd items env0 [] s0 sigs 0 [] [] [] "checked" [] ""
+      else (s0, [], [], [Diag5 (0 - 1) "sig" e0], "invalid", e0)
+
+let rec g5_prog_tydecls pr = case pr of
+  | Prog5 _ items -> g5_prog_tydecls_go items []
+
+and g5_prog_tydecls_go items acc = case items of
+    [] -> rev_acc [] acc
+  | it :: rest -> case it of
+      | ITy5 td _ -> g5_prog_tydecls_go rest (td :: acc)
+      | _ -> g5_prog_tydecls_go rest acc
+
+let g5_prog_modinfo pr = case pr of
+  | Prog5 hd _ -> case hd of
+      | NoMod5 -> ("", true, [])
+      | Mod5 nm ex _ -> (nm, false, ex)
+
+-- ---------- module loader (I/O) ----------
+-- Loaded files: (path, src, prog). Deps order: deps-first.
+
+let rec g5_visit path stack acc = case acc of
+  | (files, deps) ->
+      if g5_mem_str3 path stack then error ("g5: cyclic module import involving `" ++ path ++ "`")
+      else if g5_have_file files path then (files, deps)
+      else
+        let src = read_file path in
+        let pr = g5_parse_src src in
+        case pr of
+          | Prog5 hd items ->
+              let depnames = g5_imports_of items [] in
+              let dir = g5_dirname path in
+              let (files2, deps2) = g5_visit_deps depnames dir (path :: stack) (files, deps) in
+              let modname = case hd of
+                | NoMod5 -> path
+                | Mod5 nm _ _ -> nm in
+              (((path, src, pr) :: files2), ((modname, path, g5_hash_str src) :: deps2))
+
+and g5_mem_str3 x xs = case xs of
+    [] -> false
+  | h :: rest -> if h == x then true else g5_mem_str3 x rest
+
+and g5_have_file files path = case files of
+    [] -> false
+  | f :: rest -> case f of
+      | (p, _, _) -> if p == path then true else g5_have_file rest path
+
+and g5_imports_of items acc = case items of
+    [] -> rev_acc [] acc
+  | it :: rest -> case it of
+      | IImport5 nm _ -> g5_imports_of rest (nm :: acc)
+      | _ -> g5_imports_of rest acc
+
+and g5_visit_deps names dir stack acc = case names of
+    [] -> acc
+  | nm :: rest ->
+      let (files2, deps2) = g5_visit (dir ++ nm ++ ".dc") stack acc in
+      g5_visit_deps rest dir stack (files2, deps2)
+
+-- check loaded files in order (deps first), shared state, exps filter.
+-- files arrive entry-first from g5_visit; reverse for dep-first checking.
+-- snap deps exclude the entry itself.
+let rec g5_snap_deps files entry_path acc = case files of
+    [] -> rev_acc [] acc
+  | f :: rest -> case f of
+      | (path, src, pr) -> case pr of
+          | Prog5 hd _ ->
+              if path == entry_path then g5_snap_deps rest entry_path acc
+              else case hd of
+                | NoMod5 -> g5_snap_deps rest entry_path ((path, path, g5_hash_str src) :: acc)
+                | Mod5 nm _ _ -> g5_snap_deps rest entry_path ((nm, path, g5_hash_str src) :: acc)
+
+
+let rec g5_check_files files entry_path env sc s sums ckpts diags status deps = case files of
+    [] -> (s, sums, ckpts, diags, status, "no entry checked", deps)
+  | f :: rest -> case f of
+      | (path, src, pr) -> case pr of
+          | Prog5 hd items ->
+              let (sigs, e0) = g5_collect_sigs items [] in
+              if e0 == "" then
+                let (s1, sums1, ckpts1, diags1, st1, e1) = g5_run_items hd items env sc s sigs 0 [] [] [] "checked" [] "" in
+                if e1 == "" then
+                  if path == entry_path then
+                    (s1, sums1, ckpts1, diags1, st1, "", deps)
+                  else
+                    if st1 == "invalid" then (s1, [], [], diags1, "invalid", "dependency `" ++ path ++ "` failed to check", deps)
+                    else if st1 == "partial" then (s1, [], [], diags1, "invalid", "cannot import partial module `" ++ path ++ "`", deps)
+                    else
+                      let env2 = g5_filter_exposed hd sums1 env s1 in
+                      let dep = g5_dep_entry hd path src in
+                      g5_check_files rest entry_path env2 sc s1 sums ckpts diags status (dep :: deps)
+                else (s1, sums1, ckpts1, diags1, "invalid", e1, deps)
+              else (s, [], [], [Diag5 (0 - 1) "sig" e0], "invalid", e0, deps)
+
+and g5_dep_entry hd path src = case hd of
+  | NoMod5 -> (path, path, g5_hash_str src)
+  | Mod5 nm _ _ -> (nm, path, g5_hash_str src)
+
+-- exposed dep schemes appended in front (newest-first shadowing)
+and g5_filter_exposed hd sums1 env s = case hd of
+  | NoMod5 -> app_list (g5_sums_env_all sums1) env
+  | Mod5 _ exps _ -> app_list (g5_sums_env_exp sums1 exps) env
+
+and g5_sums_env_all sums = case sums of
+    [] -> []
+  | it :: rest -> case it of
+      | ItemSum5 _ _ binds _ _ -> app_list (g5_binds_env2 binds) (g5_sums_env_all rest)
+
+and g5_binds_env2 binds = case binds of
+    [] -> []
+  | b :: rest -> case b of
+      | BindTy5 nm _ sch st _ ->
+          if st == "checked" then (nm, sch) :: g5_binds_env2 rest
+          else g5_binds_env2 rest
+
+and g5_sums_env_exp sums exps = case sums of
+    [] -> []
+  | it :: rest -> case it of
+      | ItemSum5 _ _ binds _ _ -> app_list (g5_binds_env_exp binds exps) (g5_sums_env_exp rest exps)
+
+and g5_binds_env_exp binds exps = case binds of
+    [] -> []
+  | b :: rest -> case b of
+      | BindTy5 nm _ sch st _ ->
+          if st == "checked" then
+            if g5_mem_str3 nm exps then (nm, sch) :: g5_binds_env_exp rest exps
+            else g5_binds_env_exp rest exps
+          else g5_binds_env_exp rest exps
+
+and g5_is_builtin_name nm =
+  if nm == "print_int" then true
+  else if nm == "print_string" then true
+  else if nm == "int_to_string" then true
+  else if nm == "bool_to_string" then true
+  else if nm == "string_length" then true
+  else if nm == "str_concat" then true
+  else if nm == "read_file" then true
+  else if nm == "write_file" then true
+  else if nm == "exit" then true
+  else if nm == "chr" then true
+  else if nm == "ord" then true
+  else if nm == "string_get" then true
+  else if nm == "substring" then true
+  else if nm == "string_to_int" then true
+  else if nm == "error" then true
+  else if nm == "show" then true
+  else if nm == "argv" then true
+  else if nm == "system" then true
+  else if nm == "Nil" then true
+  else if nm == "Cons" then true
+  else false
+
+let g5_check_loaded files entry_path =
+  let (s0, env0) = g5_init_env g5s_new in
+  let rfiles = rev_acc [] files in
+  g5_check_files rfiles entry_path env0 [] s0 [] [] [] "checked" []
+
+-- ---------- query CLI main ----------
+-- gen5check <cmd> <file> [opts]: check|types|focus|why|holes|interface|format
+-- opts: --format=json --at=L:C --max-bytes=N --check=PATH --write=PATH
+
+let rec g5_pick_positional args acc = case args of
+    [] -> rev_acc [] acc
+  | a :: rest ->
+      if g5_starts_with a "--" then g5_pick_positional rest acc
+      else g5_pick_positional rest (a :: acc)
+
+let g5_main_cmd args = case args of
+  | cmd :: _ -> cmd
+  | [] -> ""
+
+let g5_main_file args = case args of
+  | _ :: file :: _ -> file
+  | _ -> ""
+
+let rec g5_main_opts args acc = case args of
+    [] -> acc
+  | a :: rest ->
+      if g5_starts_with a "--" then g5_main_opts rest (a :: acc)
+      else g5_main_opts rest acc
+
+let g5_is_cmd c =
+  if c == "check" then true
+  else if c == "types" then true
+  else if c == "focus" then true
+  else if c == "why" then true
+  else if c == "holes" then true
+  else if c == "interface" then true
+  else if c == "format" then true
+  else false
+
+let g5_usage_text = "usage: gen5check <check|types|focus|why|holes|interface|format> <file.dc> [--format=json] [--at=L:C] [--max-bytes=N] [--check=OLD.dci] [--write=OUT.dci]\n"
+
+-- load entry + deps, check everything; returns loaded bundle or aborts.
+let rec g5_find_prog files path = case files of
+    [] -> Prog5 NoMod5 []
+  | f :: rest -> case f of
+      | (p, _, pr) -> if p == path then pr else g5_find_prog rest path
+
+let rec g5_read_src files path = case files of
+    [] -> ""
+  | f :: rest -> case f of
+      | (p, src, _) -> if p == path then src else g5_read_src rest path
+
+let g5_prog_modinfo2 hd = case hd of
+  | NoMod5 -> ("", true, [])
+  | Mod5 nm ex _ -> (nm, false, ex)
+-- bundle: (entry_src, entry_prog, sums, state, snapdeps, tydecls, modname, allpub, exps)
+let g5_load_files entry_path =
+  let (files, _) = g5_visit entry_path [] ([], []) in
+  files
+
+let g5_load_check entry_path =
+  let files = g5_load_files entry_path in
+  let (s1, sums, ckpts, diags, status, errmsg, _) = g5_check_loaded files entry_path in
+  let snapdeps = g5_snap_deps files entry_path [] in
+  let eprog = g5_find_prog files entry_path in
+  case eprog of
+    | Prog5 hd items ->
+        let minfo = g5_prog_modinfo2 hd in
+        case minfo of
+          | (modname, allpub, exps) ->
+              (entry_path, g5_read_src files entry_path, eprog, sums, s1, snapdeps, g5_prog_tydecls_go items [], modname, allpub, exps, diags, status, errmsg)
+
+
+-- text-mode legacy check output (Gen0 parity): silent ok; invalid aborts
+-- with `dacelo: <msg>` (msg already carries [item N: kind] chain);
+-- partial prints note and exits 2.
+let g5_do_check_text b =
+  case b of
+    | (_, _, _, _, _, _, _, _, _, _, diags, status, errmsg) ->
+        if status == "checked" then print_string ""
+        else if status == "partial" then
+          print_string ("g5: partial program (holes must be filled)\n") ;
+          exit 2
+        else error errmsg
+
+let rec g5_cmd_check file opts as_json =
+  let b = g5_load_check file in
+  if as_json then
+    case b of
+      | (_, _, _, sums, s, snapdeps, _, _, _, _, diags, status, errmsg) ->
+          print_string (g5_check_json_of b opts) ;
+          if status == "invalid" then exit 1 else (if status == "partial" then exit 2 else print_string "")
+  else g5_do_check_text b
+
+and g5_check_json_of b opts =
+  case b of
+    | (file, src, _, sums, s, snapdeps, _, _, _, _, diags, status, errmsg) ->
+        let maxb = g5_parse_int_opt (g5_opt_val opts "--max-bytes=") 65536 in
+        let q = QCtx5 src (Snap5 file (g5_hash_str src) (string_length src) g5_lang_tag g5_build_tag snapdeps) sums (g5s_nodes s) (g5s_syms s) (g5s_holes s) (g5s_warns s) diags status errmsg s in
+        g5_check_json q maxb
+
+and g5_cmd_types file opts as_json =
+  let b = g5_load_check file in
+  case b of
+    | (_, _, _, sums, s, _, _, _, _, _, _, status, errmsg) ->
+        if status == "invalid" then
+          if as_json then
+            print_string (g5_check_json_of b opts) ;
+            exit 1
+          else error errmsg
+        else if as_json then
+          print_string (g5_types_json_of b opts)
+        else g5_print_types_text sums s
+
+and g5_types_json_of b opts =
+  case b of
+    | (file, src, _, sums, s, snapdeps, _, _, _, _, _, status, _) ->
+        let maxb = g5_parse_int_opt (g5_opt_val opts "--max-bytes=") 65536 in
+        let q = QCtx5 src (Snap5 file (g5_hash_str src) (string_length src) g5_lang_tag g5_build_tag snapdeps) sums [] [] [] [] [] status "" s in
+        g5_types_json q maxb
+
+and g5_print_types_text sums s = case sums of
+    [] -> print_string ""
+  | it :: rest -> case it of
+      | ItemSum5 _ _ binds _ _ ->
+          g5_print_binds_text binds s ;
+          g5_print_types_text rest s
+
+and g5_print_binds_text binds s = case binds of
+    [] -> print_string ""
+  | b :: rest -> case b of
+      | BindTy5 nm _ sch _ sg ->
+          print_string (nm ++ " : " ++ g5_scheme_text s sch ++ "\n") ;
+          g5_print_contract_text nm sg ;
+          g5_print_binds_text rest s
+
+and g5_print_contract_text nm sg = case sg of
+  | Sig5 cn _ _ _ ->
+      if cn == "" then print_string ""
+      else print_string ("  contract " ++ nm ++ " : " ++ g5_sig_contract_text sg ++ "\n")
+
+and g5_cmd_focus file opts as_json =
+  let at = g5_opt_val opts "--at=" in
+  if at == "" then error "g5: focus requires --at=L:C\n"
+  else
+    let (ln, col) = g5_parse_at at in
+    let maxb = g5_parse_int_opt (g5_opt_val opts "--max-bytes=") 16000 in
+    let b = g5_load_check file in
+    case b of
+      | (f2, src, _, sums, s, snapdeps, _, _, _, _, _, status, errmsg) ->
+          if status == "invalid" then
+            if as_json then
+              print_string (g5_check_json_of b opts) ;
+              exit 1
+            else error errmsg
+          else
+            let off = g5_lc_off src ln col in
+            let q = QCtx5 src (Snap5 f2 (g5_hash_str src) (string_length src) g5_lang_tag g5_build_tag snapdeps) sums (g5s_nodes s) (g5s_syms s) (g5s_holes s) (g5s_warns s) [] status "" s in
+            print_string (g5_focus_json q off maxb ++ "\n")
+
+and g5_cmd_why file opts as_json =
+  let at = g5_opt_val opts "--at=" in
+  if at == "" then error "g5: why requires --at=L:C\n"
+  else
+    let (ln, col) = g5_parse_at at in
+    let b = g5_load_check file in
+    case b of
+      | (f2, src, _, sums, s, snapdeps, _, _, _, _, _, status, errmsg) ->
+          if status == "invalid" then
+            if as_json then
+              print_string (g5_check_json_of b opts) ;
+              exit 1
+            else error errmsg
+          else
+            let off = g5_lc_off src ln col in
+            let q = QCtx5 src (Snap5 f2 (g5_hash_str src) (string_length src) g5_lang_tag g5_build_tag snapdeps) sums (g5s_nodes s) (g5s_syms s) (g5s_holes s) (g5s_warns s) [] status "" s in
+            print_string (g5_why_json q off 65536 ++ "\n")
+
+and g5_cmd_holes file opts as_json =
+  let b = g5_load_check file in
+  case b of
+    | (f2, src, _, sums, s, snapdeps, _, _, _, _, _, status, errmsg) ->
+        if status == "invalid" then
+          if as_json then
+            print_string (g5_check_json_of b opts) ;
+            exit 1
+          else error errmsg
+        else
+          let maxb = g5_parse_int_opt (g5_opt_val opts "--max-bytes=") 65536 in
+          let q = QCtx5 src (Snap5 f2 (g5_hash_str src) (string_length src) g5_lang_tag g5_build_tag snapdeps) sums [] [] (g5s_holes s) [] [] status "" s in
+          if as_json then print_string (g5_holes_query_json q maxb ++ "\n")
+          else g5_print_holes_text src (g5s_holes s) s
+
+and g5_print_holes_text src holes s = case holes of
+    [] -> print_string "no holes\n"
+  | he :: rest -> case he of
+      | HoleE5 _ nm ty cands cap ->
+          case g5_off_lc src 0 0 1 0 of
+            | _ ->
+                print_string ("hole ?" ++ nm ++ " : " ++ g5_show s ty ++ "\n") ;
+                g5_print_cands_text cands s ;
+                if cap then print_string "  ... (candidate list capped at 12)\n" else print_string "" ;
+                g5_print_holes_text src rest s
+
+and g5_print_cands_text cands s = case cands of
+    [] -> print_string ""
+  | kv :: rest -> case kv of
+      | (nm, ty, _) ->
+          print_string ("  " ++ nm ++ " : " ++ g5_show s ty ++ "\n") ;
+          g5_print_cands_text rest s
+
+and g5_cmd_interface file opts as_json =
+  let b = g5_load_check file in
+  case b of
+    | (f2, src, prog, sums, s, snapdeps, tydecls, modname, allpub, exps, _, status, errmsg) ->
+        if status == "invalid" then
+          if as_json then
+            print_string (g5_check_json_of b opts) ;
+            exit 1
+          else error errmsg
+        else if status == "partial" then
+          if as_json then
+            print_string (g5_check_json_of b opts) ;
+            exit 2
+          else error "g5: cannot publish interface for partial program (holes must be filled)\n"
+        else
+          let maxb = g5_parse_int_opt (g5_opt_val opts "--max-bytes=") 65536 in
+          let q = QCtx5 src (Snap5 f2 (g5_hash_str src) (string_length src) g5_lang_tag g5_build_tag snapdeps) sums [] [] [] [] [] status "" s in
+          let text = g5_interface_text q modname allpub exps tydecls in
+          let wpath = g5_opt_val opts "--write=" in
+          if wpath == "" then
+            let cpath = g5_opt_val opts "--check=" in
+            if cpath == "" then
+              if as_json then print_string (g5_interface_json q modname allpub exps tydecls maxb ++ "\n")
+              else print_string (text ++ "\n")
+            else
+              let old = read_file cpath in
+              case g5_diff_dci old text of
+                | (same, msg) ->
+                    print_string (msg ++ "\n") ;
+                    if same then print_string "" else exit 3
+          else
+            write_file wpath text ;
+            print_string ("wrote " ++ wpath ++ "\n")
+
+and g5_cmd_format file opts as_json =
+  let src = read_file file in
+  let out = g5_format_check src in
+  print_string out
+
+
+let g5_main () =
+  print_string "" ;
+  let args = g5_argv_list 1 [] in
+  let cmd = g5_main_cmd args in
+  if g5_is_cmd cmd then
+    let file = g5_main_file args in
+    if file == "" then error g5_usage_text
+    else
+      let opts = g5_main_opts args [] in
+      let fmt = g5_opt_val opts "--format=" in
+      let as_json = fmt == "json" in
+      if cmd == "check" then g5_cmd_check file opts as_json
+      else if cmd == "types" then g5_cmd_types file opts as_json
+      else if cmd == "focus" then g5_cmd_focus file opts as_json
+      else if cmd == "why" then g5_cmd_why file opts as_json
+      else if cmd == "holes" then g5_cmd_holes file opts as_json
+      else if cmd == "interface" then g5_cmd_interface file opts as_json
+      else if cmd == "format" then g5_cmd_format file opts as_json
+      else error g5_usage_text
+  else error g5_usage_text

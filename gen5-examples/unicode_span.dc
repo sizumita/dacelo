@@ -1,0 +1,14 @@
+-- Unicode span example: CJK comments/strings shift byte offsets.
+-- Columns in --at=L:C count Unicode scalars (1-based); spans are UTF-8
+-- byte half-open intervals. ASCII-only code, UTF-8 bytes free elsewhere.
+-- 日本語コメント（3バイト文字）と日本語文字列を含む。
+-- Run: ./gen5check check gen5-examples/unicode_span.dc
+-- Query: ./gen5check focus gen5-examples/unicode_span.dc --at=11:5
+--   (finds v with the byte span after the multibyte comment block)
+--   and --at=9:12 (inside the string literal: byte span covers 3-byte chars)
+
+let s = "日本語"
+
+let v = 42
+
+let main () = print_string s

@@ -1,0 +1,9 @@
+-- Gen5 syntax example: static typed holes (partial programs)
+-- `?name` (adjacent ident is the hole name). Hole code is `partial`:
+-- check succeeds with status partial, holes query shows expected type + candidates,
+-- but no executable or trusted interface is produced until holes are filled.
+-- Query: ./gen5check holes gen5-examples/hole.dc   /   ./gen5check check gen5-examples/hole.dc --format=json
+
+let render user = ?body
+
+let main () = print_string "fill ?body first"

@@ -1,0 +1,11 @@
+-- Gen5 syntax example: modules (file-unit, explicit import/exposing, no cycles)
+-- This file is RecMod (dependency-free, exposes name_of):
+-- Query: ./gen5check interface gen5-examples/module.dc --format=json
+-- Import pair: gen5-examples/Mymod.dc (module Mymod exposing double) is
+-- imported by gen5-examples/use_mymod.dc:
+-- Run: ./dcc_6 gen5-examples/use_mymod.dc /tmp/um && /tmp/um   (prints 42)
+
+-- This file itself is dependency-free; see use_mymod.dc for the importer.
+module RecMod exposing (name_of)
+
+let name_of r = r.name

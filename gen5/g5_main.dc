@@ -1,0 +1,4 @@
+let main () =
+  print_string "" ;
+  g5_main () ;
+  print_string ""

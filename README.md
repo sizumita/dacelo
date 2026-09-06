@@ -20,6 +20,7 @@ Dacelo(ワライカワセミ属)— ML 系静的型付け関数型言語。自�
 | Gen 2 | `gen2-dcc-rs` — Rust 製コンパイラ(ARM64 直接コード生成)| Rust | **完了** ✅ |
 | Gen 3 | `gen3-dcc-dc` — dacelo 製コンパイラ(自己コンパイル)| dacelo | **完了** ✅ |
 | Gen 4 | `gen4-infer-dc` — dacelo 製 HM 型推論(dacelo 上で動作)| dacelo | **完了** ✅ |
+| Gen 5 | `gen5/` — dacelo 製 Gen5チェッカ＋コンパイラ(新規系譜・自己ホスト) | dacelo | **完了** ✅ |
 
 ## Gen 0 の現状
 
@@ -106,10 +107,28 @@ dcc-rs -o dcc_1 dcc.dc     # Rust 製コンパイラで dacelo 製コンパイ�
 
 ## ステータス
 
-Gen 0〜4 完了。Gen 4(`gen4-infer-dc/`)は dacelo 製 HM 型推論＋統合コンパイラ:
+Gen 0〜5 完了。Gen 4(`gen4-infer-dc/`)は dacelo 製 HM 型推論＋統合コンパイラ:
 `gen4check` が Gen0 `--types` と 38 ケース完全一致し、`dcc_4` が `dcc_1` と
 同一のバイナリを生成しつつ ill-typed を拒否、`dcc_4` が `dcc_5` を
 セルフビルド(不動点到達)。
+
+**Gen 5 完了** (`gen5/` 新規系譜・dacelo製・gen0無改変): Gen4サブセット構文のみで
+書かれた HM+row多相チェッカと check-then-compile コンパイラ。`gen5check`
+(`check`/`types`/`focus`/`why`/`holes`/`interface`/`format`)が Gen0 `--types`
+と既存38ケース完全一致(終了コード＋メッセージ)、`dcc_6` が legacy 入力で
+`dcc_1` とバイト同一の `.s` を生成しつつ ill-typed を拒否、不変レコード・
+`sig` 契約(rigid)・hole(`partial`)・単純モジュールを実行可能コードへ lowering
+(`record.dc` → `Alice,Bob`、`record_with.dc` → `2`、`use_mymod.dc` → `42`)。
+`dcc_6` が `dcc_7` をセルフビルドし `dcc_6.s == dcc_7.s` の不動点に到達
+(検査は `gen5check` で別途 exit 0 確認の二段階式。理由は `gen5/test.sh`
+参照)。全 Gen3/Gen4/Gen5 ソース＋全 example が `format` 再parse一致。
+`focus` は定義スキームと使用箇所単相型・具体化・containing を分離し、
+`types` は主型と `sig` 契約を別フィールドで返す。構築は `./gen5/build.sh`
+一発で完結（seedがstage1をビルド→自己検査→gen5がgen5をビルド→不動点確認→
+promote）。Rust toolchain不要（Dacelo製seed＋golden oracle。残る外部依存は
+zsh・cc・rt.cのみ）。検証は `./gen5/test.sh`
+(A:38一致 B:同一.s＋実行＋否定例 C:不動点 D:format E:RFC受入)。例は
+[gen5-examples/README.md](./gen5-examples/README.md)。
 
 **Gen 3 完了**: `gen3-dcc-dc/` — dacelo 自身で書かれたコンパイラが
 自分自身をコンパイルして完全動作する `dcc_2` を生成し、`dcc_2` の

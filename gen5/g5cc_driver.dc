@@ -1,0 +1,139 @@
+-- ============================================================
+-- gen5/g5cc_driver.dc -- Gen5 check-then-compile driver (fresh lineage)
+--
+-- CLI identical to dcc_1/dcc_4: ./dcc_6 <in.dc> <out_base>
+-- Pipeline: load (modules) -> check all -> refuse partial/ill-typed
+-- (BEFORE any output) -> legacy path (original source, byte-identical .s)
+-- or Gen5 path (lowered source + record prelude) -> legacy backend.
+-- Only Gen4-subset syntax is used in this file.
+-- ============================================================
+
+-- collect (file, lowered-text) in order; fails on reserved/dup names
+let rec g5_lower_files files acc = case files of
+    [] -> rev_acc [] acc
+  | f :: rest -> case f of
+      | (path, _, pr) -> case pr of
+          | Prog5 _ items ->
+              let r = g5_has_reserved_prog pr in
+              if r == "" then g5_lower_files rest ((path, g5_lower_prog_src pr) :: acc)
+              else error ("g5: reserved name `" ++ r ++ "` defined in " ++ path ++ " (rename it)")
+
+-- NOTE: record-usage is detected on parsed Prog5s (kept alongside texts)
+let rec g5_any_records_ps progs = case progs of
+    [] -> false
+  | pr :: rest ->
+      if g5_uses_records_prog pr then true else g5_any_records_ps rest
+
+let rec g5_file_progs files acc = case files of
+    [] -> rev_acc [] acc
+  | f :: rest -> case f of
+      | (_, _, pr) -> g5_file_progs rest (pr :: acc)
+
+let rec g5_join_texts texts acc = case texts of
+    [] -> acc
+  | kv :: rest -> case kv of
+      | (_, t) -> g5_join_texts rest (acc ++ t ++ "\n")
+
+-- duplicate top-level value names across merged files (flat namespace)
+let rec g5_def_names_of_prog pr acc = case pr of
+  | Prog5 _ items -> g5_def_names_of_items items acc
+
+and g5_def_names_of_items items acc = case items of
+    [] -> acc
+  | it :: rest -> case it of
+      | IDef5 ds _ -> g5_def_names_of_items rest (g5_def_names_app ds acc)
+      | _ -> g5_def_names_of_items rest acc
+
+and g5_def_names_app ds acc = case ds of
+    [] -> acc
+  | d :: rest -> g5_def_names_app rest (def5_name d :: acc)
+
+let rec g5_dup_across namess seen = case namess of
+    [] -> ""
+  | ns :: rest ->
+      let d = g5_first_dup_in ns seen in
+      if d == "" then g5_dup_across rest (app_list ns seen)
+      else d
+
+and g5_first_dup_in ns seen = case ns of
+    [] -> ""
+  | n :: rest ->
+      if g5_mem_str3 n seen then n else g5_first_dup_in rest seen
+
+let rec g5_main_count namess acc = case namess of
+    [] -> acc
+  | ns :: rest -> g5_main_count rest (acc + g5_count_main ns)
+
+and g5_count_main ns = case ns of
+    [] -> 0
+  | n :: rest -> if n == "main" then 1 + g5_count_main rest else g5_count_main rest
+
+let rec g5cc_main () =
+  print_string "" ;
+  let in_path = argv 1 in
+  let out_base = argv 2 in
+  let boot = argv 3 == "--backend-only" in
+  let _w = if boot then print_string "g5: --backend-only: check skipped (bootstrap hatch; ship only inputs that gen5check accepts)\n" else print_string "" in
+  let files = g5_load_files in_path in
+  let (status, errmsg) = if boot then ("checked", "") else g5cc_status (g5_check_loaded files in_path) in
+  if status == "invalid" then error errmsg
+  else if status == "partial" then error "g5: cannot compile partial program (holes must be filled)"
+  else
+    let progs = g5_file_progs files [] in
+    let namesets = g5_namesets progs [] in
+    let dup = g5_dup_across namesets [] in
+    if dup == "" then
+      if g5_main_count namesets 0 > 1 then error "g5: multiple main definitions across modules"
+      else
+        let toks = g5_lex_all (g5_read_src files in_path) in
+        if g5_is_legacy_toks toks then g5cc_legacy in_path out_base
+        else g5cc_lowered files progs out_base
+    else error ("g5: duplicate definition `" ++ dup ++ "` across modules (flat namespace in v1)")
+
+and g5_namesets progs acc = case progs of
+    [] -> rev_acc [] acc
+  | pr :: rest -> g5_namesets rest (g5_def_names_of_prog pr [] :: acc)
+
+-- status projection for the bootstrap hatch below (codegen never reads
+-- check results: both emit paths consume parse trees only; the check
+-- gates by status. --backend-only is equivalent whenever check passes.)
+and g5cc_status r = case r of
+  | (_, _, _, _, st, e, _) -> (st, e)
+
+-- legacy path: original source straight to the legacy backend
+and g5cc_legacy in_path out_base =
+  let src_code = read_file in_path in
+  let toks = lex_all src_code in
+  let prog = parse_prog toks in
+  g5cc_emit prog out_base
+
+-- Gen5 path: lower each file, prepend prelude iff records used, reparse
+and g5cc_lowered files progs out_base =
+  let lowered = g5_lower_files files [] in
+  let body = g5_join_texts lowered "" in
+  let src = if g5_any_records_ps progs then g5_rec_prelude_src ++ body else body in
+  let prog = parse_prog (lex_all src) in
+  g5cc_emit prog out_base
+
+and g5cc_emit prog out_base =
+  let tabs = build_tables prog in
+  let all_defs = case tabs of
+      | (a, b, c) -> c in
+  let ct_id_tbl = case tabs of
+      | (a, b, c) -> a in
+  let ct_ar_tbl = case tabs of
+      | (a, b, c) -> b in
+  let lines_fwd = emit_code prog in
+  let content = join_chunks lines_fwd in
+  let s_path = out_base ++ ".s" in
+  write_file s_path content ;
+  let rt_c = "gen2-dcc-rs/rt/rt.c" in
+  let _r1 = system ("cc -O2 -arch arm64 -c " ++ s_path ++ " -o " ++ out_base ++ ".o") in
+  let _r2 = system ("cc -O2 -arch arm64 -c " ++ rt_c ++ " -o " ++ out_base ++ ".rt.o") in
+  let _r3 = system ("cc " ++ out_base ++ ".o " ++ out_base ++ ".rt.o -o " ++ out_base) in
+  print_string ("wrote " ++ out_base ++ "\n")
+
+let main () =
+  print_string "" ;
+  g5cc_main () ;
+  print_string ""

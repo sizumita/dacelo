@@ -1,0 +1,2 @@
+exit=1
+dacelo: [item 1: let main] in def `main`: left side of `;` must be Unit: type mismatch: expected `Unit`, found `String`

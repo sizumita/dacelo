@@ -1,0 +1,987 @@
+-- ============================================================
+-- gen5/g5_front.dc -- Gen5 frontend in Dacelo (fresh lineage)
+--
+-- New lineage reusing Gen3 helpers (rev_acc, mem_str, len, is_digit,
+-- is_lowerc, is_upperc, is_wordch, sget, skip_ws, word_end, sub_or_empty,
+-- escape_code, chars_str, scan_string, ...). All new top-level names use
+-- g5_/5 suffix so concatenation with dcc.dc + infer.dc never clashes.
+-- Only Gen4-subset syntax is used in this file (bootstrap stage 1-2).
+--
+-- Design notes:
+--   Dacelo forbids mutually recursive *type* declarations, so the AST is
+--   a single self-recursive type per level with the Span trailing every
+--   constructor. NodeIds are assigned on the fly by inference in
+--   pre-order (same traversal everywhere), so the AST carries spans only.
+--   Every parse function returns (value, toks, end) with exact UTF-8
+--   half-open ends (no whitespace slop).
+-- ============================================================
+
+-- ---------- spans ----------
+
+type Span = Span Int Int
+
+let span_start s = case s of | Span a _ -> a
+let span_end s = case s of | Span _ b -> b
+let span_dummy = Span 0 0
+
+-- positioned token: legacy Tok plus byte offsets
+type PTok = PTok Tok Int Int
+
+let ptok_tok t = case t of | PTok k _ _ -> k
+let ptok_start t = case t of | PTok _ s _ -> s
+let ptok_end t = case t of | PTok _ _ e -> e
+
+-- ---------- positioned lexer (extends dcc.dc char helpers) ----------
+
+let g5_keywords = ["let", "rec", "and", "in", "if", "then", "else", "case", "of",
+                   "fun", "true", "false", "type",
+                   "sig", "module", "exposing", "import", "with", "forall"]
+
+let g5_sym2s = ["->", "==", "!=", "<=", ">=", "&&", "||", "++", "::"]
+
+let g5_is_sym1 c =
+  c == 40 || c == 41 || c == 91 || c == 93 || c == 44 || c == 59 ||
+  c == 58 || c == 124 || c == 60 || c == 62 || c == 61 || c == 43 ||
+  c == 45 || c == 42 || c == 47 || c == 37 ||
+  c == 123 || c == 125 || c == 46 || c == 63
+
+let g5_sym1_of c =
+  if c == 40 then "("
+  else if c == 41 then ")"
+  else if c == 91 then "["
+  else if c == 93 then "]"
+  else if c == 44 then ","
+  else if c == 59 then ";"
+  else if c == 58 then ":"
+  else if c == 124 then "|"
+  else if c == 60 then "<"
+  else if c == 62 then ">"
+  else if c == 61 then "="
+  else if c == 43 then "+"
+  else if c == 45 then "-"
+  else if c == 42 then "*"
+  else if c == 47 then "/"
+  else if c == 37 then "%"
+  else if c == 123 then "{"
+  else if c == 125 then "}"
+  else if c == 46 then "."
+  else "?"
+
+let rec g5_lex_loop s i acc =
+  let j = skip_ws s i in
+  let c = sget s j in
+  if c == -1 then rev_acc [] acc
+  else if is_digit c then
+    let (n, k) = scan_int_run s j 0 in
+    g5_lex_loop s k (PTok (TInt n) j k :: acc)
+  else if c == 34 then
+    let (t, k) = scan_string s (j + 1) [] in
+    g5_lex_loop s k (PTok (TStr t) j k :: acc)
+  else if is_lowerc c || c == 95 then
+    let k = word_end s j in
+    let w = substring s j (k - j) in
+    if mem_str w g5_keywords
+    then g5_lex_loop s k (PTok (TKw w) j k :: acc)
+    else g5_lex_loop s k (PTok (TIdent w) j k :: acc)
+  else if is_upperc c then
+    let k = word_end s j in
+    let w = substring s j (k - j) in
+    g5_lex_loop s k (PTok (TUpper w) j k :: acc)
+  else
+    let two = sub_or_empty s j 2 in
+    if mem_str two g5_sym2s
+    then g5_lex_loop s (j + 2) (PTok (TSym two) j (j + 2) :: acc)
+    else if g5_is_sym1 c
+    then g5_lex_loop s (j + 1) (PTok (TSym (g5_sym1_of c)) j (j + 1) :: acc)
+    else error ("g5: unexpected character (code " ++ int_to_string c ++ ")")
+
+let g5_lex_all src = g5_lex_loop src 0 []
+
+-- ---------- AST5 (single self-recursive types, Span trailing) ----------
+
+-- Record types: TTRec5 fields rowopt, rowopt = "" means closed.
+type TyAst5 =
+  | TTVar5 String Span
+  | TTCon5 String (List TyAst5) Span
+  | TTArr5 TyAst5 TyAst5 Span
+  | TTTup5 (List TyAst5) Span
+  | TTRec5 (List (String, TyAst5)) String Span
+
+type Pat5 =
+  | PWild5 Span
+  | PVar5 String Span
+  | PInt5 Int Span
+  | PBool5 Bool Span
+  | PStr5 String Span
+  | PUnit5 Span
+  | PTup5 (List Pat5) Span
+  | PCtor5 String (List Pat5) Span
+
+type Expr5 =
+  | EInt5 Int Span
+  | EBool5 Bool Span
+  | EStr5 String Span
+  | EUnit5 Span
+  | EVar5 String Span
+  | ECtor5 String Span
+  | ELam5 Pat5 Expr5 Span
+  | EApp5 Expr5 Expr5 Span
+  | EBin5 String Expr5 Expr5 Span
+  | EIf5 Expr5 Expr5 Expr5 Span
+  | ECase5 Expr5 (List (Pat5, Expr5)) Span
+  | ELet5 Bool String Expr5 Expr5 Span
+  | ETup5 (List Expr5) Span
+  | EAnn5 Expr5 TyAst5 Span
+  | ERec5 (List (String, Expr5)) Span
+  | EProj5 Expr5 String Span
+  | EWith5 Expr5 String Expr5 Span
+  | EHole5 String Span
+
+type OptTy5 = NoneTy5 | SomeTy5 TyAst5
+
+type Def5 = Def5 Bool String Span (List Pat5) OptTy5 Expr5 Span
+
+type CtorDecl5 = CtorDecl5 String (List TyAst5)
+
+type TyDecl5 = TyDecl5 String (List String) (List CtorDecl5)
+
+type Sig5 = Sig5 String (List String) TyAst5 Span
+
+type Item5 =
+  | ITy5 TyDecl5 Span
+  | IDef5 (List Def5) Span
+  | ISig5 Sig5
+  | IImport5 String Span
+
+type Mod5 = NoMod5 | Mod5 String (List String) Span
+
+type Prog5 = Prog5 Mod5 (List Item5)
+
+let e5_span e = case e of
+  | EInt5 _ s -> s
+  | EBool5 _ s -> s
+  | EStr5 _ s -> s
+  | EUnit5 s -> s
+  | EVar5 _ s -> s
+  | ECtor5 _ s -> s
+  | ELam5 _ _ s -> s
+  | EApp5 _ _ s -> s
+  | EBin5 _ _ _ s -> s
+  | EIf5 _ _ _ s -> s
+  | ECase5 _ _ s -> s
+  | ELet5 _ _ _ _ s -> s
+  | ETup5 _ s -> s
+  | EAnn5 _ _ s -> s
+  | ERec5 _ s -> s
+  | EProj5 _ _ s -> s
+  | EWith5 _ _ _ s -> s
+  | EHole5 _ s -> s
+
+let ty5_span t = case t of
+  | TTVar5 _ s -> s
+  | TTCon5 _ _ s -> s
+  | TTArr5 _ _ s -> s
+  | TTTup5 _ s -> s
+  | TTRec5 _ _ s -> s
+
+let pat5_span p = case p of
+  | PWild5 s -> s
+  | PVar5 _ s -> s
+  | PInt5 _ s -> s
+  | PBool5 _ s -> s
+  | PStr5 _ s -> s
+  | PUnit5 s -> s
+  | PTup5 _ s -> s
+  | PCtor5 _ _ s -> s
+
+let def5_span d = case d of | Def5 _ _ _ _ _ _ s -> s
+let def5_name d = case d of | Def5 _ n _ _ _ _ _ -> n
+
+let item5_span it = case it of
+  | ITy5 _ s -> s
+  | IDef5 _ s -> s
+  | ISig5 sg -> (case sg of | Sig5 _ _ _ s -> s)
+  | IImport5 _ s -> s
+
+-- ---------- positioned token-stream helpers ----------
+
+let g5_peek_tok toks = case toks of
+  | PTok k _ _ :: _ -> k
+  | [] -> TSym "@eof"
+
+let g5_peek_start toks = case toks of
+  | PTok _ s _ :: _ -> s
+  | [] -> 0 - 1
+
+let g5_is_sym5 q toks = case toks of
+  | PTok (TSym x) _ _ :: _ -> x == q
+  | _ -> false
+
+let g5_is_kw5 q toks = case toks of
+  | PTok (TKw x) _ _ :: _ -> x == q
+  | _ -> false
+
+let g5_drop1 toks = case toks of
+  | _ :: rest -> rest
+  | [] -> []
+
+let g5_expect_sym q toks = case toks of
+  | PTok (TSym x) _ e :: rest -> if x == q then (rest, e) else error ("g5: expected `" ++ q ++ "`")
+  | _ -> error ("g5: expected `" ++ q ++ "`")
+
+let g5_expect_kw q toks = case toks of
+  | PTok (TKw x) _ e :: rest -> if x == q then (rest, e) else error ("g5: expected keyword `" ++ q ++ "`")
+  | _ -> error ("g5: expected keyword `" ++ q ++ "`")
+
+let g5_take_ident toks = case toks of
+  | PTok (TIdent n) _ e :: rest -> (n, rest, e)
+  | _ -> error "g5: expected identifier"
+
+let g5_take_upper toks = case toks of
+  | PTok (TUpper n) _ e :: rest -> (n, rest, e)
+  | _ -> error "g5: expected constructor name"
+
+-- ---------- types (all return (val, toks, end)) ----------
+
+let g5_starts_tyatom toks = case toks of
+  | PTok (TIdent _) _ _ :: _ -> true
+  | PTok (TUpper _) _ _ :: _ -> true
+  | PTok (TSym "(") _ _ :: _ -> true
+  | PTok (TSym "[") _ _ :: _ -> true
+  | PTok (TSym "{") _ _ :: _ -> true
+  | _ -> false
+
+let rec g5_last_ty xs dflt = case xs of
+  | [] -> dflt
+  | t :: rest -> case rest of | [] -> t | _ -> g5_last_ty rest dflt
+
+let rec g5_ptyatom toks = case toks of
+  | PTok (TIdent n) s e :: rest -> (TTVar5 n (Span s e), rest, e)
+  | PTok (TUpper n) s e :: rest -> (TTCon5 n [] (Span s e), rest, e)
+  | PTok (TSym "(") s _ :: rest ->
+      if g5_is_sym5 ")" rest then
+        let (t1, e1) = g5_expect_sym ")" rest in
+        (TTCon5 "Unit" [] (Span s e1), t1, e1)
+      else
+        let (t1, u1, _) = g5_ptype rest in
+        if g5_is_sym5 "," u1 then
+          let (ts, u2, _) = g5_pmore_tytuple (g5_drop1 u1) [t1] in
+          let (t3, e3) = g5_expect_sym ")" u2 in
+          (TTTup5 ts (Span s e3), t3, e3)
+        else
+          let (t3, e3) = g5_expect_sym ")" u1 in
+          (t1, t3, e3)
+  | PTok (TSym "[") s _ :: rest ->
+      let (t1, u1, _) = g5_ptype rest in
+      let (t2, e2) = g5_expect_sym "]" u1 in
+      (TTCon5 "List" [t1] (Span s e2), t2, e2)
+  | PTok (TSym "{") s _ :: rest -> g5_prectype s rest
+  | _ -> error "g5: expected type"
+
+and g5_prectype s toks =
+  if g5_is_sym5 "}" toks then
+    let (t1, e1) = g5_expect_sym "}" toks in
+    (TTRec5 [] "" (Span s e1), t1, e1)
+  else
+    let (fs, row, u1, e1) = g5_pfields toks [] in
+    let (t2, e2) = g5_expect_sym "}" u1 in
+    (TTRec5 fs row (Span s e2), t2, e2)
+
+and g5_pfields toks acc =
+  let (lb, t1, _) = g5_take_ident toks in
+  let (t2, _) = g5_expect_sym ":" t1 in
+  let (ty, t3, _) = g5_ptype t2 in
+  let acc2 = (lb, ty) :: acc in
+  if g5_is_sym5 "," t3 then g5_pfields (g5_drop1 t3) acc2
+  else if g5_is_sym5 "|" t3 then
+    let (rn, t4, e4) = g5_take_ident (g5_drop1 t3) in
+    (rev_acc [] acc2, rn, t4, e4)
+  else (rev_acc [] acc2, "", t3, span_end (ty5_span ty))
+
+and g5_pmore_tytuple toks acc =
+  let (t1, u1, _) = g5_ptype toks in
+  if g5_is_sym5 "," u1 then g5_pmore_tytuple (g5_drop1 u1) (t1 :: acc)
+  else (rev_acc [] (t1 :: acc), u1, span_end (ty5_span t1))
+
+and g5_ptyapp toks =
+  let (hd, u1, _) = g5_ptyatom toks in
+  let (args, u2) = g5_ptyapp_args u1 [] in
+  case args of
+    | [] -> (hd, u2, span_end (ty5_span hd))
+    | _ ->
+        let e2 = span_end (ty5_span (g5_last_ty args hd)) in
+        case hd of
+          | TTCon5 n [] _ ->
+              (TTCon5 n args (Span (span_start (ty5_span hd)) e2), u2, e2)
+          | _ -> error "g5: invalid type application"
+
+and g5_ptyapp_args toks acc =
+  if g5_starts_tyatom toks then
+    let (t1, u1, _) = g5_ptyatom toks in
+    g5_ptyapp_args u1 (t1 :: acc)
+  else (rev_acc [] acc, toks)
+
+and g5_ptype toks =
+  let (t1, u1, _) = g5_ptyapp toks in
+  if g5_is_sym5 "->" u1 then
+    let (t2, u2, e2) = g5_ptype (g5_drop1 u1) in
+    (TTArr5 t1 t2 (Span (span_start (ty5_span t1)) e2), u2, e2)
+  else (t1, u1, span_end (ty5_span t1))
+
+-- ---------- expressions (all return (val, toks, end)) ----------
+
+let g5_starts_atom toks = case toks of
+  | PTok (TInt _) _ _ :: _ -> true
+  | PTok (TStr _) _ _ :: _ -> true
+  | PTok (TIdent _) _ _ :: _ -> true
+  | PTok (TUpper _) _ _ :: _ -> true
+  | PTok (TKw "true") _ _ :: _ -> true
+  | PTok (TKw "false") _ _ :: _ -> true
+  | PTok (TSym "(") _ _ :: _ -> true
+  | PTok (TSym "[") _ _ :: _ -> true
+  | PTok (TSym "{") _ _ :: _ -> true
+  | PTok (TSym "?") _ _ :: _ -> true
+  | _ -> false
+
+let rec g5_wrap_lams ps body = case ps of
+    [] -> body
+  | p :: rest -> ELam5 p (g5_wrap_lams rest body) (pat5_span p)
+
+let g5_mk_app f a = EApp5 f a (Span (span_start (e5_span f)) (span_end (e5_span a)))
+
+let g5_mk_cons l r = g5_mk_app (g5_mk_app (ECtor5 "Cons" (e5_span l)) l) r
+
+let rec g5_build_cons xs = case xs of
+    [] -> ECtor5 "Nil" span_dummy
+  | h :: rest -> g5_mk_cons h (g5_build_cons rest)
+
+let g5_pat_nil5 = PCtor5 "Nil" [] span_dummy
+
+let rec g5_build_pcons xs = case xs of
+    [] -> g5_pat_nil5
+  | h :: rest -> PCtor5 "Cons" [h, g5_build_pcons rest] span_dummy
+
+let g5_starts_pat_atom toks = case toks of
+  | PTok (TInt _) _ _ :: _ -> true
+  | PTok (TStr _) _ _ :: _ -> true
+  | PTok (TIdent _) _ _ :: _ -> true
+  | PTok (TUpper _) _ _ :: _ -> true
+  | PTok (TKw "true") _ _ :: _ -> true
+  | PTok (TKw "false") _ _ :: _ -> true
+  | PTok (TSym "(") _ _ :: _ -> true
+  | PTok (TSym "[") _ _ :: _ -> true
+  | _ -> false
+
+let rec g5_last_e es dflt = case es of
+  | [] -> dflt
+  | e :: rest -> case rest of | [] -> e | _ -> g5_last_e rest dflt
+
+let g5_eat_ann_opt t3 =
+  if g5_is_sym5 ":" t3 then
+    let (ty, t4, _) = g5_ptype (g5_drop1 t3) in
+    (ty, t4)
+  else (TTCon5 "Unit" [] span_dummy, t3)
+
+let g5_eat_ann_opt2 t2 =
+  if g5_is_sym5 ":" t2 then
+    let (ty, t1, _) = g5_ptype (g5_drop1 t2) in
+    (SomeTy5 ty, t1)
+  else (NoneTy5, t2)
+
+let g5_patom_q s qe rest = case rest of
+  | PTok (TIdent n) ns ne :: rest2 ->
+      if ns == qe then
+        (EHole5 n (Span s ne), rest2, ne)
+      else (EHole5 "" (Span s qe), rest, qe)
+  | _ -> (EHole5 "" (Span s qe), rest, qe)
+
+let rec g5_pmany_param toks acc = case toks of
+  | PTok (TIdent _) _ _ :: _ -> let (p, t, _) = g5_ppat_atom toks in g5_pmany_param t (p :: acc)
+  | PTok (TSym "_") _ _ :: _ -> let (p, t, _) = g5_ppat_atom toks in g5_pmany_param t (p :: acc)
+  | PTok (TSym "(") _ _ :: _ -> let (p, t, _) = g5_ppat_atom toks in g5_pmany_param t (p :: acc)
+  | _ -> (rev_acc [] acc, toks, 0 - 9)
+
+and g5_plist_elems toks acc =
+  let (e, t1, _) = g5_pexpr toks in
+  let acc2 = e :: acc in
+  if g5_is_sym5 "," t1 then g5_plist_elems (g5_drop1 t1) acc2
+  else
+    let (t2, e2) = g5_expect_sym "]" t1 in
+    (g5_build_cons (rev_acc [] acc2), t2, e2)
+
+and g5_plist_pats toks acc =
+  let (p, t1, _) = g5_ppattern toks in
+  let acc2 = p :: acc in
+  if g5_is_sym5 "," t1 then g5_plist_pats (g5_drop1 t1) acc2
+  else
+    let (t2, e2) = g5_expect_sym "]" t1 in
+    (g5_build_pcons (rev_acc [] acc2), t2, e2)
+
+and g5_ptuple_more toks acc =
+  let (e, t1, _) = g5_pexpr toks in
+  let acc2 = e :: acc in
+  if g5_is_sym5 "," t1 then g5_ptuple_more (g5_drop1 t1) acc2
+  else
+    let (t2, e2) = g5_expect_sym ")" t1 in
+    let all = rev_acc [] acc2 in
+    (ETup5 all (Span (span_start (e5_span e)) e2), t2, e2)
+
+and g5_ptuple_pats_more toks acc =
+  let (p, t1, _) = g5_ppattern toks in
+  let acc2 = p :: acc in
+  if g5_is_sym5 "," t1 then g5_ptuple_pats_more (g5_drop1 t1) acc2
+  else
+    let (t2, e2) = g5_expect_sym ")" t1 in
+    (PTup5 (rev_acc [] acc2) (Span (span_start (pat5_span p)) e2), t2, e2)
+
+-- record literal vs with-update lookahead after `{` (s = brace start)
+and g5_precord s toks =
+  if g5_is_sym5 "}" toks then
+    let (t1, e1) = g5_expect_sym "}" toks in
+    (ERec5 [] (Span s e1), t1, e1)
+  else case toks of
+    | PTok (TIdent lb) _ _ :: rest ->
+        if g5_is_sym5 "=" rest then g5_pfields_e s toks []
+        else g5_precord_with s toks
+    | _ -> g5_precord_with s toks
+
+and g5_precord_with s toks =
+  let (base, t1, _) = g5_pexpr toks in
+  if g5_is_kw5 "with" t1 then
+    let (fld, t2, _) = g5_take_ident (g5_drop1 t1) in
+    let (t3, _) = g5_expect_sym "=" t2 in
+    let (upd, t4, _) = g5_pexpr t3 in
+    let (t5, e5) = g5_expect_sym "}" t4 in
+    (EWith5 base fld upd (Span s e5), t5, e5)
+  else error "g5: expected `=` (record field) or `with` after `{`"
+
+and g5_pfields_e s toks acc =
+  let (lb, t1, _) = g5_take_ident toks in
+  let (t2, _) = g5_expect_sym "=" t1 in
+  let (e, t3, _) = g5_pexpr t2 in
+  let acc2 = (lb, e) :: acc in
+  if g5_is_sym5 "," t3 then
+    if g5_is_sym5 "}" (g5_drop1 t3) then
+      let (t4, e4) = g5_expect_sym "}" t3 in
+      (ERec5 (rev_acc [] acc2) (Span s e4), t4, e4)
+    else g5_pfields_e s (g5_drop1 t3) acc2
+  else
+    let (t4, e4) = g5_expect_sym "}" t3 in
+    (ERec5 (rev_acc [] acc2) (Span s e4), t4, e4)
+
+and g5_patom toks = case toks of
+  | PTok (TInt n) s e :: rest -> (EInt5 n (Span s e), rest, e)
+  | PTok (TStr x) s e :: rest -> (EStr5 x (Span s e), rest, e)
+  | PTok (TKw "true") s e :: rest -> (EBool5 true (Span s e), rest, e)
+  | PTok (TKw "false") s e :: rest -> (EBool5 false (Span s e), rest, e)
+  | PTok (TIdent n) s e :: rest -> (EVar5 n (Span s e), rest, e)
+  | PTok (TUpper c) s e :: rest -> (ECtor5 c (Span s e), rest, e)
+  | PTok (TSym "-") s _ :: PTok (TInt n) _ e :: rest ->
+      (EInt5 (0 - n) (Span s e), rest, e)
+  | PTok (TSym "?") s qe :: rest -> g5_patom_q s qe rest
+  | PTok (TSym "{") s _ :: rest -> g5_precord s rest
+  | PTok (TSym "(") s _ :: rest ->
+      if g5_is_sym5 ")" rest then
+        let (t1, e1) = g5_expect_sym ")" rest in
+        (EUnit5 (Span s e1), t1, e1)
+      else
+        let (e, t1, _) = g5_pexpr rest in
+        if g5_is_sym5 "," t1 then g5_ptuple_more (g5_drop1 t1) [e]
+        else
+          let (t2, e2) = g5_expect_sym ")" t1 in
+          (e, t2, e2)
+  | PTok (TSym "[") s _ :: rest ->
+      if g5_is_sym5 "]" rest then
+        let (t1, e1) = g5_expect_sym "]" rest in
+        (ECtor5 "Nil" (Span s e1), t1, e1)
+      else g5_plist_elems rest []
+  | _ -> error "g5: expected expression"
+
+-- projection binds tighter than application: atom (`.` ident)*
+and g5_pproj toks =
+  let (a, t1, _) = g5_patom toks in
+  g5_pproj_loop a t1
+
+and g5_pproj_loop e toks =
+  if g5_is_sym5 "." toks then
+    let (lb, t1, e1) = g5_take_ident (g5_drop1 toks) in
+    g5_pproj_loop (EProj5 e lb (Span (span_start (e5_span e)) e1)) t1
+  else (e, toks, span_end (e5_span e))
+
+and g5_papp_loop f toks =
+  if g5_starts_atom toks then
+    let (a, t1, _) = g5_pproj toks in
+    g5_papp_loop (g5_mk_app f a) t1
+  else (f, toks, span_end (e5_span f))
+
+and g5_papp toks =
+  let (a, t1, _) = g5_pproj toks in
+  g5_papp_loop a t1
+
+and g5_pmul_loop l toks =
+  if g5_is_sym5 "*" toks then
+    let (r, t1, _) = g5_papp (g5_drop1 toks) in g5_pmul_loop (EBin5 "*" l r (e5_span l)) t1
+  else if g5_is_sym5 "/" toks then
+    let (r, t1, _) = g5_papp (g5_drop1 toks) in g5_pmul_loop (EBin5 "/" l r (e5_span l)) t1
+  else if g5_is_sym5 "%" toks then
+    let (r, t1, _) = g5_papp (g5_drop1 toks) in g5_pmul_loop (EBin5 "%" l r (e5_span l)) t1
+  else (l, toks, span_end (e5_span l))
+
+and g5_pmul toks =
+  let (l, t1, _) = g5_papp toks in g5_pmul_loop l t1
+
+and g5_padd_loop l toks =
+  if g5_is_sym5 "+" toks then
+    let (r, t1, _) = g5_pmul (g5_drop1 toks) in g5_padd_loop (EBin5 "+" l r (e5_span l)) t1
+  else if g5_is_sym5 "-" toks then
+    let (r, t1, _) = g5_pmul (g5_drop1 toks) in g5_padd_loop (EBin5 "-" l r (e5_span l)) t1
+  else (l, toks, span_end (e5_span l))
+
+and g5_padd toks =
+  let (l, t1, _) = g5_pmul toks in g5_padd_loop l t1
+
+and g5_pcons toks =
+  let (l, t1, _) = g5_padd toks in
+  if g5_is_sym5 "::" t1 then
+    let (r, t2, _) = g5_pcons (g5_drop1 t1) in
+    (g5_mk_cons l r, t2, span_end (e5_span r))
+  else if g5_is_sym5 "++" t1 then
+    let (r, t2, _) = g5_pcons (g5_drop1 t1) in
+    (EBin5 "++" l r (e5_span l), t2, span_end (e5_span r))
+  else (l, t1, span_end (e5_span l))
+
+and g5_pcmp toks =
+  let (l, t1, _) = g5_pcons toks in
+  let op = if g5_is_sym5 "==" t1 then "=="
+    else if g5_is_sym5 "!=" t1 then "!="
+    else if g5_is_sym5 "<=" t1 then "<="
+    else if g5_is_sym5 ">=" t1 then ">="
+    else if g5_is_sym5 "<" t1 then "<"
+    else if g5_is_sym5 ">" t1 then ">" else "" in
+  if op == "" then (l, t1, span_end (e5_span l))
+  else
+    let (r, t2, _) = g5_pcons (g5_drop1 t1) in
+    (EBin5 op l r (e5_span l), t2, span_end (e5_span r))
+
+and g5_pand_loop l toks =
+  if g5_is_sym5 "&&" toks then
+    let (r, t1, _) = g5_pcmp (g5_drop1 toks) in g5_pand_loop (EBin5 "&&" l r (e5_span l)) t1
+  else (l, toks, span_end (e5_span l))
+
+and g5_pand toks =
+  let (l, t1, _) = g5_pcmp toks in g5_pand_loop l t1
+
+and g5_por_loop l toks =
+  if g5_is_sym5 "||" toks then
+    let (r, t1, _) = g5_pand (g5_drop1 toks) in g5_por_loop (EBin5 "||" l r (e5_span l)) t1
+  else (l, toks, span_end (e5_span l))
+
+and g5_por toks =
+  let (l, t1, _) = g5_pand toks in
+  g5_por_loop l t1
+
+and g5_pann toks =
+  let (l, t1, _) = g5_por toks in
+  if g5_is_sym5 ":" t1 then
+    let (ty, t2, _) = g5_ptype (g5_drop1 t1) in
+    (EAnn5 l ty (e5_span l), t2, span_end (ty5_span ty))
+  else (l, t1, span_end (e5_span l))
+
+and g5_pseq toks =
+  let (l, t1, _) = g5_pann toks in
+  if g5_is_sym5 ";" t1 then
+    let (r, t2, _) = g5_pexpr (g5_drop1 t1) in
+    (ELet5 false "_" l r (e5_span l), t2, span_end (e5_span r))
+  else (l, t1, span_end (e5_span l))
+
+and g5_pplet toks =
+  let (p, t1, _) = g5_ppat_atom toks in
+  let (t2, _) = g5_expect_sym "=" t1 in
+  let (rhs, t3, _) = g5_pexpr t2 in
+  let (t4, _) = g5_expect_kw "in" t3 in
+  let (body, t5, e5) = g5_pexpr t4 in
+  (ECase5 rhs [(p, body)] (pat5_span p), t5, e5)
+
+and g5_pbranches toks acc =
+  let (p, t1, _) = g5_ppattern toks in
+  let (t2, _) = g5_expect_sym "->" t1 in
+  let (b, t3, _) = g5_pexpr t2 in
+  let acc2 = (p, b) :: acc in
+  if g5_is_sym5 "|" t3 then g5_pbranches (g5_drop1 t3) acc2
+  else (rev_acc [] acc2, t3, span_end (e5_span b))
+
+-- braced case: `of { | p -> e | ... }` (Gen5 form, no absorption)
+and g5_pbranches_braced toks =
+  let t0 = if g5_is_sym5 "|" toks then g5_drop1 toks else toks in
+  let (brs, t1, _) = g5_pbranches t0 [] in
+  let (t2, e2) = g5_expect_sym "}" t1 in
+  (brs, t2, e2)
+
+and g5_pexpr toks =
+  if g5_is_kw5 "fun" toks then
+    let (ps, t1, _) = g5_pmany_param (g5_drop1 toks) [] in
+    let (t2, _) = g5_expect_sym "->" t1 in
+    let (b, t3, e3) = g5_pexpr t2 in
+    (g5_wrap_lams ps b, t3, e3)
+  else if g5_is_kw5 "if" toks then
+    let s = g5_peek_start toks in
+    let (c, t1, _) = g5_pexpr (g5_drop1 toks) in
+    let (t2, _) = g5_expect_kw "then" t1 in
+    let (th, t3, _) = g5_pexpr t2 in
+    let (t4, _) = g5_expect_kw "else" t3 in
+    let (el, t5, e5) = g5_pexpr t4 in
+    (EIf5 c th el (Span s e5), t5, e5)
+  else if g5_is_kw5 "case" toks then
+    let s = g5_peek_start toks in
+    let (sc, t1, _) = g5_pexpr (g5_drop1 toks) in
+    let (t2, _) = g5_expect_kw "of" t1 in
+    if g5_is_sym5 "{" t2 then
+      let (brs, t3, e3) = g5_pbranches_braced (g5_drop1 t2) in
+      (ECase5 sc brs (Span s e3), t3, e3)
+    else
+      let t3 = if g5_is_sym5 "|" t2 then g5_drop1 t2 else t2 in
+      let (brs, t4, e4) = g5_pbranches t3 [] in
+      (ECase5 sc brs (Span s e4), t4, e4)
+  else if g5_is_kw5 "let" toks then
+    (case g5_drop1 toks of
+       | PTok (TSym "(") _ _ :: _ -> g5_pplet (g5_drop1 toks)
+       | _ -> g5_plocal_let (g5_drop1 toks))
+  else g5_pseq toks
+
+and g5_plocal_let toks =
+  let s = g5_peek_start toks in
+  let (isrec, t1) = (case toks of
+                         | PTok (TKw "rec") _ _ :: rest -> (true, rest)
+                         | r -> (false, r)) in
+  let (name, t2, _) = g5_take_ident t1 in
+  let (params, t3, _) = g5_pmany_param t2 [] in
+  let (mty, t4) = g5_eat_ann_opt2 t3 in
+  let (t5, _) = g5_expect_sym "=" t4 in
+  let (rhs, t6, _) = g5_pexpr t5 in
+  let (t7, _) = g5_expect_kw "in" t6 in
+  let (body, t8, e8) = g5_pexpr t7 in
+  (ELet5 isrec name (g5_wrap_lams params rhs) body (Span s e8), t8, e8)
+
+and g5_ppat_atom toks = case toks of
+  | PTok (TIdent "_") s e :: rest -> (PWild5 (Span s e), rest, e)
+  | PTok (TIdent n) s e :: rest -> (PVar5 n (Span s e), rest, e)
+  | PTok (TInt n) s e :: rest -> (PInt5 n (Span s e), rest, e)
+  | PTok (TStr x) s e :: rest -> (PStr5 x (Span s e), rest, e)
+  | PTok (TKw "true") s e :: rest -> (PBool5 true (Span s e), rest, e)
+  | PTok (TKw "false") s e :: rest -> (PBool5 false (Span s e), rest, e)
+  | PTok (TSym "(") s _ :: rest ->
+      if g5_is_sym5 ")" rest then
+        let (t1, e1) = g5_expect_sym ")" rest in
+        (PUnit5 (Span s e1), t1, e1)
+      else
+        let (p, t1, _) = g5_ppattern rest in
+        if g5_is_sym5 "," t1 then g5_ptuple_pats_more (g5_drop1 t1) [p]
+        else
+          let (t2, e2) = g5_expect_sym ")" t1 in
+          (p, t2, e2)
+  | PTok (TSym "[") s _ :: rest ->
+      if g5_is_sym5 "]" rest then
+        let (t1, e1) = g5_expect_sym "]" rest in
+        (g5_pat_nil5, t1, e1)
+      else
+        let (p, t1, e1) = g5_plist_pats rest [] in
+        (p, t1, e1)
+  | PTok (TSym "_") s e :: rest -> (PWild5 (Span s e), rest, e)
+  | _ -> error "g5: expected pattern"
+
+and g5_ppat_app toks = case toks of
+  | PTok (TUpper c) s _ :: rest ->
+      let (args, t1, e1) = g5_pmany_pat_atom rest [] in
+      (PCtor5 c args (Span s e1), t1, e1)
+  | _ -> g5_ppat_atom toks
+
+and g5_pmany_pat_atom toks acc =
+  if g5_starts_pat_atom toks then
+    let (p, t1, _) = g5_ppat_atom toks in
+    g5_pmany_pat_atom t1 (p :: acc)
+  else (rev_acc [] acc, toks, 0 - 8)
+
+and g5_ppattern toks =
+  let (l, t1, _) = g5_ppat_app toks in
+  if g5_is_sym5 "::" t1 then
+    let (r, t2, e2) = g5_ppattern (g5_drop1 t1) in
+    (PCtor5 "Cons" [l, r] (pat5_span l), t2, e2)
+  else (l, t1, span_end (pat5_span l))
+
+-- ---------- top-level items ----------
+
+let rec g5_pparams_only toks acc = case toks of
+  | PTok (TIdent _) _ _ :: _ -> let (n, t, _) = g5_take_ident toks in g5_pparams_only t (n :: acc)
+  | _ -> (rev_acc [] acc, toks, 0 - 7)
+
+let g5_apply_ann params rhs mty = case mty of
+  | NoneTy5 -> g5_wrap_lams params rhs
+  | SomeTy5 ty -> EAnn5 (g5_wrap_lams params rhs) ty (e5_span rhs)
+
+let g5_pdef_tail isrec toks =
+  let s = g5_peek_start toks in
+  let (name, t1, nse) = g5_take_ident toks in
+  let (params, t2, _) = g5_pmany_param t1 [] in
+  let (mty, t3) = g5_eat_ann_opt2 t2 in
+  let (t4, _) = g5_expect_sym "=" t3 in
+  let (rhs, t5, e5) = g5_pexpr t4 in
+  (Def5 isrec name (Span s nse) params mty (g5_apply_ann params rhs mty) (Span s e5), t5, e5)
+
+let rec g5_pctrs toks acc =
+  let (cname, t1, _) = g5_take_upper toks in
+  let (fields, t2) = g5_ptyatom_fields t1 [] in
+  let acc2 = CtorDecl5 cname fields :: acc in
+  if g5_is_sym5 "|" t2 then g5_pctrs (g5_drop1 t2) acc2
+  else (acc2, t2, span_end (ty5_span (g5_last_ty fields (TTCon5 "Unit" [] span_dummy))))
+
+and g5_ptyatom_fields toks acc =
+  if g5_starts_tyatom toks then
+    let (t1, u1, _) = g5_ptyatom toks in
+    g5_ptyatom_fields u1 (t1 :: acc)
+  else (rev_acc [] acc, toks)
+
+let g5_ptydef toks = case toks of
+  | PTok (TUpper name) s _ :: rest ->
+      let (tparams, t1, _) = g5_pparams_only rest [] in
+      let (t2, _) = g5_expect_sym "=" t1 in
+      let t3 = if g5_is_sym5 "|" t2 then g5_drop1 t2 else t2 in
+      let (cds, t4, e4) = g5_pctrs t3 [] in
+      (TyDecl5 name tparams (rev_acc [] cds), t4, e4)
+  | _ -> error "g5: expected type name"
+
+-- sig name : [fall a b .] Type
+let rec g5_pforall_vars toks acc = case toks of
+  | PTok (TIdent n) _ _ :: rest -> g5_pforall_vars rest (n :: acc)
+  | _ -> (rev_acc [] acc, toks, 0 - 6)
+
+let g5_psig toks =
+  let s = g5_peek_start toks in
+  let (t0, _) = g5_expect_kw "sig" toks in
+  let (name, t1, _) = g5_take_ident t0 in
+  let (t2, _) = g5_expect_sym ":" t1 in
+  if g5_is_kw5 "forall" t2 then
+    let (vs, t3, _) = g5_pforall_vars (g5_drop1 t2) [] in
+    let (t4, _) = g5_expect_sym "." t3 in
+    let (ty, t5, e5) = g5_ptype t4 in
+    (Sig5 name vs ty (Span s e5), t5, e5)
+  else
+    let (ty, t3, e3) = g5_ptype t2 in
+    (Sig5 name [] ty (Span s e3), t3, e3)
+
+let g5_next_is_and toks = case toks of
+  | PTok (TKw "and") _ _ :: _ -> true
+  | _ -> false
+
+let rec g5_pand_chain toks acc =
+  let (t0, _) = g5_expect_kw "and" toks in
+  let (d, t1, _) = g5_pdef_tail true t0 in
+  let acc2 = d :: acc in
+  if g5_next_is_and t1 then g5_pand_chain t1 acc2
+  else (rev_acc [] acc2, t1, span_end (def5_span d))
+
+-- module header (optional, first): module Name exps (a, b)
+let rec g5_pname_list toks acc = case toks of
+  | PTok (TIdent n) _ _ :: rest ->
+      let acc2 = n :: acc in
+      if g5_is_sym5 "," rest then g5_pname_list (g5_drop1 rest) acc2
+      else (rev_acc [] acc2, rest, span_end span_dummy)
+  | _ -> error "g5: expected exposed name"
+
+let g5_pheader toks = case toks of
+  | PTok (TKw "module") s _ :: rest ->
+      let (name, t1, _) = g5_take_upper rest in
+      let (t2, _) = g5_expect_kw "exposing" t1 in
+      let (t3, _) = g5_expect_sym "(" t2 in
+      let (names, t4, _) = g5_pname_list t3 [] in
+      let (t5, e5) = g5_expect_sym ")" t4 in
+      (Mod5 name names (Span s e5), t5, e5)
+  | _ -> (NoMod5, toks, g5_peek_start toks)
+
+let rec g5_pitems toks acc = case toks of
+  | [] -> (rev_acc [] acc, [], 0 - 5)
+  | PTok (TKw "type") _ _ :: _ ->
+      let s = g5_peek_start toks in
+      let (td, t1, e1) = g5_ptydef (g5_drop1 toks) in
+      g5_pitems t1 (ITy5 td (Span s e1) :: acc)
+  | PTok (TKw "let") _ _ :: _ ->
+      let s = g5_peek_start toks in
+      let rest = g5_drop1 toks in
+      let (isrec, t1) = (case rest of
+                           | PTok (TKw "rec") _ _ :: r -> (true, r)
+                           | r -> (false, r)) in
+      let (d, t2, _) = g5_pdef_tail isrec t1 in
+      if g5_next_is_and t2 && isrec then
+        let (ds, t3, e3) = g5_pand_chain t2 [d] in
+        g5_pitems t3 (IDef5 ds (Span s e3) :: acc)
+      else if g5_next_is_and t2 then
+        error "g5: `and` is only allowed after `let rec`"
+      else
+        g5_pitems t2 (IDef5 [d] (Span s (span_end (def5_span d))) :: acc)
+  | PTok (TKw "sig") _ _ :: _ ->
+      let (sg, t1, _) = g5_psig toks in
+      g5_pitems t1 (ISig5 sg :: acc)
+  | PTok (TKw "import") s _ :: rest ->
+      let (nm, t1, e1) = g5_take_upper rest in
+      g5_pitems t1 (IImport5 nm (Span s e1) :: acc)
+  | _ -> error "g5: expected top-level item (`let`, `type`, `sig` or `import`)"
+
+let g5_parse_prog toks =
+  let (hd, t1, _) = g5_pheader toks in
+  let (items, rest, _) = g5_pitems t1 [] in
+  case rest of
+    | [] -> Prog5 hd items
+    | _ -> error "g5: trailing tokens after program"
+
+let g5_parse_src src = g5_parse_prog (g5_lex_all src)
+
+-- ---------- span-insensitive structural equality ----------
+
+let rec g5_eq_ty a b = case a of
+  | TTVar5 x _ -> (case b of | TTVar5 y _ -> x == y | _ -> false)
+  | TTCon5 x xs _ -> (case b of | TTCon5 y ys _ -> if x == y then g5_eq_tys xs ys else false | _ -> false)
+  | TTArr5 x1 x2 _ -> (case b of | TTArr5 y1 y2 _ -> if g5_eq_ty x1 y1 then g5_eq_ty x2 y2 else false | _ -> false)
+  | TTTup5 xs _ -> (case b of | TTTup5 ys _ -> g5_eq_tys xs ys | _ -> false)
+  | TTRec5 fx rx _ -> (case b of | TTRec5 fy ry _ -> if rx == ry then g5_eq_fields_ty fx fy else false | _ -> false)
+
+and g5_eq_tys xs ys = case xs of
+    [] -> (case ys of | [] -> true | _ -> false)
+  | x :: xr -> (case ys of | [] -> false | y :: yr -> if g5_eq_ty x y then g5_eq_tys xr yr else false)
+
+and g5_eq_fields_ty fx fy = case fx of
+    [] -> (case fy of | [] -> true | _ -> false)
+  | kv :: rest -> case kv of
+      | (lb, t) -> case fy of
+          | [] -> false
+          | kv2 :: rest2 -> case kv2 of
+              | (lb2, t2) -> if lb == lb2 then (if g5_eq_ty t t2 then g5_eq_fields_ty rest rest2 else false) else false
+
+let rec g5_eq_pat a b = case a of
+  | PWild5 _ -> (case b of | PWild5 _ -> true | _ -> false)
+  | PVar5 x _ -> (case b of | PVar5 y _ -> x == y | _ -> false)
+  | PInt5 x _ -> (case b of | PInt5 y _ -> x == y | _ -> false)
+  | PBool5 x _ -> (case b of | PBool5 y _ -> x == y | _ -> false)
+  | PStr5 x _ -> (case b of | PStr5 y _ -> x == y | _ -> false)
+  | PUnit5 _ -> (case b of | PUnit5 _ -> true | _ -> false)
+  | PTup5 xs _ -> (case b of | PTup5 ys _ -> g5_eq_pats xs ys | _ -> false)
+  | PCtor5 x xs _ -> (case b of | PCtor5 y ys _ -> if x == y then g5_eq_pats xs ys else false | _ -> false)
+
+and g5_eq_pats xs ys = case xs of
+    [] -> (case ys of | [] -> true | _ -> false)
+  | x :: xr -> (case ys of | [] -> false | y :: yr -> if g5_eq_pat x y then g5_eq_pats xr yr else false)
+
+let rec g5_eq_e a b = case a of
+  | EInt5 x _ -> (case b of | EInt5 y _ -> x == y | _ -> false)
+  | EBool5 x _ -> (case b of | EBool5 y _ -> x == y | _ -> false)
+  | EStr5 x _ -> (case b of | EStr5 y _ -> x == y | _ -> false)
+  | EUnit5 _ -> (case b of | EUnit5 _ -> true | _ -> false)
+  | EVar5 x _ -> (case b of | EVar5 y _ -> x == y | _ -> false)
+  | ECtor5 x _ -> (case b of | ECtor5 y _ -> x == y | _ -> false)
+  | ELam5 p x _ -> (case b of | ELam5 q y _ -> if g5_eq_pat p q then g5_eq_e x y else false | _ -> false)
+  | EApp5 f x _ -> (case b of | EApp5 g y _ -> if g5_eq_e f g then g5_eq_e x y else false | _ -> false)
+  | EBin5 o x y _ -> (case b of | EBin5 p u v _ -> if o == p then (if g5_eq_e x u then g5_eq_e y v else false) else false | _ -> false)
+  | EIf5 c t e _ -> (case b of | EIf5 c2 t2 e2 _ -> if g5_eq_e c c2 then (if g5_eq_e t t2 then g5_eq_e e e2 else false) else false | _ -> false)
+  | ECase5 s brs _ -> (case b of | ECase5 s2 brs2 _ -> if g5_eq_e s s2 then g5_eq_brs brs brs2 else false | _ -> false)
+  | ELet5 r n x y _ -> (case b of | ELet5 r2 n2 x2 y2 _ -> if r == r2 then (if n == n2 then (if g5_eq_e x x2 then g5_eq_e y y2 else false) else false) else false | _ -> false)
+  | ETup5 xs _ -> (case b of | ETup5 ys _ -> g5_eq_es xs ys | _ -> false)
+  | EAnn5 x t _ -> (case b of | EAnn5 y u _ -> if g5_eq_e x y then g5_eq_ty t u else false | _ -> false)
+  | ERec5 fx _ -> (case b of | ERec5 fy _ -> g5_eq_fields_e fx fy | _ -> false)
+  | EProj5 x lb _ -> (case b of | EProj5 y lb2 _ -> if lb == lb2 then g5_eq_e x y else false | _ -> false)
+  | EWith5 x lb y _ -> (case b of | EWith5 x2 lb2 y2 _ -> if lb == lb2 then (if g5_eq_e x x2 then g5_eq_e y y2 else false) else false | _ -> false)
+  | EHole5 x _ -> (case b of | EHole5 y _ -> x == y | _ -> false)
+
+and g5_eq_es xs ys = case xs of
+    [] -> (case ys of | [] -> true | _ -> false)
+  | x :: xr -> (case ys of | [] -> false | y :: yr -> if g5_eq_e x y then g5_eq_es xr yr else false)
+
+and g5_eq_brs xs ys = case xs of
+    [] -> (case ys of | [] -> true | _ -> false)
+  | br :: xr -> case br of
+      | (p, e) -> case ys of
+          | [] -> false
+          | br2 :: yr -> case br2 of
+              | (q, f) -> if g5_eq_pat p q then (if g5_eq_e e f then g5_eq_brs xr yr else false) else false
+
+and g5_eq_fields_e fx fy = case fx of
+    [] -> (case fy of | [] -> true | _ -> false)
+  | kv :: rest -> case kv of
+      | (lb, e) -> case fy of
+          | [] -> false
+          | kv2 :: rest2 -> case kv2 of
+              | (lb2, e2) -> if lb == lb2 then (if g5_eq_e e e2 then g5_eq_fields_e rest rest2 else false) else false
+
+-- ---------- small string/UTF-8 helpers ----------
+
+-- lexicographic byte compare: -1 | 0 | 1
+let rec g5_strcmp a b i =
+  let ca = string_get a i in
+  let cb = string_get b i in
+  if ca == -1 then (if cb == -1 then 0 else 0 - 1)
+  else if cb == -1 then 1
+  else if ca < cb then 0 - 1
+  else if ca > cb then 1
+  else g5_strcmp a b (i + 1)
+
+let g5_str_lt a b = g5_strcmp a b 0 == (0 - 1)
+
+-- insertion sort for (label, value) lists by label bytes
+let rec g5_insert_sorted kv acc = case kv of
+  | (lb, v) -> case acc of
+      | [] -> [kv]
+      | kv2 :: rest -> case kv2 of
+          | (lb2, _) -> if g5_str_lt lb lb2 then kv :: acc else kv2 :: g5_insert_sorted kv rest
+
+let rec g5_sort_fields flds acc = case flds of
+    [] -> acc
+  | kv :: rest -> g5_sort_fields rest (g5_insert_sorted kv acc)
+
+-- duplicate label check on sorted fields; "" = ok else offending label
+let rec g5_dup_label flds = case flds of
+    [] -> ""
+  | kv :: rest -> case kv of
+      | (lb, _) -> case rest of
+          | [] -> ""
+          | kv2 :: _ -> case kv2 of
+              | (lb2, _) -> if lb == lb2 then lb else g5_dup_label rest
+
+-- UTF-8 char length of a byte range [s, e)
+let rec g5_char_len src i e acc =
+  if i >= e then acc
+  else
+    let c = string_get src i in
+    if c == -1 then acc
+    else if c < 128 then g5_char_len src (i + 1) e (acc + 1)
+    else if c >= 192 then g5_char_len src (i + 1) e (acc + 1)
+    else g5_char_len src (i + 1) e acc
+
+-- byte offset -> (line, col); col counts Unicode scalars, 1-based
+let rec g5_off_lc src i off line line_start =
+  if i >= off then (line, g5_char_len src line_start i 0 + 1)
+  else
+    let c = string_get src i in
+    if c == -1 then (line, g5_char_len src line_start i 0 + 1)
+    else if c == 10 then g5_off_lc src (i + 1) off (line + 1) (i + 1)
+    else g5_off_lc src (i + 1) off line line_start
+
+-- (line, col) 1-based chars -> byte offset (clamped to line end)
+let rec g5_lc_off_line src i line = if line <= 1 then i else
+  let c = string_get src i in
+  if c == -1 then i
+  else if c == 10 then g5_lc_off_line src (i + 1) (line - 1)
+  else g5_lc_off_line src (i + 1) line
+
+let rec g5_lc_off_col src i col acc =
+  if acc >= col then i
+  else
+    let c = string_get src i in
+    if c == -1 then i
+    else if c == 10 then i
+    else if c < 128 then g5_lc_off_col src (i + 1) col (acc + 1)
+    else if c >= 192 then g5_lc_off_col src (i + 1) col (acc + 1)
+    else g5_lc_off_col src (i + 1) col acc
+
+let g5_lc_off src line col =
+  if line <= 0 then 0
+  else if col <= 0 then 0
+  else
+    let ls = g5_lc_off_line src 0 line in
+    g5_lc_off_col src ls col 1
