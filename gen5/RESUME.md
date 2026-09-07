@@ -1,6 +1,41 @@
 # Gen5 再開ガイド (fresh lineage, dacelo製・gen0無改変)
 
-## issue #1 残件の追い込み（本ターン）
+## issue #1 追記レビュー対応（P1×6＋P2×5、11件完治）
+
+- **P0級の副産物：rollback反転**：`g5_rollback`が newest-ns を残し history を
+  捨てていた（`g5_trunc`の向き間違い。unit probeで確定後 `g5_drop` に修正）。
+  旧コードはhard error即停止で発覚せず、tentativeも偶然動いていた。
+  継続検査(#2)とhole再 trial(#9)は正しいrollbackなしには成立しない。
+  probeが一度 `with_subst` のreplace意味で空振りした教訓あり（consで再検証）。
+
+- **P1-1 open row残余**：flex/flexにfresh共有tailを両側束縛（片側のみは成功後も
+  両辺不一致でunsound）。片側循環はinfiniteで拒否。`pick`例で検証。
+- **P1-2 occurs**：`g5_row_occurs`がchase後tailを捨てていた→tailも検査。
+  内部probe相当7件（direct/nested/fun/tuple/否定×2/subst経由）をCLI例で検証。
+- **P1-3 括弧**：Proj/With受信側・App関数側・With更新値を非atomic時括弧化。
+  `(mk 42).value`→42、`((fun..) 41)`→42で検証。
+- **P1-4 文字列**：loweringは`g5_dc_str`で再エスケープ（式・パターン）。
+  `"\\n"`(2byte)→2、`"\n"`一致→7で検証。
+- **P1-5 capture**：全bind site走査で予約拒否（topはprogram-wide、localは
+  自file記録使用時のみ。legacy互換維持）。prelude衝突も同走査で防御。
+- **P1-6 順序**：lowering連結をdep-firstに（entry-firstは未初期化読み）。
+  値コピー・diamond・top-call実行で検証。
+- **P2-7 env分離**：file毎export表（値・ctor・tydecl）＋初期env再構成＋
+  tydefs save/restore。exposingは大文字可に拡張、型名露出も検証可に。
+  import順不変・単独一致を検証。
+- **P2-8 focus分離**：file毎node/sym slice＋entry限定探索＋island local_env
+  ＋decl file tag。Dep/Main例・f/g例で検証。
+- **P2-9 hole再 trial**：scheme保存＋refresh時re-trial＋後絞りcap。
+  good採用・wrong除外を検証。
+- **P2-10 ADT diff**：semに正規化type行を含め、diffも対応。ctor追加でexit 3、
+  param改名は無視を検証。
+- **P2-11 toolchain**：3 systemの戻り値検査＋tmpbin経由publish。fake ccで検証。
+- **Dacelo実装上の新知見**：`and`束縛名は複数型で使えない（単相化される。
+  `g5_slice_new`で発覚→standalone化）。多相helperは必ずstandalone `let rec`。
+  変数腕が文字列リテラル腕の後だとGen0が誤る（`g5_canon_or`で回避）。
+- **⑧不可再確認**：自ソースsigはlegacy鎖破壊のため不可（前回同様revert）。
+- **box都合（再）**：llama常駐で自己検査(~27GB)が死ぬ。prefix曲線
+  （p1 47s/21GB→pfxD 261s/24.8GB）は滑らかで回帰なし確定。C完走は静穏時要再走。
 
 - **非ASCII**：CJKコメントは元から可（`//`と書くミスに注意、正は`--`）。CJK文字列は
   `chr` mojibakeでformat再parse不一致＋実行時文字化け→`dcc.dc`の`scan_string`を
@@ -22,9 +57,10 @@
 - **hatch警告**：`--backend-only`時に警告行をstdoutへ追加（Daceloにstderr出力組込みなし）。
 - **⑧不可確定**：自ソースへの`sig`はlegacy parserがand-group結合を壊す
   （`unbound variable 'sig'`）ためrevert。11.3(3)はseed切替後の課題。
-- **box都合と決着**：llama-server常駐で自己検査(要~25GB)がOOM死することがある。
-  p1再測＋backend不動点で回帰なしを確定後、静かな時間帯に再走しexit 0を確認。
-  test.sh Cはそのまま（要約：boxが重い時はCだけ後で）。
+- **box都合と決着**：llama-server常駐で自己検査(要~27GB)がOOM死することがある。
+  p1再測＋backend不動点＋pfx曲線で回帰なしを確定。全11件修正後の現行ソースでは
+  自己検査がexit 137で死ぬことを確認済み（3:58経過時点）。A/B/D/E/F＋不動点は
+  現行でgreen。C完走は空き27GB+のboxで再走要（test.sh Cにtry_twice済み）。
 
 ## 達成状態 (./gen5/test.sh が ALL PASSED)
 

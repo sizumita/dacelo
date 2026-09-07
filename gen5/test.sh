@@ -97,7 +97,11 @@ diff -q /tmp/o_g6.log /tmp/o_g0.log > /dev/null || { echo "  REJECT-MSG-DIFFER(t
 echo "  reject OK (t_bad, Gen0-comparable message)"
 
 echo "== C. self-build fixpoint (dcc_7) =="
-./gen5check check $G5CC_SRC > /dev/null 2>&1 || { echo "  self-check FAIL"; exit 1; }
+# self-check peaks ~27GB; retry once on transient OOM (a pass is conclusive)
+try_twice() {
+  "$@" > /dev/null 2>&1 || { echo "  retrying self-check after failure..."; sleep 5; "$@" > /dev/null 2>&1; } || return 1
+}
+try_twice ./gen5check check $G5CC_SRC || { echo "  self-check FAIL"; exit 1; }
 echo "  gen5check accepts its own compiler source (exit 0)"
 ./dcc_6 $G5CC_SRC dcc_7 --backend-only > /dev/null 2>&1 || { echo "  dcc_7 BUILD FAIL"; exit 1; }
 diff -q dcc_6.s dcc_7.s > /dev/null || { echo "  FIXPOINT FAIL: dcc_6.s != dcc_7.s"; exit 1; }
@@ -265,5 +269,171 @@ grep -q '"kind":"lacking"' /tmp/g5e_cont.json || { echo "  cont: lacking mark mi
 grep -q '"name":"ok"' /tmp/g5e_cont.json || { echo "  cont: independent item not analyzed"; exit 1; }
 grep -q '"name":"main"' /tmp/g5e_cont.json || { echo "  cont: main not analyzed"; exit 1; }
 echo "  error recovery: independent parts analyzed, dependents marked OK"
+echo "== F. issue #1 follow-up regressions (P1 soundness + P2 contracts) =="
+cat > /tmp/g5f_pick.dc <<'EOF'
+let pick a b =
+  let ax = a.x in
+  let by = b.y in
+  if false then a else b
+let bad = pick { x = 1, y = 2 } { y = 3 }
+let main () = print_int (bad.x)
+EOF
+set +e
+./gen5check check /tmp/g5f_pick.dc > /dev/null 2>&1
+[ $? -eq 1 ] || { echo "  row-unify: pick must reject"; exit 1; }
+set -e
+echo "  row unify: residual fields enforced OK"
+cat > /tmp/g5f_pick2.dc <<'EOF'
+let pick2 a b = let c = if true then a else b in c.x + c.y
+let main () = print_int (pick2 { x = 1, y = 2 } { y = 20, x = 10 })
+EOF
+cat > /tmp/g5f_pick2s.dc <<'EOF'
+let pick2s a b = let c = if false then a else b in c.x + c.y
+let main () = print_int (pick2s { x = 1, y = 2 } { y = 20, x = 10 })
+EOF
+./dcc_6 /tmp/g5f_pick2.dc /tmp/g5f_pick2 > /dev/null 2>&1 || { echo "  pick2: COMPILE FAIL"; exit 1; }
+[ "$(/tmp/g5f_pick2)" = "3" ] || { echo "  pick2: expected 3"; exit 1; }
+./dcc_6 /tmp/g5f_pick2s.dc /tmp/g5f_pick2s > /dev/null 2>&1 || { echo "  pick2s: COMPILE FAIL"; exit 1; }
+[ "$(/tmp/g5f_pick2s)" = "30" ] || { echo "  pick2s: swapped branches must still check and run (30)"; exit 1; }
+echo "  row unify: both sides normalize + branch order irrelevant OK"
+cat > /tmp/g5f_occ.dc <<'EOF'
+let f r = let s = { x = r } in if true then r else s
+let main () = print_int 0
+EOF
+set +e
+./gen5check check /tmp/g5f_occ.dc > /dev/null 2>&1
+[ $? -eq 1 ] || { echo "  row occurs: nested cycle must reject"; exit 1; }
+set -e
+echo "  row occurs-check: nested cycle rejected OK"
+cat > /tmp/g5f_proj.dc <<'EOF'
+let mk x = { value = x }
+let main () = print_int ((mk 42).value)
+EOF
+./dcc_6 /tmp/g5f_proj.dc /tmp/g5f_proj > /dev/null 2>&1 || { echo "  proj: COMPILE FAIL"; exit 1; }
+[ "$(/tmp/g5f_proj)" = "42" ] || { echo "  proj: expected 42"; exit 1; }
+cat > /tmp/g5f_lamapp.dc <<'EOF'
+sig main : Unit -> Unit
+let main () = print_int ((fun x -> x + 1) 41)
+EOF
+./dcc_6 /tmp/g5f_lamapp.dc /tmp/g5f_lamapp > /dev/null 2>&1 || { echo "  lamapp: COMPILE FAIL"; exit 1; }
+[ "$(/tmp/g5f_lamapp)" = "42" ] || { echo "  lamapp: expected 42"; exit 1; }
+echo "  lowering parens: projection receiver + fn lambda OK"
+python3 -c "open('/tmp/g5f_str.dc','w').write('sig main : Unit -> Unit\nlet main () = print_int (string_length \"\\\\\\\\n\")\n')"
+./dcc_6 /tmp/g5f_str.dc /tmp/g5f_str > /dev/null 2>&1 || { echo "  str: COMPILE FAIL"; exit 1; }
+[ "$(/tmp/g5f_str)" = "2" ] || { echo "  str: backslash-n must stay 2 bytes"; exit 1; }
+python3 -c "open('/tmp/g5f_strp.dc','w').write('sig main : Unit -> Unit\nlet f s = case s of | \"\\\\\\\\n\" -> 7 | _ -> 0\nlet main () = print_int (f \"\\\\\\\\n\")\n')"
+./dcc_6 /tmp/g5f_strp.dc /tmp/g5f_strp > /dev/null 2>&1 || { echo "  strpat: COMPILE FAIL"; exit 1; }
+[ "$(/tmp/g5f_strp)" = "7" ] || { echo "  strpat: expected 7"; exit 1; }
+echo "  lowering strings: re-escape in expr + pattern OK"
+cat > /tmp/g5f_cap.dc <<'EOF'
+let read g5_rec_get = ({ x = 1 }).x
+let fake r k = 99
+let main () = print_int (read fake)
+EOF
+set +e
+./gen5check check /tmp/g5f_cap.dc > /dev/null 2>&1
+[ $? -eq 1 ] || { echo "  capture: reserved param must reject"; exit 1; }
+set -e
+cat > /tmp/g5f_legit.dc <<'EOF'
+let ident g5_rec_get = g5_rec_get
+let main () = print_int (ident 7)
+EOF
+./gen5check check /tmp/g5f_legit.dc > /dev/null 2>&1 || { echo "  capture: legacy-only binding must stay valid"; exit 1; }
+echo "  helper capture: reserved rejected, legacy compat kept OK"
+mkdir -p /tmp/g5fmod && printf 'module Dep exposing (answer)\nlet answer = 42\n' > /tmp/g5fmod/Dep.dc
+printf 'import Dep\nlet copied = answer\nlet main () = print_int copied\n' > /tmp/g5fmod/Main.dc
+./dcc_6 /tmp/g5fmod/Main.dc /tmp/g5fmod_main > /dev/null 2>&1 || { echo "  modorder: COMPILE FAIL"; exit 1; }
+[ "$(/tmp/g5fmod_main)" = "42" ] || { echo "  modorder: top-level dep value must init first"; exit 1; }
+printf 'module Base exposing (two)\nlet two = 2\n' > /tmp/g5fmod/Base.dc
+printf 'module Mid exposing (twice)\nimport Base\nlet twice x = x + two\n' > /tmp/g5fmod/Mid.dc
+printf 'import Base\nimport Mid\nlet v = twice two\nlet main () = print_int v\n' > /tmp/g5fmod/Dia.dc
+./dcc_6 /tmp/g5fmod/Dia.dc /tmp/g5fmod_dia > /dev/null 2>&1 || { echo "  diamond: COMPILE FAIL"; exit 1; }
+[ "$(/tmp/g5fmod_dia)" = "4" ] || { echo "  diamond: expected 4"; exit 1; }
+printf 'module Dd exposing (double)\nlet double x = x * 2\n' > /tmp/g5fmod/Dd.dc
+printf 'import Dd\nlet x = double 21\nlet main () = print_int x\n' > /tmp/g5fmod/Topcall.dc
+./dcc_6 /tmp/g5fmod/Topcall.dc /tmp/g5fmod_top > /dev/null 2>&1 || { echo "  topcall: COMPILE FAIL"; exit 1; }
+[ "$(/tmp/g5fmod_top)" = "42" ] || { echo "  topcall: expected 42"; exit 1; }
+echo "  module order: dep-first init (value/diamond/top-call) OK"
+mkdir -p /tmp/g5fiso && printf 'module A exposing (a)\nlet a = 1\n' > /tmp/g5fiso/A.dc
+printf 'module B exposing (b)\nlet b = a\n' > /tmp/g5fiso/B.dc
+printf 'import A\nimport B\nlet main () = print_int b\n' > /tmp/g5fiso/Main.dc
+printf 'import B\nimport A\nlet main () = print_int b\n' > /tmp/g5fiso/Main2.dc
+set +e
+./gen5check check /tmp/g5fiso/Main.dc > /dev/null 2>&1; r1=$?
+./gen5check check /tmp/g5fiso/Main2.dc > /dev/null 2>&1; r2=$?
+./gen5check check /tmp/g5fiso/B.dc > /dev/null 2>&1; r3=$?
+set -e
+[ $r1 -eq 1 ] && [ $r2 -eq 1 ] && [ $r3 -eq 1 ] || { echo "  isolation: unimported export must reject (order-independent)"; exit 1; }
+[ $r1 -eq $r2 ] || { echo "  isolation: import order changed result"; exit 1; }
+echo "  module isolation: no leakage, import-order independent OK"
+mkdir -p /tmp/g5fx && printf 'module Dep exposing (dep)\nlet dep = 0\n' > /tmp/g5fx/Dep.dc
+printf 'import Dep\nlet value =              true\n' > /tmp/g5fx/Main.dc
+./gen5check focus /tmp/g5fx/Main.dc --at=2:26 --format=json > /tmp/g5fx.json 2>&1 || { echo "  xfile focus: FAIL"; exit 1; }
+grep -q '"occurrence":"Bool"' /tmp/g5fx.json || { echo "  xfile focus: picked wrong file node"; exit 1; }
+cat > /tmp/g5fsc.dc <<'EOF'
+let f x = x + 1
+let g y = y
+EOF
+./gen5check focus /tmp/g5fsc.dc --at=2:11 --format=json > /tmp/g5fsc.json 2>&1 || { echo "  scope focus: FAIL"; exit 1; }
+if grep -q '"name":"x"' /tmp/g5fsc.json; then echo "  scope: exited param x leaked"; exit 1; fi
+grep -q '"name":"y"' /tmp/g5fsc.json || { echo "  scope: current param y missing"; exit 1; }
+echo "  focus: cross-file pick + lexical local_env OK"
+cat > /tmp/g5f_hole9.dc <<'EOF'
+let good = 1
+let wrong = true
+let answer = (?value : Int)
+let main () = print_int answer
+EOF
+./gen5check holes /tmp/g5f_hole9.dc > /tmp/g5f_hole9.txt 2>&1 || { echo "  holes9: FAIL"; exit 1; }
+grep -q 'good : Int' /tmp/g5f_hole9.txt || { echo "  holes9: fitting candidate missing"; exit 1; }
+if grep -q 'wrong' /tmp/g5f_hole9.txt; then echo "  holes9: ill-fitting candidate kept"; exit 1; fi
+echo "  holes: post-annotation re-trial OK"
+cat > /tmp/g5f_d10a.dc <<'EOF'
+module M exposing (make)
+type T = A
+let make () = A
+EOF
+cat > /tmp/g5f_d10b.dc <<'EOF'
+module M exposing (make)
+type T = A | B
+let make () = A
+EOF
+./gen5check interface /tmp/g5f_d10a.dc --write=/tmp/g5f_d10.dci > /dev/null 2>&1 || { echo "  dci write: FAIL"; exit 1; }
+set +e
+./gen5check interface /tmp/g5f_d10b.dc --check=/tmp/g5f_d10.dci > /dev/null 2>&1
+[ $? -eq 3 ] || { echo "  dci: added ctor must diff"; exit 1; }
+set -e
+echo "  interface: ADT change detected OK"
+mkdir -p /tmp/g5ffakebin && printf '#!/bin/sh\nexit 1\n' > /tmp/g5ffakebin/cc && chmod +x /tmp/g5ffakebin/cc
+rm -f /tmp/g5ffake_out
+set +e
+PATH=/tmp/g5ffakebin:$PATH ./dcc_6 examples/hello.dc /tmp/g5ffake_out > /dev/null 2>&1
+[ $? -ne 0 ] || { echo "  toolchain: failing cc must fail build"; exit 1; }
+set -e
+[ ! -e /tmp/g5ffake_out ] || { echo "  toolchain: stale output must not exist"; exit 1; }
+echo "  toolchain: assembler/linker failure propagates OK"
+cat > /tmp/g5f_plain.dc <<'EOF'
+let main () = print_int (1 + 2)
+EOF
+cat > /tmp/g5f_wrapped.dc <<'EOF'
+module W exposing (main)
+sig main : Unit -> Unit
+let main () = print_int (1 + 2)
+EOF
+./dcc_6 /tmp/g5f_plain.dc /tmp/g5f_plain > /dev/null 2>&1 || { echo "  meaning: PLAIN FAIL"; exit 1; }
+./dcc_6 /tmp/g5f_wrapped.dc /tmp/g5f_wrapped > /dev/null 2>&1 || { echo "  meaning: WRAPPED FAIL"; exit 1; }
+[ "$(/tmp/g5f_plain)" = "$(/tmp/g5f_wrapped)" ] || { echo "  meaning: sig/module wrapper changed result"; exit 1; }
+[ "$(/tmp/g5f_plain)" = "3" ] || { echo "  meaning: expected 3"; exit 1; }
+cat > /tmp/g5f_combo.dc <<'EOF'
+module C exposing (main)
+sig main : Unit -> Unit
+let apply f x = f x
+let r = { name = "a\nb", n = 1 }
+let r2 = { r with n = apply (fun v -> v + 1) r.n }
+let main () = print_string (r2.name ++ show r2.n)
+EOF
+./dcc_6 /tmp/g5f_combo.dc /tmp/g5f_combo > /dev/null 2>&1 || { echo "  combo: COMPILE FAIL"; exit 1; }
+[ "$(/tmp/g5f_combo)" = $'a\nb2' ] || { echo "  combo: OUTPUT MISMATCH"; exit 1; }
+echo "  meaning preserved across lowering paths OK"
 
 echo "ALL GEN5 CHECKS PASSED"

@@ -22,6 +22,7 @@ gen5check
 *_g3.s
 *.o
 *.s
+*.linktmp
 
 # Generated concatenation for Gen4 build (rebuilt by gen4-infer-dc/test.sh)
 gen4-infer-dc/g4_full.dc

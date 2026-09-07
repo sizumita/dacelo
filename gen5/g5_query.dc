@@ -170,19 +170,20 @@ let g5_scheme_json s sch = case sch of
 
 -- ---------- query context (assembled by driver from check results) ----------
 
-type QCtx5 = QCtx5 String Snap5 (List ItemSum5) (List NodeE5) (List SymE5) (List HoleE5) (List Warn5) (List Diag5) String String TIS5
+type QCtx5 = QCtx5 String Snap5 (List ItemSum5) (List NodeE5) (List SymE5) (List HoleE5) (List Warn5) (List Diag5) String String TIS5 (List (String, List (String, Sch5), List TyDecl5, List NodeE5, List SymE5))
 
-let q_src q = case q of | QCtx5 a _ _ _ _ _ _ _ _ _ _ -> a
-let q_snap q = case q of | QCtx5 _ a _ _ _ _ _ _ _ _ _ -> a
-let q_sums q = case q of | QCtx5 _ _ a _ _ _ _ _ _ _ _ -> a
-let q_nodes q = case q of | QCtx5 _ _ _ a _ _ _ _ _ _ _ -> a
-let q_syms q = case q of | QCtx5 _ _ _ _ a _ _ _ _ _ _ -> a
-let q_holes q = case q of | QCtx5 _ _ _ _ _ a _ _ _ _ _ -> a
-let q_warns q = case q of | QCtx5 _ _ _ _ _ _ a _ _ _ _ -> a
-let q_diags q = case q of | QCtx5 _ _ _ _ _ _ _ a _ _ _ -> a
-let q_status q = case q of | QCtx5 _ _ _ _ _ _ _ _ a _ _ -> a
-let q_errmsg q = case q of | QCtx5 _ _ _ _ _ _ _ _ _ a _ -> a
-let q_state q = case q of | QCtx5 _ _ _ _ _ _ _ _ _ _ a -> a
+let q_src q = case q of | QCtx5 a _ _ _ _ _ _ _ _ _ _ _ -> a
+let q_snap q = case q of | QCtx5 _ a _ _ _ _ _ _ _ _ _ _ -> a
+let q_sums q = case q of | QCtx5 _ _ a _ _ _ _ _ _ _ _ _ -> a
+let q_nodes q = case q of | QCtx5 _ _ _ a _ _ _ _ _ _ _ _ -> a
+let q_syms q = case q of | QCtx5 _ _ _ _ a _ _ _ _ _ _ _ -> a
+let q_holes q = case q of | QCtx5 _ _ _ _ _ a _ _ _ _ _ _ -> a
+let q_warns q = case q of | QCtx5 _ _ _ _ _ _ a _ _ _ _ _ -> a
+let q_diags q = case q of | QCtx5 _ _ _ _ _ _ _ a _ _ _ _ -> a
+let q_status q = case q of | QCtx5 _ _ _ _ _ _ _ _ a _ _ _ -> a
+let q_errmsg q = case q of | QCtx5 _ _ _ _ _ _ _ _ _ a _ _ -> a
+let q_state q = case q of | QCtx5 _ _ _ _ _ _ _ _ _ _ a _ -> a
+let q_tabs q = case q of | QCtx5 _ _ _ _ _ _ _ _ _ _ _ a -> a
 
 -- ---------- envelope with byte budget (two-tier truncation) ----------
 
@@ -224,22 +225,59 @@ let rec g5_sym_get syms id = case syms of
 
 -- ---------- focus ----------
 
-let rec g5_local_env syms noff acc n = case syms of
+-- Lexical local env: top-level names are always visible; other syms only
+-- if declared inside the top-level item enclosing the query offset (scope
+-- islands). "Declared before" alone is NOT visibility (issue #1-8).
+let rec g5_span_file_json sp file =
+  case sp of
+    | Span a b -> "{\"start\":" ++ int_to_string a ++ ",\"end\":" ++ int_to_string b ++ ",\"file\":" ++ g5_json_str file ++ "}"
+
+let rec g5_local_env syms noff tops defs file acc n = case syms of
     [] -> acc
   | sy :: rest ->
       if n == 0 then acc
       else case sy of
         | SymE5 _ nm dsp _ sch ->
-            case dsp of
+            if g5_mem_str_nm nm tops then g5_local_env rest noff tops defs file ((nm, sch, dsp, file) :: acc) (n - 1)
+            else case dsp of
               | Span a _ ->
-                  if a <= noff then g5_local_env rest noff ((nm, sch, dsp) :: acc) (n - 1)
-                  else g5_local_env rest noff acc n
+                  if a <= noff then
+                    if g5_in_enclosing dsp defs noff then g5_local_env rest noff tops defs file ((nm, sch, dsp, file) :: acc) (n - 1)
+                    else g5_local_env rest noff tops defs file acc n
+                  else g5_local_env rest noff tops defs file acc n
+
+and g5_in_enclosing dsp defs noff = case dsp of
+  | Span x y -> case defs of
+      | [] -> false
+      | d :: rest -> case d of
+          | Span a b ->
+              if a <= noff then (if noff < b then (if a <= x then (if y <= b then true else g5_in_enclosing dsp rest noff) else g5_in_enclosing dsp rest noff) else g5_in_enclosing dsp rest noff)
+              else g5_in_enclosing dsp rest noff
+
+and g5_tops_of_sums sums acc = case sums of
+    [] -> acc
+  | it :: rest -> case it of
+      | ItemSum5 _ _ binds _ _ -> g5_tops_of_sums rest (g5_tops_of_binds binds acc)
+
+and g5_tops_of_binds binds acc = case binds of
+    [] -> acc
+  | b :: rest -> case b of
+      | BindTy5 nm _ _ _ _ -> g5_tops_of_binds rest (nm :: acc)
+
+and g5_defspans_of_sums sums acc = case sums of
+    [] -> acc
+  | it :: rest -> case it of
+      | ItemSum5 _ sp _ _ _ -> g5_defspans_of_sums rest (sp :: acc)
+
+and g5_mem_str_nm x xs = case xs of
+    [] -> false
+  | h :: rest -> if h == x then true else g5_mem_str_nm x rest
 
 let rec g5_local_json s envs = case envs of
     [] -> ""
   | kv :: rest -> case kv of
-      | (nm, sch, dsp) ->
-          let here = "{\"name\":" ++ g5_json_str nm ++ ",\"scheme\":" ++ g5_json_str (g5_scheme_text s sch) ++ ",\"decl\":" ++ g5_span_json dsp ++ "}" in
+      | (nm, sch, dsp, file) ->
+          let here = "{\"name\":" ++ g5_json_str nm ++ ",\"scheme\":" ++ g5_json_str (g5_scheme_text s sch) ++ ",\"decl\":" ++ g5_span_file_json dsp file ++ "}" in
           case rest of
             | [] -> here
             | _ -> here ++ "," ++ g5_local_json s rest
@@ -276,14 +314,35 @@ let g5_drop_brace s = substring s 1 (string_length s - 2)
 let g5_snap_wrap q inner =
   "{\"snapshot\":" ++ g5_snap_json (q_snap q) ++ ",\"status\":" ++ g5_json_str (q_status q) ++ "," ++ g5_drop_brace inner ++ "}"
 
-let g5_binding_json q symid sch =
+let rec g5_binding_json q symid sch =
   if symid == (0 - 1) then "null"
-  else
-    let sy = g5_sym_get (q_syms q) symid in
-    case sy of
-      | SymE5 _ nm dsp _ ssch ->
-          let sch2 = g5_pick_sch sch ssch in
-          "{\"id\":" ++ int_to_string symid ++ ",\"name\":" ++ g5_json_str nm ++ ",\"decl\":" ++ g5_span_json dsp ++ ",\"scheme\":" ++ g5_json_str (g5_scheme_text (q_state q) sch2) ++ "}"
+  else case g5_sym_get (q_syms q) symid of
+    | SymE5 _ _ _ _ _ ->
+        let (nm, dsp, ssch, bfile) = g5_binding_of q symid in
+        let sch2 = g5_pick_sch sch ssch in
+        "{\"id\":" ++ int_to_string symid ++ ",\"name\":" ++ g5_json_str nm ++ ",\"decl\":" ++ g5_span_file_json dsp bfile ++ ",\"scheme\":" ++ g5_json_str (g5_scheme_text (q_state q) sch2) ++ "}"
+    | _ -> "null"
+
+and g5_entry_file q = case q_snap q of
+  | Snap5 file _ _ _ _ _ -> file
+
+-- (name, decl-span, scheme, file): entry syms first, then dep stores.
+-- Numeric spans collide across files, so dep syms are only consulted by
+-- table lookup, never merged into the searched lists. Misses fall back to
+-- ("", dummy) so callers can still render; symid -1 never reaches here.
+and g5_binding_of q symid =
+  case g5_sym_get (q_syms q) symid of
+    | SymE5 i nm dsp _ ssch ->
+        if i == symid then (nm, dsp, ssch, g5_entry_file q)
+        else g5_binding_in_tabs (q_tabs q) symid
+
+and g5_binding_in_tabs tabs symid = case tabs of
+    [] -> ("", span_dummy, g5_null_sch, "")
+  | e :: rest -> case e of
+      | (p, _, _, _, sys) -> case g5_sym_get sys symid of
+          | SymE5 i nm dsp _ ssch ->
+              if i == symid then (nm, dsp, ssch, p)
+              else g5_binding_in_tabs rest symid
 
 -- smallest strict super-span node (RFC 6.2 containing context, e.g. app result)
 let rec g5_parent_best nodes ca cb best bestw = case nodes of
@@ -326,7 +385,7 @@ let g5_focus_json q off maxb =
       | NodeE5 _ sp ty symid sch inst exp reason ->
           let s = q_state q in
           let bjson = g5_binding_json q symid sch in
-          let locs = g5_local_env (q_syms q) (span_start sp) [] 12 in
+          let locs = g5_local_env (q_syms q) (span_start sp) (g5_tops_of_sums (q_sums q) []) (g5_defspans_of_sums (q_sums q) []) (g5_entry_file q) [] 12 in
           let cjson = g5_parent_json q nid sp in
           let full = "{\"found\":true,\"node\":" ++ int_to_string nid ++ ",\"span\":" ++ g5_span_json sp ++ ",\"occurrence\":" ++ g5_json_str (g5_show s ty) ++ ",\"binding\":" ++ bjson ++ ",\"instantiation\":[" ++ g5_inst_json s sch inst ++ "],\"expected\":" ++ g5_maybe_ty_json s exp ++ ",\"reason\":" ++ g5_json_str reason ++ ",\"containing\":" ++ cjson ++ ",\"local_env\":[" ++ g5_local_json s locs ++ "]}" in
           let reduced = "{\"found\":true,\"node\":" ++ int_to_string nid ++ ",\"span\":" ++ g5_span_json sp ++ ",\"occurrence\":" ++ g5_json_str (g5_show s ty) ++ ",\"binding\":" ++ bjson ++ "}" in
@@ -385,7 +444,7 @@ let rec g5_holes_json s holes = case holes of
 and g5_cands_json s cands = case cands of
     [] -> ""
   | kv :: rest -> case kv of
-      | (nm, ty, dsp) ->
+      | (nm, _, ty, dsp) ->
           let here = "{\"name\":" ++ g5_json_str nm ++ ",\"type\":" ++ g5_json_str (g5_show s ty) ++ ",\"decl\":" ++ g5_span_json dsp ++ "}" in
           case rest of
             | [] -> here
@@ -567,20 +626,31 @@ let g5_types_json q maxb =
 -- ---------- interface (.dci text) + diff ----------
 
 -- public binds: exposed names (or all if NoMod5), checked status only
-let rec g5_public_binds sums all_pub exps acc = case sums of
+let rec g5_public_binds sums all_pub exps ctors acc = case sums of
     [] -> rev_acc [] acc
   | it :: rest -> case it of
-      | ItemSum5 _ _ binds _ _ -> g5_public_binds rest all_pub exps (g5_pub_binds binds all_pub exps acc)
+      | ItemSum5 _ _ binds _ _ -> g5_public_binds rest all_pub exps ctors (g5_pub_binds binds all_pub exps ctors acc)
 
-and g5_pub_binds binds all_pub exps acc = case binds of
+and g5_pub_binds binds all_pub exps ctors acc = case binds of
     [] -> acc
   | b :: rest -> case b of
       | BindTy5 nm sp sch st sg ->
           if st == "checked" then
-            if all_pub then g5_pub_binds rest all_pub exps ((nm, sp, sch, sg) :: acc)
-            else if g5_mem_str2 nm exps then g5_pub_binds rest all_pub exps ((nm, sp, sch, sg) :: acc)
-            else g5_pub_binds rest all_pub exps acc
-          else g5_pub_binds rest all_pub exps acc
+            if g5_mem_str2 nm ctors then g5_pub_binds rest all_pub exps ctors acc
+            else if all_pub then g5_pub_binds rest all_pub exps ctors ((nm, sp, sch, sg) :: acc)
+            else if g5_mem_str2 nm exps then g5_pub_binds rest all_pub exps ctors ((nm, sp, sch, sg) :: acc)
+            else g5_pub_binds rest all_pub exps ctors acc
+          else g5_pub_binds rest all_pub exps ctors acc
+
+and g5_tydecls_ctors tyds acc = case tyds of
+    [] -> acc
+  | td :: rest -> case td of
+      | TyDecl5 _ _ cds -> g5_tydecls_ctors rest (g5_cdor_names_list cds acc)
+
+and g5_cdor_names_list cds acc = case cds of
+    [] -> acc
+  | cd :: rest -> case cd of
+      | CtorDecl5 nm _ -> g5_cdor_names_list rest (nm :: acc)
 
 and g5_mem_str2 x xs = case xs of
     [] -> false
@@ -657,9 +727,53 @@ and g5_cdors cds = case cds of
 
 let rec g5_tydecl_lines tyds = case tyds of
     [] -> ""
-  | td :: rest -> case td of
+  | td :: rest -> case g5_canon_tydecl td of
       | TyDecl5 nm ps cds ->
           "type " ++ nm ++ g5_join_sp2 ps ++ "= " ++ g5_cdors cds ++ "\n" ++ g5_tydecl_lines rest
+
+-- canonicalize type-var/row names (a,b,.. / r,r1,.. by appearance) so
+-- renaming-only edits do not change the published interface (§5.2, #1-10)
+and g5_canon_tydecl td = case td of
+  | TyDecl5 nm ps cds -> TyDecl5 nm (g5_canon_ps ps 0 []) (g5_canon_cds cds ps)
+
+and g5_canon_ps ps i acc = case ps of
+    [] -> rev_acc [] acc
+  | _ :: rest -> g5_canon_ps rest (i + 1) (g5_canon_var i :: acc)
+
+and g5_canon_var i =
+  if i < 26 then substring "abcdefghijklmnopqrstuvwxyz" i 1
+  else substring "abcdefghijklmnopqrstuvwxyz" (i % 26) 1 ++ int_to_string (i / 26)
+
+and g5_canon_cds cds ps = case cds of
+    [] -> []
+  | cd :: rest -> case cd of
+      | CtorDecl5 nm fs -> CtorDecl5 nm (g5_canon_tys fs ps 0 []) :: g5_canon_cds rest ps
+
+and g5_canon_tys ts ps i acc = case ts of
+    [] -> rev_acc [] acc
+  | t :: rest -> g5_canon_tys rest ps (i + 1) ((g5_canon_ty t ps i) :: acc)
+
+and g5_canon_ty t ps i = case t of
+  | TTVar5 n sp -> TTVar5 (g5_canon_or n (g5_canon_at ps n 0)) sp
+  | TTCon5 n args sp -> TTCon5 n (g5_canon_args args ps) sp
+  | TTArr5 a b sp -> TTArr5 (g5_canon_ty a ps i) (g5_canon_ty b ps i) sp
+  | TTTup5 ts sp -> TTTup5 (g5_canon_args ts ps) sp
+  | TTRec5 flds row sp -> TTRec5 (g5_canon_fields flds ps) row sp
+
+and g5_canon_or n m = if m == "" then n else m
+
+and g5_canon_at ps n i = case ps of
+    [] -> ""
+  | p :: rest -> if p == n then g5_canon_var i else g5_canon_at rest n (i + 1)
+
+and g5_canon_args ts ps = case ts of
+    [] -> []
+  | t :: rest -> g5_canon_ty t ps 0 :: g5_canon_args rest ps
+
+and g5_canon_fields flds ps = case flds of
+    [] -> []
+  | kv :: rest -> case kv of
+      | (lb, t) -> (lb, g5_canon_ty t ps 0) :: g5_canon_fields rest ps
 
 let rec g5_dep_lines deps = case deps of
     [] -> ""
@@ -668,9 +782,9 @@ let rec g5_dep_lines deps = case deps of
 
 let g5_interface_text q modname all_pub exps tydecls =
   let s = q_state q in
-  let pubs = g5_public_binds (q_sums q) all_pub exps [] in
+  let pubs = g5_public_binds (q_sums q) all_pub exps (g5_tydecls_ctors tydecls []) [] in
   let lines = g5_pub_lines s pubs [] in
-  let sem = g5_hex32 (g5_hash_str (g5_join_nl lines)) in
+  let sem = g5_hex32 (g5_hash_str (g5_join_nl lines ++ g5_tydecl_lines tydecls)) in
   case q_snap q of
     | Snap5 file hh len _ _ deps ->
         let head = "#dci g5-1\nmodule " ++ modname ++ "\nsrc " ++ g5_hex32 hh ++ " sem " ++ sem ++ "\n" in
@@ -701,6 +815,24 @@ and g5_dci_vals_lines lines acc = case lines of
   | h :: rest ->
       if g5_starts_with h "val " then g5_dci_vals_lines rest (h :: acc)
       else g5_dci_vals_lines rest acc
+
+and g5_dci_types_lines lines acc = case lines of
+    [] -> acc
+  | h :: rest ->
+      if g5_starts_with h "type " then g5_dci_types_lines rest (h :: acc)
+      else g5_dci_types_lines rest acc
+
+and g5_type_name line = g5_type_name_go line 5 ""
+
+and g5_type_name_go line i acc =
+  let c = string_get line i in
+  if c == -1 then acc
+  else if c == 32 then acc
+  else g5_type_name_go line (i + 1) (acc ++ substring line i 1)
+
+and g5_find_type lines nm = case lines of
+    [] -> ""
+  | h :: rest -> if g5_type_name h == nm then h else g5_find_type rest nm
 
 and g5_starts_with hay needle = g5_starts_with2 hay needle 0
 
@@ -741,8 +873,33 @@ let rec g5_diff_dci old new =
   let added = g5_added_lines vn vo in
   let removed = g5_added_lines vo vn in
   let changed = g5_changed_lines vo vn in
-  if added == [] then (if removed == [] then (if changed == [] then (true, "no public type changes") else (false, "public type specialized:\n" ++ g5_join_nl changed)) else (false, "public type removed:\n" ++ g5_join_nl removed))
-  else (false, "public type added:\n" ++ g5_join_nl added ++ (if removed == [] then "" else "\npublic type removed:\n" ++ g5_join_nl removed) ++ (if changed == [] then "" else "\npublic type specialized:\n" ++ g5_join_nl changed))
+  let dto = g5_dci_types old [] in
+  let dtn = g5_dci_types new [] in
+  let tadded = g5_added_tlines dtn dto in
+  let tremoved = g5_added_tlines dto dtn in
+  let tchanged = g5_changed_tlines dto dtn in
+  let vmsg = if added == [] then (if removed == [] then (if changed == [] then "" else "public type specialized:\n" ++ g5_join_nl changed) else "public type removed:\n" ++ g5_join_nl removed) else "public type added:\n" ++ g5_join_nl added ++ (if removed == [] then "" else "\npublic type removed:\n" ++ g5_join_nl removed) ++ (if changed == [] then "" else "\npublic type specialized:\n" ++ g5_join_nl changed) in
+  let tmsg = if tadded == [] then (if tremoved == [] then (if tchanged == [] then "" else "public type decl changed:\n" ++ g5_join_nl tchanged) else "public type decl removed:\n" ++ g5_join_nl tremoved) else "public type decl added:\n" ++ g5_join_nl tadded ++ (if tremoved == [] then "" else "\npublic type decl removed:\n" ++ g5_join_nl tremoved) ++ (if tchanged == [] then "" else "\npublic type decl changed:\n" ++ g5_join_nl tchanged) in
+  if vmsg == "" then (if tmsg == "" then (true, "no public type changes") else (false, tmsg)) else (false, if tmsg == "" then vmsg else vmsg ++ "\n" ++ tmsg)
+
+and g5_dci_types text acc = g5_dci_types_lines (g5_split_lines text 0 "" []) acc
+
+and g5_added_tlines xs ys = case xs of
+    [] -> []
+  | h :: rest ->
+      if g5_mem_str2 h ys then g5_added_tlines rest ys
+      else if g5_type_name h == "" then g5_added_tlines rest ys
+      else case g5_find_type ys (g5_type_name h) of
+        | "" -> h :: g5_added_tlines rest ys
+        | _ -> g5_added_tlines rest ys
+
+and g5_changed_tlines to_ tn = case to_ of
+    [] -> []
+  | h :: rest ->
+      let nm = g5_type_name h in
+      (case g5_find_type tn nm of
+        | "" -> g5_changed_tlines rest tn
+        | n2 -> if n2 == h then g5_changed_tlines rest tn else ("old: " ++ h ++ "\nnew: " ++ n2) :: g5_changed_tlines rest tn)
 
 and g5_added_lines xs ys = case xs of
     [] -> []

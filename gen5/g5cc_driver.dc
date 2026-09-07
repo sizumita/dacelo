@@ -8,15 +8,22 @@
 -- Only Gen4-subset syntax is used in this file.
 -- ============================================================
 
--- collect (file, lowered-text) in order; fails on reserved/dup names
-let rec g5_lower_files files acc = case files of
+-- collect (file, lowered-text) in order; fails on reserved/dup names.
+-- anyrec gates the top-level prelude-collision check; per-file local
+-- bindings are checked only in files that use records (legacy-only files
+-- stay compilable even if they bind such names: no helpers are emitted
+-- into their scope).
+let rec g5_lower_files anyrec files acc = case files of
     [] -> rev_acc [] acc
   | f :: rest -> case f of
       | (path, _, pr) -> case pr of
           | Prog5 _ items ->
-              let r = g5_has_reserved_prog pr in
-              if r == "" then g5_lower_files rest ((path, g5_lower_prog_src pr) :: acc)
-              else error ("g5: reserved name `" ++ r ++ "` defined in " ++ path ++ " (rename it)")
+              let t = if anyrec then g5_has_reserved_top pr else "" in
+              if t == "" then
+                let l = if g5_uses_records_prog pr then g5_has_reserved_prog pr else "" in
+                if l == "" then g5_lower_files anyrec rest ((path, g5_lower_prog_src pr) :: acc)
+                else error ("g5: reserved record-helper name `" ++ l ++ "` bound in " ++ path ++ " (rename it)")
+              else error ("g5: reserved record-helper name `" ++ t ++ "` defined in " ++ path ++ " (rename it)")
 
 -- NOTE: record-usage is detected on parsed Prog5s (kept alongside texts)
 let rec g5_any_records_ps progs = case progs of
@@ -98,7 +105,7 @@ and g5_namesets progs acc = case progs of
 -- check results: both emit paths consume parse trees only; the check
 -- gates by status. --backend-only is equivalent whenever check passes.)
 and g5cc_status r = case r of
-  | (_, _, _, _, st, e, _) -> (st, e)
+  | (_, _, _, _, st, e, _, _) -> (st, e)
 
 -- legacy path: original source straight to the legacy backend
 and g5cc_legacy in_path out_base =
@@ -107,11 +114,14 @@ and g5cc_legacy in_path out_base =
   let prog = parse_prog toks in
   g5cc_emit prog out_base
 
--- Gen5 path: lower each file, prepend prelude iff records used, reparse
+-- Gen5 path: lower each file dep-first (files arrive entry-first; backend
+-- initializes top-level thunks in source order), prepend prelude iff
+-- records used, reparse
 and g5cc_lowered files progs out_base =
-  let lowered = g5_lower_files files [] in
+  let anyrec = g5_any_records_ps progs in
+  let lowered = g5_lower_files anyrec (rev_acc [] files) [] in
   let body = g5_join_texts lowered "" in
-  let src = if g5_any_records_ps progs then g5_rec_prelude_src ++ body else body in
+  let src = if anyrec then g5_rec_prelude_src ++ body else body in
   let prog = parse_prog (lex_all src) in
   g5cc_emit prog out_base
 
@@ -128,10 +138,19 @@ and g5cc_emit prog out_base =
   let s_path = out_base ++ ".s" in
   write_file s_path content ;
   let rt_c = "gen2-dcc-rs/rt/rt.c" in
-  let _r1 = system ("cc -O2 -arch arm64 -c " ++ s_path ++ " -o " ++ out_base ++ ".o") in
-  let _r2 = system ("cc -O2 -arch arm64 -c " ++ rt_c ++ " -o " ++ out_base ++ ".rt.o") in
-  let _r3 = system ("cc " ++ out_base ++ ".o " ++ out_base ++ ".rt.o -o " ++ out_base) in
-  print_string ("wrote " ++ out_base ++ "\n")
+  let tmpbin = out_base ++ ".linktmp" in
+  let r1 = system ("cc -O2 -arch arm64 -c " ++ s_path ++ " -o " ++ out_base ++ ".o") in
+  if r1 != 0 then error ("g5: assembler failed on " ++ s_path ++ " (exit " ++ int_to_string (r1 / 256) ++ ")")
+  else
+    let r2 = system ("cc -O2 -arch arm64 -c " ++ rt_c ++ " -o " ++ out_base ++ ".rt.o") in
+    if r2 != 0 then error ("g5: assembler failed on " ++ rt_c ++ " (exit " ++ int_to_string (r2 / 256) ++ ")")
+    else
+      let r3 = system ("cc " ++ out_base ++ ".o " ++ out_base ++ ".rt.o -o " ++ tmpbin) in
+      if r3 != 0 then error ("g5: linker failed for " ++ out_base ++ " (exit " ++ int_to_string (r3 / 256) ++ ")")
+      else
+        let r4 = system ("mv " ++ tmpbin ++ " " ++ out_base) in
+        if r4 != 0 then error ("g5: cannot publish " ++ out_base ++ " (exit " ++ int_to_string (r4 / 256) ++ ")")
+        else print_string ("wrote " ++ out_base ++ "\n")
 
 let main () =
   print_string "" ;

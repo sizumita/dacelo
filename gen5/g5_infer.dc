@@ -27,10 +27,10 @@ type Sch5 = Sch5 (List Int) (List Int) Ty5 Bool
 
 type RowC5 = RowC5 (List (String, Ty5)) RowTail5
 
--- HoleE5 nodeid name type candidates(name, inst-type, declspan) capped?
+-- HoleE5 nodeid name type candidates(name, scheme, inst-type, declspan) capped? capped?
 -- (capped = candidate walk hit the display limit; trial/rollback semantics
 -- unchanged, only listing is truncated. JSON-only transparency flag.)
-type HoleE5 = HoleE5 Int String Ty5 (List (String, Ty5, Span)) Bool
+type HoleE5 = HoleE5 Int String Ty5 (List (String, Sch5, Ty5, Span)) Bool
 
 -- SymE5 symid name declspan nodeid scheme (normalized at bind time)
 type SymE5 = SymE5 Int String Span Int Sch5
@@ -273,8 +273,8 @@ and g5_row_occurs rid t st = case g5_chase (g5s_subst st) t of
   | TTup5 ts -> g5_row_occurs_list rid ts st
   | TApp5 _ ts -> g5_row_occurs_list rid ts st
   | TRec5 flds tl ->
-      let (ef, _) = g5_row_chase (g5s_rowsubst st) tl in
-      g5_row_occurs_fields rid (g5_merge_fields flds ef) st
+      if g5_row_occurs_fields rid flds st then true
+      else g5_row_tail_occurs rid tl st
 
 and g5_row_occurs_list rid ts st = case ts of
     [] -> false
@@ -529,17 +529,19 @@ let g5_fresh_sym s = case s of
 let g5_fresh_node s = case s of
   | TIS5 a b c d e f g h i j k l m n o q -> (TIS5 a b c d e f g h i j k (l + 1) m n o q, l)
 
--- snapshot = lengths + counters (subst/rowsubst grow-only; truncate restores)
+-- snapshot = lengths + counters. subst/rowsubst/holevars grow newest-first,
+-- so rollback DROPS the newest entries back to the recorded lengths
+-- (keeping newest-ns, as g5_trunc did, keeps trial garbage and loses history).
 let g5_snapshot s = (len (g5s_subst s), len (g5s_rowsubst s), len (g5s_holevars s), g5s_ctr s, g5s_rowctr s)
 
-let rec g5_trunc n xs = if n == 0 then [] else
+let rec g5_drop n xs = if n <= 0 then xs else
   case xs of
     | [] -> []
-    | h :: rest -> h :: g5_trunc (n - 1) rest
+    | _ :: rest -> g5_drop (n - 1) rest
 
 let g5_rollback s snap = case snap of
   | (ns, nr, nh, _, _) ->
-      g5s_with_holevars (g5s_with_rowsubst (g5s_with_subst s (g5_trunc ns (g5s_subst s))) (g5_trunc nr (g5s_rowsubst s))) (g5_trunc nh (g5s_holevars s))
+      g5s_with_holevars (g5s_with_rowsubst (g5s_with_subst s (g5_drop ((len (g5s_subst s)) - ns) (g5s_subst s))) (g5_drop ((len (g5s_rowsubst s)) - nr) (g5s_rowsubst s))) (g5_drop ((len (g5s_holevars s)) - nh) (g5s_holevars s))
 
 let g5_fail_msg s dflt = g5s_ectx s ++ dflt
 
@@ -684,10 +686,12 @@ and g5_unify_open2 o1 o2 r1 r2 s em =
   else if r2 < 0 then
     if o1 == [] then g5_bind_row r1 o2 (ROpen5 r2) s em
     else (s, g5_missing_fields o1 s em)
-  else if g5_row_occurs_map r1 o2 s then
-    if g5_row_occurs_map r2 o1 s then (s, g5_fail_msg s (if em == "" then "infinite row type" else em))
-    else g5_bind_row r2 o1 (ROpen5 r1) s em
-  else g5_bind_row r1 o2 (ROpen5 r2) s em
+  else if g5_row_occurs_map r1 o2 s then (s, g5_fail_msg s (if em == "" then "infinite row type" else em))
+  else if g5_row_occurs_map r2 o1 s then (s, g5_fail_msg s (if em == "" then "infinite row type" else em))
+  else
+    let (s1, r3) = g5_fresh_row s in
+    let (s2, e1) = g5_bind_row r1 o2 (ROpen5 r3) s1 em in
+    if e1 == "" then g5_bind_row r2 o1 (ROpen5 r3) s2 em else (s2, e1)
 
 and g5_missing_fields o s em =
   g5_fail_msg s (if em == "" then ("record mismatch: missing field(s) `" ++ g5_join_labels o ++ "`") else em)
@@ -1452,33 +1456,31 @@ and g5_infer_hole s e nm sp env sc =
   let (s0, nid) = g5_fresh_node s in
   let (s1, v) = g5_fresh s0 in
   let s2 = g5s_with_holevars s1 (v :: g5s_holevars s1) in
-  let (s3, cands, cap) = g5_hole_cands env (TVI5 v) s2 12 in
-  let s4 = g5s_with_holes s3 (HoleE5 nid nm (TVI5 v) cands cap :: g5s_holes s3) in
+  let (s3, cands0) = g5_hole_cands env (TVI5 v) s2 in
+  let s4 = g5s_with_holes s3 (HoleE5 nid nm (TVI5 v) (rev_acc [] cands0) false :: g5s_holes s3) in
   (g5_record s4 nid sp (TVI5 v) (0 - 1) g5_null_sch [] g5_no_expected "hole (partial)", TVI5 v, "")
 
-and g5_hole_cands env hty s limit = case env of
-    [] -> (s, [], false)
+and g5_hole_cands env hty s = case env of
+    [] -> (s, [])
   | kv :: rest -> case kv of
-      | (nm, sch) ->
-          if limit == 0 then (s, [], true)
-          else case sch of
-            | Sch5 qvars qrows sty p ->
-                if p then g5_hole_cands rest hty s limit
+      | (nm, sch) -> case sch of
+          | Sch5 qvars qrows sty p ->
+              if p then g5_hole_cands rest hty s
+              else
+                let (s1, inst, _, _) = g5_instantiate qvars qrows sty s in
+                if g5_mentions_hole inst s1 then g5_hole_cands rest hty s1
                 else
-                  let (s1, inst, _, _) = g5_instantiate qvars qrows sty s in
-                  if g5_mentions_hole inst s1 then g5_hole_cands rest hty s1 limit
+                  let snap = g5_snapshot s1 in
+                  let (s2, e1) = g5_unify inst hty s1 "" in
+                  if e1 == "" then
+                    let ninst = g5_norm_ty_here s2 inst in
+                    let s3 = g5_rollback s2 snap in
+                    let dsp = g5_decl_span_of s3 nm in
+                    let (s4, more) = g5_hole_cands rest hty s3 in
+                    (s4, (nm, sch, ninst, dsp) :: more)
                   else
-                    let snap = g5_snapshot s1 in
-                    let (s2, e1) = g5_unify inst hty s1 "" in
-                    if e1 == "" then
-                      let ninst = g5_norm_ty_here s2 inst in
-                      let s3 = g5_rollback s2 snap in
-                      let dsp = g5_decl_span_of s3 nm in
-                      let (s4, more, cap) = g5_hole_cands rest hty s3 (limit - 1) in
-                      (s4, (nm, ninst, dsp) :: more, cap)
-                    else
-                      let s3 = g5_rollback s2 snap in
-                      g5_hole_cands rest hty s3 limit
+                    let s3 = g5_rollback s2 snap in
+                    g5_hole_cands rest hty s3
 
 and g5_mentions_hole inst s =
   g5_any_mem (g5_free_chase inst s []) (g5s_holevars s)
@@ -1823,12 +1825,33 @@ let rec g5_refresh_holes s =
 and g5_refresh_hole_list hs s = case hs of
     [] -> []
   | he :: rest -> case he of
-      | HoleE5 nid nm ty cands cap -> HoleE5 nid nm (g5_norm_ty_here s ty) (g5_refresh_cands cands s) cap :: g5_refresh_hole_list rest s
+      | HoleE5 nid nm ty cands cap ->
+          let expty = g5_norm_ty_here s ty in
+          case g5_refilter_cands cands expty s [] of
+            | (rc, recap) -> HoleE5 nid nm expty rc (if cap then true else recap) :: g5_refresh_hole_list rest s
 
-and g5_refresh_cands cs s = case cs of
-    [] -> []
+-- re-trial against the firmed expected type (issue #1-9): instantiate the
+-- SAVED scheme fresh, trial-unify, roll back. Cap applies AFTER filtering.
+and g5_refilter_cands cs exp s acc = case cs of
+    [] -> (rev_acc [] acc, false)
   | kv :: rest -> case kv of
-      | (nm, ty, dsp) -> (nm, g5_norm_ty_here s ty, dsp) :: g5_refresh_cands rest s
+      | (nm, sch, _, dsp) -> case sch of
+          | Sch5 qvars qrows sty p ->
+              if p then g5_refilter_cands rest exp s acc
+              else
+                let (s1, inst, _, _) = g5_instantiate qvars qrows sty s in
+                if g5_mentions_hole inst s1 then g5_refilter_cands rest exp s1 acc
+                else
+                  let snap = g5_snapshot s1 in
+                  let (s2, e1) = g5_unify inst exp s1 "" in
+                  if e1 == "" then
+                    let ninst = g5_norm_ty_here s2 inst in
+                    let s3 = g5_rollback s2 snap in
+                    if len acc == 12 then (rev_acc [] acc, true)
+                    else g5_refilter_cands rest exp s3 ((nm, sch, ninst, dsp) :: acc)
+                  else
+                    let s3 = g5_rollback s2 snap in
+                    g5_refilter_cands rest exp s3 acc
 
 let rec g5_norm_env env s = case env of
     [] -> []
@@ -2129,7 +2152,8 @@ let rec g5_run_items hd items env sc s sigs idx sums ckpts diags status failed e
               let (s1b, sc1) = g5_top_ctor_syms schs sp s1 sc in
               let tlg = g5s_tracelog s1b in
               let (s2, env3) = g5_boundary_item (g5s_with_ectx s1b ectx0) env2 n0 y0 in
-              g5_run_items hd rest env3 sc1 s2 sigs (idx + 1) (ItemSum5 "type" sp [] tlg "checked" :: sums) ckpts diags status failed errmsg
+              let cb = rev_acc [] (g5_ctor_binds schs sp []) in
+              g5_run_items hd rest env3 sc1 s2 sigs (idx + 1) (ItemSum5 "type" sp cb tlg "checked" :: sums) ckpts diags status failed errmsg
             else g5_continue_item (g5s_with_ectx s1 ectx0) idx "type" sp e1 sums ckpts diags status failed errmsg (g5_ty_names td) rest hd env sc sigs
           else
             let dg = Diag5 idx "lacking" lack in
@@ -2196,12 +2220,19 @@ and g5_check_exposing exps env sc s sums ckpts diags status = case exps of
     [] -> (s, sums, ckpts, diags, g5_hole_status s status, "")
   | nm :: rest ->
       if g5_env_has5 env nm then g5_check_exposing rest env sc s sums ckpts diags status
+      else if g5_dup_tydef (g5s_tydefs s) nm then g5_check_exposing rest env sc s sums ckpts diags status
+      else if g5_is_builtin_ty nm then g5_check_exposing rest env sc s sums ckpts diags status
       else (s, sums, ckpts, Diag5 (0 - 1) "module" ("module exposes undefined `" ++ nm ++ "`") :: diags, "invalid", "module exposes undefined `" ++ nm ++ "`")
 
 and g5_hole_status s status =
   if status == "invalid" then "invalid"
   else if g5s_holes s == [] then status
   else "partial"
+
+and g5_ctor_binds schs sp acc = case schs of
+    [] -> acc
+  | kv :: rest -> case kv of
+      | (nm, sch) -> g5_ctor_binds rest sp (BindTy5 nm sp sch "checked" g5_no_sig5 :: acc)
 
 and g5_fail_item s idx kind sp msg sums ckpts diags =
   (s, sums, ckpts, Diag5 idx kind msg :: diags, "invalid", msg)

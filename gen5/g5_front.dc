@@ -785,6 +785,10 @@ let rec g5_pname_list toks acc = case toks of
       let acc2 = n :: acc in
       if g5_is_sym5 "," rest then g5_pname_list (g5_drop1 rest) acc2
       else (rev_acc [] acc2, rest, span_end span_dummy)
+  | PTok (TUpper n) _ _ :: rest ->
+      let acc2 = n :: acc in
+      if g5_is_sym5 "," rest then g5_pname_list (g5_drop1 rest) acc2
+      else (rev_acc [] acc2, rest, span_end span_dummy)
   | _ -> error "g5: expected exposed name"
 
 let g5_pheader toks = case toks of

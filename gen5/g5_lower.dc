@@ -71,7 +71,7 @@ let rec g5_lw_pat p = case p of
   | PVar5 n _ -> n
   | PInt5 n _ -> int_to_string n
   | PBool5 b _ -> if b then "true" else "false"
-  | PStr5 s _ -> "\"" ++ s ++ "\""
+  | PStr5 s _ -> g5_dc_str s
   | PUnit5 _ -> "()"
   | PTup5 ps _ -> "(" ++ g5_lw_pats ps ++ ")"
   | PCtor5 n ps _ ->
@@ -106,12 +106,12 @@ and g5_lw_is_atomic e = case e of
 and g5_lw_e e = case e of
   | EInt5 n _ -> int_to_string n
   | EBool5 b _ -> if b then "true" else "false"
-  | EStr5 s _ -> "\"" ++ s ++ "\""
+  | EStr5 s _ -> g5_dc_str s
   | EUnit5 _ -> "()"
   | EVar5 n _ -> n
   | ECtor5 n _ -> n
   | ELam5 p b _ -> "fun " ++ g5_lw_pat p ++ " -> " ++ g5_lw_e b
-  | EApp5 f a _ -> g5_lw_e f ++ " " ++ (if g5_lw_is_atomic a then g5_lw_e a else "(" ++ g5_lw_e a ++ ")")
+  | EApp5 f a _ -> g5_lw_fn f ++ " " ++ g5_lw_arg a
   | EBin5 op l r _ -> "(" ++ g5_lw_e l ++ " " ++ op ++ " " ++ g5_lw_e r ++ ")"
   | EIf5 c t el _ -> "(if " ++ g5_lw_e c ++ " then " ++ g5_lw_e t ++ " else " ++ g5_lw_e el ++ ")"
   | ECase5 sc brs _ -> "(case " ++ g5_lw_e sc ++ " of " ++ g5_lw_brs brs ++ ")"
@@ -119,9 +119,15 @@ and g5_lw_e e = case e of
   | ETup5 es _ -> "(" ++ g5_lw_es_comma es ++ ")"
   | EAnn5 x _ _ -> g5_lw_e x
   | ERec5 flds _ -> "[" ++ g5_lw_fields flds ++ "]"
-  | EProj5 r lb _ -> "(g5_rec_get " ++ g5_lw_e r ++ " \"" ++ lb ++ "\")"
-  | EWith5 b lb u _ -> "(g5_rec_with " ++ g5_lw_e b ++ " \"" ++ lb ++ "\" " ++ g5_lw_e u ++ ")"
+  | EProj5 r lb _ -> "(g5_rec_get " ++ g5_lw_arg r ++ " \"" ++ lb ++ "\")"
+  | EWith5 b lb u _ -> "(g5_rec_with " ++ g5_lw_arg b ++ " \"" ++ lb ++ "\" " ++ g5_lw_arg u ++ ")"
   | EHole5 nm _ -> error "g5: hole reached lowering (refusing partial program)"
+
+and g5_lw_fn f = case f of
+  | EApp5 _ _ _ -> g5_lw_e f
+  | _ -> if g5_lw_is_atomic f then g5_lw_e f else "(" ++ g5_lw_e f ++ ")"
+
+and g5_lw_arg a = if g5_lw_is_atomic a then g5_lw_e a else "(" ++ g5_lw_e a ++ ")"
 
 and g5_lw_es_comma es = case es of
     [] -> ""
@@ -215,7 +221,16 @@ and g5_lw_items its acc = case its of
       | ISig5 _ -> g5_lw_items rest acc
       | IImport5 _ _ -> g5_lw_items rest acc
 
--- reserved helper names must not be user-defined
+-- reserved helper names (g5_rec_get/g5_rec_with, emitted by lowering) must
+-- not be user-bound where helper calls can appear: top-level names program-
+-- wide (prelude collision), local names in files that use records (capture).
+-- Interim rule until intrinsics resolve via IDs (see RESUME). Returns "" or
+-- the offending name. Legacy-only programs without records are unaffected.
+let g5_is_reserved_nm nm =
+  if nm == g5_rec_get_name then true
+  else if nm == g5_rec_with_name then true
+  else false
+
 let rec g5_has_reserved_prog pr = case pr of
   | Prog5 _ items -> g5_has_reserved_items items
 
@@ -230,10 +245,106 @@ and g5_has_reserved_items its = case its of
 and g5_has_reserved_defs ds = case ds of
     [] -> ""
   | d :: rest -> case d of
+      | Def5 _ nm _ ps _ body _ ->
+          if g5_is_reserved_nm nm then nm
+          else
+            let f = g5_has_reserved_pats ps in
+            if f == "" then
+              let g = g5_has_reserved_e body in
+              if g == "" then g5_has_reserved_defs rest else g
+            else f
+
+and g5_has_reserved_pats ps = case ps of
+    [] -> ""
+  | p :: rest ->
+      let f = g5_has_reserved_pat p in
+      if f == "" then g5_has_reserved_pats rest else f
+
+and g5_has_reserved_pat p = case p of
+  | PVar5 n _ -> if g5_is_reserved_nm n then n else ""
+  | PTup5 ps _ -> g5_has_reserved_pats ps
+  | PCtor5 _ ps _ -> g5_has_reserved_pats ps
+  | _ -> ""
+
+and g5_has_reserved_e e = case e of
+  | EVar5 _ _ -> ""
+  | ECtor5 _ _ -> ""
+  | EInt5 _ _ -> ""
+  | EBool5 _ _ -> ""
+  | EStr5 _ _ -> ""
+  | EUnit5 _ -> ""
+  | EHole5 _ _ -> ""
+  | ELam5 p b _ ->
+      let f = g5_has_reserved_pat p in
+      if f == "" then g5_has_reserved_e b else f
+  | EApp5 f a _ ->
+      let x = g5_has_reserved_e f in
+      if x == "" then g5_has_reserved_e a else x
+  | EBin5 _ l r _ ->
+      let x = g5_has_reserved_e l in
+      if x == "" then g5_has_reserved_e r else x
+  | EIf5 c t el _ ->
+      let x = g5_has_reserved_e c in
+      if x == "" then
+        let y = g5_has_reserved_e t in
+        if y == "" then g5_has_reserved_e el else y
+      else x
+  | ECase5 sc brs _ ->
+      let x = g5_has_reserved_e sc in
+      if x == "" then g5_has_reserved_brs brs else x
+  | ELet5 _ nm rhs body _ ->
+      if g5_is_reserved_nm nm then nm
+      else
+        let x = g5_has_reserved_e rhs in
+        if x == "" then g5_has_reserved_e body else x
+  | ETup5 es _ -> g5_has_reserved_list es
+  | EAnn5 x _ _ -> g5_has_reserved_e x
+  | ERec5 flds _ -> g5_has_reserved_fields flds
+  | EProj5 r _ _ -> g5_has_reserved_e r
+  | EWith5 b _ u _ ->
+      let x = g5_has_reserved_e b in
+      if x == "" then g5_has_reserved_e u else x
+
+and g5_has_reserved_brs brs = case brs of
+    [] -> ""
+  | br :: rest -> case br of
+      | (p, b) ->
+          let f = g5_has_reserved_pat p in
+          if f == "" then
+            let g = g5_has_reserved_e b in
+            if g == "" then g5_has_reserved_brs rest else g
+          else f
+
+and g5_has_reserved_list es = case es of
+    [] -> ""
+  | e :: rest ->
+      let f = g5_has_reserved_e e in
+      if f == "" then g5_has_reserved_list rest else f
+
+and g5_has_reserved_fields flds = case flds of
+    [] -> ""
+  | kv :: rest -> case kv of
+      | (_, e) ->
+          let f = g5_has_reserved_e e in
+          if f == "" then g5_has_reserved_fields rest else f
+
+-- top-level names only (prelude collision is program-wide)
+and g5_has_reserved_top pr = case pr of
+  | Prog5 _ items -> g5_has_reserved_top_items items
+
+and g5_has_reserved_top_items its = case its of
+    [] -> ""
+  | it :: rest -> case it of
+      | IDef5 ds _ ->
+          let f = g5_has_reserved_top_defs ds in
+          if f == "" then g5_has_reserved_top_items rest else f
+      | _ -> g5_has_reserved_top_items rest
+
+and g5_has_reserved_top_defs ds = case ds of
+    [] -> ""
+  | d :: rest -> case d of
       | Def5 _ nm _ _ _ _ _ ->
-          if nm == "g5_rec_get" then nm
-          else if nm == "g5_rec_with" then nm
-          else g5_has_reserved_defs rest
+          if g5_is_reserved_nm nm then nm else g5_has_reserved_top_defs rest
 
 -- entry: Nothing about holes (driver refuses partial first)
 and g5_lower_prog_src pr = case pr of
