@@ -141,7 +141,10 @@ drop-guided reuse による関数型のままの in-place 更新、既知関数�
 実行時: `DACELO_RC_CHECK=1` で終了時に全ブロック解放を検証（リークで exit 3）、`DACELO_RC_STATS=1` で
 alloc/free/reuse 数を stderr に出力。検証は `./gen5/test.sh`（B: 全例が Gen0 と出力一致＋リークゼロ＋
 reuse 実測、C: `dcc_7`（RC 上で動くコンパイラ）→`dcc_8` の `.s` 不動点＋RC 版チェッカの 38 一致＋
-自己検査の RSS 比較、G: 所有権パスの単体出力）。結果: <TBD-RESULTS>
+自己検査の RSS 比較、G: 所有権パスの単体出力）。初回のみ `dcc_1`（Gen3 seed、GC なし）で stage1 を作るためピーク約 25GB が要る（単独実行）。以後は RC 版を seed に
+`./gen5/build.sh` が約 3 分で自己ホストを再生成する。結果: **A** 38/38（旧・新チェッカとも）、**B** 全 example＋gen5-examples が Gen0 と出力一致・`DACELO_RC_CHECK=1` でリークゼロ・`reuse` 例 1000 セル全て in-place、
+**C** `dcc_7.s == dcc_8.s`（5,853,382 B）の不動点、RC 版チェッカ 38/38、**自己検査（8,500 行）が exit 0・46.7 秒・最大 RSS 1.84GB**
+（mark-sweep 版は 272 秒後に 23.7GB／footprint 140GB で OOM kill）、**D/E/F/G** green。即席計測: fib 30 が 0.46s→0.01s。
 
 **Gen 3 完了**: `gen3-dcc-dc/` — dacelo 自身で書かれたコンパイラが
 自分自身をコンパイルして完全動作する `dcc_2` を生成し、`dcc_2` の

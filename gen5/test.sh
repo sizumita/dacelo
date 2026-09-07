@@ -129,9 +129,9 @@ echo "== C. self-host: Gen5-RC builds Gen5-RC (dcc_7 -> dcc_8 fixpoint) =="
 ./dcc_6 $G5CHECK_SRC gen5check_rc --backend-only > /dev/null 2>&1 || { echo "  gen5check_rc BUILD FAIL"; exit 1; }
 echo "  stage1: dcc_7 + gen5check_rc built by dcc_6 (both run under RC)"
 # stage2: the RC-compiled compiler rebuilds itself; assembly fixpoint
-./dcc_7 $G5CC_SRC dcc_8 --backend-only > /dev/null 2>&1 || { echo "  dcc_8 BUILD FAIL"; exit 1; }
+DACELO_RC_CHECK=1 DACELO_RC_STATS=1 ./dcc_7 $G5CC_SRC dcc_8 --backend-only > /tmp/g5_dcc8.log 2>&1 || { echo "  dcc_8 BUILD FAIL (or the RC-compiled compiler leaked while compiling itself)"; tail -3 /tmp/g5_dcc8.log; exit 1; }
 cmp -s dcc_7.s dcc_8.s || { echo "  FIXPOINT FAIL: dcc_7.s != dcc_8.s"; exit 1; }
-echo "  FIXPOINT: dcc_7.s == dcc_8.s ($(wc -c < dcc_7.s | tr -d ' ') bytes)"
+echo "  FIXPOINT: dcc_7.s == dcc_8.s ($(wc -c < dcc_7.s | tr -d ' ') bytes); dcc_7 leak-free on its own source ($(grep -o 'reuses=[0-9]*' /tmp/g5_dcc8.log))"
 ./dcc_8 examples/hello.dc /tmp/g8_hello > /dev/null 2>&1 || { echo "  dcc_8 SMOKE FAIL"; exit 1; }
 /tmp/g8_hello > /tmp/g8_hello.out 2>&1
 $GEN0 examples/hello.dc > /tmp/ref_hello.out 2>&1
@@ -151,10 +151,10 @@ echo "  gen5check_rc oracle: $pass agree, $fail differ"
 [ $fail -eq 0 ]
 # headline: self-check under RC (the checker checks the compiler source), with time + peak RSS
 set +e
-/usr/bin/time -l ./gen5check_rc check $G5CC_SRC > /tmp/g5_selfcheck_rc.log 2>&1; sc2=$?
+/usr/bin/time -l env DACELO_RC_CHECK=1 DACELO_RC_STATS=1 ./gen5check_rc check $G5CC_SRC > /tmp/g5_selfcheck_rc.log 2>&1; sc2=$?
 set -e
-echo "  self-check (RC build): exit $sc2; $(grep -E 'maximum resident|real' /tmp/g5_selfcheck_rc.log | tr -s ' ' | tr '\n' ' ')"
-[ $sc2 -eq 0 ] || { echo "  self-check FAIL under RC (log: /tmp/g5_selfcheck_rc.log)"; exit 1; }
+echo "  self-check (RC build, leak-checked): exit $sc2; $(grep -E 'maximum resident|real|^rc:' /tmp/g5_selfcheck_rc.log | tr -s ' ' | tr '\n' ' ')"
+[ $sc2 -eq 0 ] || { echo "  self-check FAIL under RC (exit 3 = leak; log: /tmp/g5_selfcheck_rc.log)"; exit 1; }
 DACELO_RC_CHECK=1 ./gen5check_rc check examples/tree.dc > /dev/null 2>&1 || { echo "  gen5check_rc leaked while checking tree.dc"; exit 1; }
 echo "  gen5check_rc accepts its own compiler source and is leak-free on tree.dc"
 # comparison point: the same self-check with the mark-sweep-built checker (never collects;

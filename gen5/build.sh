@@ -17,6 +17,10 @@
 # needs the ~25GB that the old (never-collecting) mark-sweep runtime did; the
 # stage1 binaries still run on the seed's runtime, which is why the
 # self-check is done with the stage2 checker.
+# Seed choice matters: an RC-compiled seed (./dcc_7 from test.sh C, or a
+# promoted ./dcc_6) builds stage1 in ~5 s at ~1.7GB; the Gen3 seed ./dcc_1
+# (no GC, quadratic line joining) peaks at 23-27GB on the 8,500-line
+# compiler source -- run it alone, never two builds at once.
 set -e
 cd "$(dirname "$0")/.."
 
@@ -46,8 +50,14 @@ build_seed() {
 echo "== 1. stage1: seed builds gen5 once =="
 cat gen3-dcc-dc/dcc.dc gen5/g5_front.dc gen5/g5_infer.dc gen5/g5_query.dc gen5/g5_lower.dc gen5/g5_oir.dc gen5/g5_own.dc gen5/g5_driver.dc gen5/g5_main.dc > $G5CHECK_SRC
 cat gen3-dcc-dc/dcc.dc gen5/g5_front.dc gen5/g5_infer.dc gen5/g5_query.dc gen5/g5_lower.dc gen5/g5_oir.dc gen5/g5_own.dc gen5/g5_driver.dc gen5/g5_cg.dc gen5/g5_cgdriver.dc gen5/g5cc_driver.dc > $G5CC_SRC
-if [ -x ./gen5check ]; then
-  ./gen5check check $G5CHECK_SRC > /dev/null 2>&1 && echo "gate: existing gen5check accepts checker source" || echo "gate: existing gen5check could not verify checker source (continuing; stage2 self-check is mandatory)"
+# an RC-compiled checker prints an `rc:` stats line; a mark-sweep-built one
+# (never collects) would need ~25GB for the 8,000-line gate and is skipped
+is_rc_bin() { DACELO_RC_STATS=1 "$1" check examples/hello.dc 2>&1 | grep -q '^rc:'; }
+if [ -x ./gen5check ] && is_rc_bin ./gen5check; then
+  ./gen5check check $G5CHECK_SRC > /dev/null 2>&1 && echo "gate: existing gen5check (RC) accepts checker source" || { echo "gate FAIL (checker source)"; exit 1; }
+  ./gen5check check $G5CC_SRC > /dev/null 2>&1 && echo "gate: existing gen5check (RC) accepts compiler source" || { echo "gate FAIL (compiler source)"; exit 1; }
+elif [ -x ./gen5check ]; then
+  echo "gate: existing gen5check is a mark-sweep build (would need ~25GB); skipped -- stage2 self-check is mandatory"
 elif [ $USE_RUST -eq 1 ]; then
   $GEN0 $G5CHECK_SRC --types > /dev/null && echo "gate: Gen0 accepts checker source"
   $GEN0 $G5CC_SRC --types > /dev/null && echo "gate: Gen0 accepts compiler source"

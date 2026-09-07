@@ -205,3 +205,15 @@ concat（checker）: `dcc.dc g5_front g5_infer g5_query g5_lower g5_oir g5_own g
 - Morphic 流の寿命変数つき借用・lambda set specialization（局所関数の直接呼出・借用）。
 - 可変長フレーム、レジスタ割付、直接呼出の引数 9 個以上（現状 8 関数はクロージャ経路）。
 - `.dci` への ownership 出力（ABI 互換性の意味論を決めてから）。
+
+## 8. 結果（2026-09-08、branch `gen5-gc`）
+
+| 検証 | 結果 |
+|---|---|
+| A. `gen5check check` vs Gen0 `--types`（38 ケース） | 38 agree（旧チェッカ・RC 版チェッカとも） |
+| B. examples 6 本＋gen5-examples | 全て Gen0 と出力一致、`DACELO_RC_CHECK=1` でリークゼロ、`reuse` 例 reuses=1000 |
+| C. 不動点 | `dcc_7.s == dcc_8.s`（5,853,382 B） |
+| C. 自己検査（8,500 行） | RC 版: exit 0 / 46.7 s / 最大 RSS 1.84 GB。mark-sweep 版: 272 s 後 OOM kill（23.7 GB、footprint 140 GB） |
+| D/E/F/G | green（G: `types` の ownership、`probe_own.dc` の IR dump 固定） |
+| 即席性能 | fib 30: 0.46 s → 0.01 s（直接呼出＋クロージャ確保消滅） |
+

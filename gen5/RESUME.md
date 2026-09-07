@@ -28,7 +28,25 @@
 - **落とし穴（追加）**：`dcc_1`（Gen3、GC なし）で 8500 行の concat をビルドすると数 GB 常駐するため、
   **同時に 2 本走らせると `cc`/`malloc` が失敗して黙って `.o` が消える**（dcc_1 は system() の戻り値を
   見ない）。ビルドは 1 本ずつ。単独なら決定的（`.s` バイト一致）。
-- **C（自己ホスト）の結果**：<TBD-C>
+- **build.sh**（seed=`./dcc_7`、2026-09-08 03:27）：stage1 5 秒 → stage2 → 自己検査（両ソース、RC）→ stage3 不動点 →
+  oracle 38/38 → promote、約 5 分で `GEN5 BUILD COMPLETE`。ゲートは RC 製 `gen5check` のみで実行（mark-sweep 製はスキップ）。
+- **C（自己ホスト）の結果**：`GEN5_KEEP_BIN=1 GEN5_ONLY=C zsh gen5/test.sh`（2026-09-08 03:13、約 2.5 分）
+  - stage1: `dcc_6`（dcc_1 製、旧ランタイム上）が `dcc_7` と `gen5check_rc` をビルド（RC 上で動く）。
+  - **不動点** `dcc_7.s == dcc_8.s`（5,853,382 B）。`dcc_8` は hello/tree を正しくコンパイルし、コンパイル中もリークゼロ。
+  - `gen5check_rc`：38 ケース oracle 一致。
+  - **自己検査**（`gen5check_rc check gen5/g5cc_full.dc`、8,500 行）：**exit 0、46.7 秒、最大 RSS 1.84GB**。
+    同じ入力を mark-sweep 版 `gen5check` で検査すると 272 秒後に OOM kill（最大 RSS 23.7GB、footprint 140GB）。
+    RESUME 旧記述の「二次時間・RSS 25GB」は総確保量であり、実メモリは RC で 1/13 未満・時間は 1/5 以下になった
+    （旧計測は GC が走らない前提で page fault と圧縮に時間を食っていた）。
+  - 即席性能（旧 dcc_1 生成物 vs 新）：fib 30 0.46s→0.01s、tree/list_ops/closures 0.3s→0.00s。
+  - **リーク検証（最大入力）**：`DACELO_RC_CHECK=1` で `gen5check_rc check gen5/g5cc_full.dc` は
+    allocs 32,380,954 / frees 32,379,569（差＝グローバル、終了時に解放）/ reuses 759,141 / peak_live 11.2M ブロックで
+    exit 0（リークなし、46.9 秒、1.84GB）。`dcc_7 … --backend-only` も allocs 5.8M / reuses 2.3M / 4.8 秒 / 1.67GB で
+    リークなし。test.sh C はこの 2 つを常時 `DACELO_RC_CHECK=1` で回す。
+  - **seed 段のメモリ**：`dcc_1`（Gen3、GC なし）で 8,500 行の compiler concat をビルドすると
+    ピーク 23〜27GB（dcc_1 自身の二次的な行結合）。この box では単独実行なら通るが、並列は不可。
+    一度 RC 版（`dcc_7`）ができれば `build.sh` はそれを seed に使い（stage1 が 5 秒・1.7GB）、以後 dcc_1 は不要。
+    新 backend の行結合は balanced join に置き換え済み（emit 相 23.9GB/44s → 5.9GB/10s、seed 上でも）。
 
 
 ## issue #1 再レビュー対応（R1＋R2〜R4残件）

@@ -118,3 +118,8 @@ CLI 例だけでは「通常の occurs-check でも弾ける例」になりが�
 - test.sh: B は「Gen0 と出力一致＋リークゼロ＋reuse 実測」、C は `dcc_7`（RC 上のコンパイラ）→`dcc_8` の
   `.s` 不動点と RC 版チェッカの oracle、G は所有権パスの単体出力。旧 B の「dcc_1 と .s 同一」は廃止。
 - ブートストラップは `gen5/build.sh`（seed→stage1→stage2(RC)→自己検査→stage3 不動点→promote）。
+- `GEN5_KEEP_BIN=1` で A/B のバイナリ再生成を省略（`./gen5check`/`./dcc_6` が現ソース由来のとき）。
+- **dcc_1 のビルドは 1 本ずつ**：Gen3 製 dcc_1 は GC なしで数 GB 常駐し、system() の戻り値を見ないので、
+  並列に 2 本走らせると `cc` が失敗しても「wrote」と言って `.o`/バイナリが無いことがある。
+- C 節は RC 版なら約 2.5 分・RSS 2GB 弱（自己検査 47 秒）。旧 mark-sweep 版チェッカでの自己検査は
+  この box では OOM kill されるので、比較したいときだけ `GEN5_SELFCHECK_COMPARE=1`。
