@@ -157,12 +157,14 @@ let rec g5_check_files files entry_path s sums ckpts diags status deps tables = 
               if e0 == "" then
                 let imps = g5_imports_of items [] in
                 let (sx, base) = g5_init_env s in
-                let envf = app_list (g5_table_binds tables imps path []) base in
+                let ibinds = g5_table_binds tables imps path [] in
+                let envf = app_list (g5_strip_sids ibinds) base in
+                let scf = app_list (g5_sids_of ibinds) [] in
                 let td0 = g5s_tydefs sx in
                 let spx = g5s_with_tydefs sx (app_list (g5_tables_tydefs tables imps path []) td0) in
                 let nn0 = len (g5s_nodes spx) in
                 let ny0 = len (g5s_syms spx) in
-                let (s1, sums1, ckpts1, diags1, st1, e1) = g5_run_items hd items envf [] spx sigs 0 [] [] [] "checked" [] "" in
+                let (s1, sums1, ckpts1, diags1, st1, e1) = g5_run_items hd items envf scf spx sigs 0 [] [] [] "checked" [] "" in
                 let s1r = g5s_with_tydefs s1 td0 in
                 if e1 == "" then
                   let tb = g5_table_entry hd path sums1 items (g5_slice_new nn0 (g5s_nodes s1r)) (g5_slice_new ny0 (g5s_syms s1r)) in
@@ -177,9 +179,69 @@ let rec g5_check_files files entry_path s sums ckpts diags status deps tables = 
                 else (s1r, sums1, ckpts1, diags1, "invalid", e1, deps, tables)
               else (s, [], [], [Diag5 (0 - 1) "sig" e0], "invalid", e0, deps, tables)
 
-and g5_table_entry hd path sums1 items fnds fsys = case hd of
-  | NoMod5 -> (path, g5_sums_env_all sums1, g5_prog_tydecls_go items [], fnds, fsys)
-  | Mod5 _ exps _ -> (path, g5_sums_env_exp sums1 exps, g5_filter_tydecls (g5_prog_tydecls_go items []) exps [], fnds, fsys)
+and g5_table_entry hd path sums1 items fnds fsys =
+  let names = case hd of
+    | NoMod5 -> g5_top_names_items items []
+    | Mod5 _ exps _ -> exps in
+  let tds = case hd of
+    | NoMod5 -> g5_prog_tydecls_go items []
+    | Mod5 _ exps _ -> g5_filter_tydecls (g5_prog_tydecls_go items []) exps [] in
+  (path, g5_resolve_exports names sums1 items fsys [], tds, fnds, fsys)
+
+and g5_top_names_items items acc = case items of
+    [] -> acc
+  | it :: rest -> case it of
+      | IDef5 ds _ -> g5_top_names_items rest (app_list (g5_defs_names ds) acc)
+      | ITy5 td _ -> (case td of
+          | TyDecl5 _ _ cds -> g5_top_names_items rest (app_list (g5_cdor_names cds []) acc))
+      | _ -> g5_top_names_items rest acc
+
+and g5_resolve_exports names sums1 items fsys acc = case names of
+    [] -> acc
+  | nm :: rest -> case g5_find_bind sums1 nm of
+      | ("", _, _, _) -> g5_resolve_exports rest sums1 items fsys acc
+      | (_, sch, _, _) -> g5_resolve_exports rest sums1 items fsys ((nm, sch, g5_top_sid items fsys nm) :: acc)
+
+and g5_find_bind sums nm = case sums of
+    [] -> ("", g5_null_sch, span_dummy, "")
+  | it :: rest -> case it of
+      | ItemSum5 _ _ binds _ _ -> case g5_find_binds binds nm of
+          | ("", _, _, _) -> g5_find_bind rest nm
+          | found -> found
+
+and g5_find_binds binds nm = case binds of
+    [] -> ("", g5_null_sch, span_dummy, "")
+  | b :: rest -> case b of
+      | BindTy5 n sp sch _ _ -> if n == nm then (n, sch, sp, "") else g5_find_binds rest nm
+
+-- top-level sid: match file sym by (name, def-span); ctors (never bound
+-- locally) by first name match. Returns (0-1) when unresolvable.
+and g5_top_sid items fsys nm =
+  case g5_defspan_of items nm span_dummy of
+    | Span 0 0 -> g5_first_sym_by_name fsys nm
+    | dsp -> g5_sym_by_namedef fsys nm dsp
+
+and g5_defspan_of items nm acc = case items of
+    [] -> acc
+  | it :: rest -> case it of
+      | IDef5 ds _ ->
+          if g5_mem_str5 nm (g5_defs_names ds) then g5_defspan_of rest nm (g5_def_span ds nm)
+          else g5_defspan_of rest nm acc
+      | _ -> g5_defspan_of rest nm acc
+
+and g5_sym_by_namedef sys nm dsp = case sys of
+    [] -> 0 - 1
+  | sy :: rest -> case sy of
+      | SymE5 sid n dsp2 _ _ -> if n == nm then (if g5_span_eq dsp2 dsp then sid else g5_sym_by_namedef rest nm dsp) else g5_sym_by_namedef rest nm dsp
+
+and g5_first_sym_by_name sys nm = case sys of
+    [] -> 0 - 1
+  | sy :: rest -> case sy of
+      | SymE5 sid n _ _ _ -> if n == nm then sid else g5_first_sym_by_name rest nm
+
+and g5_span_eq a b = case a of
+  | Span a1 a2 -> case b of
+      | Span b1 b2 -> if a1 == b1 then a2 == b2 else false
 
 -- tydecls travel the same boundary: a type is preloaded iff exposed by name
 -- or one of its ctors is (NoMod exposes everything). Values/ctors in binds
@@ -207,6 +269,16 @@ and g5_table_find tables dp = case tables of
     [] -> []
   | e :: rest -> case e of
       | (p, binds, _, _, _) -> if p == dp then binds else g5_table_find rest dp
+
+and g5_strip_sids binds = case binds of
+    [] -> []
+  | kv :: rest -> case kv of
+      | (nm, sch, _) -> (nm, sch) :: g5_strip_sids rest
+
+and g5_sids_of binds = case binds of
+    [] -> []
+  | kv :: rest -> case kv of
+      | (nm, _, sid) -> (nm, sid) :: g5_sids_of rest
 
 and g5_tables_tydefs tables imps self acc = case imps of
     [] -> acc
@@ -303,19 +375,51 @@ and g5_reserved_files files anyrec = case files of
 
 and g5_reserved_msg nm path = path ++ ": reserved record-helper name `" ++ nm ++ "` (rename it)"
 
-let g5_check_loaded files entry_path =
-  let (s0, env0) = g5_init_env g5s_new in
-  let anyrec = g5_anyrec_files files in
-  let rv = g5_reserved_files files anyrec in
-  if rv == "" then
-    let rfiles = rev_acc [] files in
-    g5_check_files rfiles entry_path s0 [] [] [] "checked" [] []
-  else (s0, [], [], [Diag5 (0 - 1) "reserved" rv], "invalid", rv, [], [])
+let rec g5_dup_tydecl_files files seen = case files of
+    [] -> ""
+  | f :: rest -> case f of
+      | (path, _, pr) -> case pr of
+          | Prog5 _ items ->
+              case g5_dup_tydecl_items items seen path of
+                | "" -> g5_dup_tydecl_files rest (app_list (g5_tydecl_names_of items []) seen)
+                | msg -> msg
+
+and g5_tydecl_names_of items acc = case items of
+    [] -> acc
+  | it :: rest -> case it of
+      | ITy5 td _ -> (case td of
+          | TyDecl5 n _ _ -> g5_tydecl_names_of rest (n :: acc))
+      | _ -> g5_tydecl_names_of rest acc
+
+and g5_dup_tydecl_items items seen path = case items of
+    [] -> ""
+  | it :: rest -> case it of
+      | ITy5 td _ -> (case td of
+          | TyDecl5 n _ _ ->
+              if g5_mem_str3 n seen then path ++ ": duplicate type definition `" ++ n ++ "` across modules (flat namespace in v1)"
+              else g5_dup_tydecl_items rest seen path)
+      | _ -> g5_dup_tydecl_items rest seen path
 
 -- ---------- query CLI main ----------
 -- gen5check <cmd> <file> [opts]: check|types|focus|why|holes|interface|format
 -- opts: --format=json --at=L:C --max-bytes=N --check=PATH --write=PATH
 
+let g5_check_loaded files entry_path =
+  let (s0, env0) = g5_init_env g5s_new in
+  let anyrec = g5_anyrec_files files in
+  let rv = g5_reserved_files files anyrec in
+  if rv == "" then
+    let dv = g5_dup_tydecl_files files [] in
+    if dv == "" then
+      let rfiles = rev_acc [] files in
+      g5_check_files rfiles entry_path s0 [] [] [] "checked" [] []
+    else (s0, [], [], [Diag5 (0 - 1) "type" dv], "invalid", dv, [], [])
+  else (s0, [], [], [Diag5 (0 - 1) "reserved" rv], "invalid", rv, [], [])
+
+-- nominal ADT identity is name-based in v1 (no TypeDefId yet): duplicate
+-- type declarations across modules would conflate distinct ADTs during
+-- unification, so they are rejected program-wide (exposed or not).
+-- Same-file diamonds are visited once, so shared ADTs never false-positive.
 let rec g5_pick_positional args acc = case args of
     [] -> rev_acc [] acc
   | a :: rest ->

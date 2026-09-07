@@ -23,6 +23,7 @@ GEN0=./gen0-interp-rs/target/release/dacelo
 G5CHECK_SRC=gen5/g5check_full.dc
 G5CC_SRC=gen5/g5cc_full.dc
 
+sec_A() {
 echo "== A. checker =="
 cat gen3-dcc-dc/dcc.dc gen5/g5_front.dc gen5/g5_infer.dc gen5/g5_query.dc gen5/g5_lower.dc gen5/g5_driver.dc gen5/g5_main.dc > $G5CHECK_SRC
 $GEN0 $G5CHECK_SRC --types > /dev/null && echo "gen5 typecheck OK"
@@ -52,6 +53,9 @@ done
 echo "checker oracle: $pass agree, $fail differ"
 [ $fail -eq 0 ]
 
+}
+
+sec_B() {
 echo "== B. compiler (dcc_6) =="
 cat gen3-dcc-dc/dcc.dc gen3-dcc-dc/g3_pm_v2.dc gen3-dcc-dc/g3_ce_v2.dc gen3-dcc-dc/g3_driver_v2.dc gen5/g5_front.dc gen5/g5_infer.dc gen5/g5_query.dc gen5/g5_lower.dc gen5/g5_driver.dc gen5/g5cc_driver.dc > $G5CC_SRC
 $GEN0 $G5CC_SRC --types > /dev/null && echo "g5cc typecheck OK"
@@ -96,6 +100,9 @@ $GEN0 gen4-infer-dc/tests/t_bad.dc --types > /tmp/o_g0.log 2>&1 || true
 diff -q /tmp/o_g6.log /tmp/o_g0.log > /dev/null || { echo "  REJECT-MSG-DIFFER(t_bad)"; exit 1; }
 echo "  reject OK (t_bad, Gen0-comparable message)"
 
+}
+
+sec_C() {
 echo "== C. self-build fixpoint (dcc_7) =="
 # self-check peaks ~27GB; retry once on transient OOM (a pass is conclusive)
 try_twice() {
@@ -112,6 +119,9 @@ $GEN0 examples/hello.dc > /tmp/ref_hello.out 2>&1
 diff -q /tmp/ref_hello.out /tmp/g7_hello.out > /dev/null || { echo "  dcc_7 OUTPUT MISMATCH"; exit 1; }
 echo "  dcc_7 smokes OK"
 
+}
+
+sec_D() {
 echo "== D. formatter round-trip =="
 for f in gen3-dcc-dc/dcc.dc gen3-dcc-dc/g3_pm_v2.dc gen3-dcc-dc/g3_ce_v2.dc gen3-dcc-dc/g3_driver_v2.dc gen5/g5_front.dc gen5/g5_infer.dc gen5/g5_query.dc gen5/g5_lower.dc gen5/g5_driver.dc gen5/g5cc_driver.dc gen5/g5_main.dc gen4-infer-dc/infer.dc gen4-infer-dc/g4_check.dc gen4-infer-dc/g4_main.dc gen4-infer-dc/g4cc_driver.dc; do
   ./gen5check format "$f" > /dev/null 2>&1 || { echo "  FORMAT FAIL: $f"; exit 1; }
@@ -121,6 +131,9 @@ for f in gen5-examples/*.dc; do
 done
 echo "  all sources format-clean"
 
+}
+
+sec_E() {
 echo "== E. RFC acceptance (queries, negatives, i18n, budgets) =="
 cat > /tmp/g5e_id.dc <<'EOF'
 let id x = x
@@ -269,6 +282,9 @@ grep -q '"kind":"lacking"' /tmp/g5e_cont.json || { echo "  cont: lacking mark mi
 grep -q '"name":"ok"' /tmp/g5e_cont.json || { echo "  cont: independent item not analyzed"; exit 1; }
 grep -q '"name":"main"' /tmp/g5e_cont.json || { echo "  cont: main not analyzed"; exit 1; }
 echo "  error recovery: independent parts analyzed, dependents marked OK"
+}
+
+sec_F() {
 echo "== F. issue #1 follow-up regressions (P1 soundness + P2 contracts) =="
 cat > /tmp/g5f_pick.dc <<'EOF'
 let pick a b =
@@ -435,5 +451,116 @@ EOF
 ./dcc_6 /tmp/g5f_combo.dc /tmp/g5f_combo > /dev/null 2>&1 || { echo "  combo: COMPILE FAIL"; exit 1; }
 [ "$(/tmp/g5f_combo)" = $'a\nb2' ] || { echo "  combo: OUTPUT MISMATCH"; exit 1; }
 echo "  meaning preserved across lowering paths OK"
+cat gen3-dcc-dc/dcc.dc gen5/g5_front.dc gen5/g5_infer.dc gen5/probe_row_occurs.dc > /tmp/g5occ_full.dc
+$GEN0 /tmp/g5occ_full.dc > /tmp/g5occ.out 2>&1 || { echo "  occurs probe: RUN FAIL"; exit 1; }
+printf 'true\ntrue\ntrue\ntrue\nfalse\nfalse\ntrue\n' > /tmp/g5occ.exp
+diff -q /tmp/g5occ.exp /tmp/g5occ.out > /dev/null || { echo "  occurs probe: OUTPUT MISMATCH"; exit 1; }
+echo "  row occurs: unit predicate OK (direct/nested/fun/tuple/negatives/subst)"
+cat gen3-dcc-dc/dcc.dc gen5/g5_front.dc gen5/g5_infer.dc gen5/probe_row_unify.dc > /tmp/g5runify_full.dc
+$GEN0 /tmp/g5runify_full.dc > /tmp/g5runify.out 2>&1 || { echo "  row unify probe: RUN FAIL"; exit 1; }
+printf 'true\n{x : Int, y : Bool | r}\n{y : Bool | r}\n{x : Int | r}\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\ntrue\n' > /tmp/g5runify.exp
+diff -q /tmp/g5runify.exp /tmp/g5runify.out > /dev/null || { echo "  row unify probe: OUTPUT MISMATCH"; diff /tmp/g5runify.exp /tmp/g5runify.out; exit 1; }
+echo "  row unify: unit invariants OK (both sides normalize equal, swap-invariant, residual to both tails, rigid/closed/occurs)"
+mkdir -p /tmp/g5r1 && printf 'module A exposing (make)\ntype Box = ABox Int\nlet make x = ABox x\n' > /tmp/g5r1/A.dc
+printf 'module B exposing (read)\ntype Box = BBox Bool\nlet read x = case x of | BBox b -> if b then 1 else 0\n' > /tmp/g5r1/B.dc
+printf 'import A\nimport B\nlet main () = print_int (read (make 42))\n' > /tmp/g5r1/Main.dc
+set +e
+./gen5check check /tmp/g5r1/Main.dc > /dev/null 2>&1
+[ $? -eq 1 ] || { echo "  nominal dup: same-name ADT across modules must reject"; exit 1; }
+set -e
+mkdir -p /tmp/g5r1d && printf 'module Sh exposing (mk, get)\ntype T = | C Int\nlet mk n = C n\nlet get x = case x of | C n -> n\n' > /tmp/g5r1d/Sh.dc
+printf 'import Sh\nlet main () = print_int (get (mk 2))\n' > /tmp/g5r1d/U1.dc
+printf 'import Sh\nlet main () = print_int 0\n' > /tmp/g5r1d/E1.dc
+printf 'import Sh\nlet main () = print_int 0\n' > /tmp/g5r1d/E2.dc
+printf 'import E1\nimport E2\nimport Sh\nlet main () = print_int 0\n' > /tmp/g5r1d/Dia.dc
+./gen5check check /tmp/g5r1d/Dia.dc > /dev/null 2>&1 || { echo "  nominal diamond: shared ADT via two paths must accept"; exit 1; }
+echo "  nominal ADT: dup rejected, diamond accepted OK"
+cat > /tmp/g5r2_scope.dc <<'EOF'
+let f u =
+  let a = (let hidden = 1 in hidden) in
+  u
+let later = true
+EOF
+./gen5check focus /tmp/g5r2_scope.dc --at=3:3 --format=json > /tmp/g5r2_scope.json 2>&1 || { echo "  scope: FAIL"; exit 1; }
+if grep -q '"name":"hidden"' /tmp/g5r2_scope.json; then echo "  scope: exited let leaked"; exit 1; fi
+if grep -q '"name":"later"' /tmp/g5r2_scope.json; then echo "  scope: later def leaked"; exit 1; fi
+grep -q '"name":"u"' /tmp/g5r2_scope.json || { echo "  scope: current param missing"; exit 1; }
+grep -q '"name":"a"' /tmp/g5r2_scope.json || { echo "  scope: visible local missing"; exit 1; }
+cat > /tmp/g5r2_sib.dc <<'EOF'
+type T = | A Int | B Int
+let f v = case v of | A n -> n + 1 | B m -> m + 2
+let main () = print_int 0
+EOF
+./gen5check focus /tmp/g5r2_sib.dc --at=2:38 --format=json > /tmp/g5r2_sib.json 2>&1 || { echo "  sibscope: FAIL"; exit 1; }
+if grep -q '"name":"n"' /tmp/g5r2_sib.json; then echo "  sibscope: sibling branch leaked"; exit 1; fi
+grep -q '"name":"m"' /tmp/g5r2_sib.json || { echo "  sibscope: own branch missing"; exit 1; }
+cat > /tmp/g5r2_lam.dc <<'EOF'
+let g a = a
+let f x = g (fun y -> y)
+let main () = print_int 0
+EOF
+./gen5check focus /tmp/g5r2_lam.dc --at=2:23 --format=json > /tmp/g5r2_lam.json 2>&1 || { echo "  lamscope: FAIL"; exit 1; }
+grep -q '"name":"y"' /tmp/g5r2_lam.json || { echo "  lamscope: inner lambda param missing"; exit 1; }
+if grep -q '"name":"a"' /tmp/g5r2_lam.json; then echo "  lamscope: outer param leaked into file scope"; exit 1; fi
+cat > /tmp/g5r2_sh.dc <<'EOF'
+let f x = 1
+let g x = x
+let main () = print_int 0
+EOF
+./gen5check focus /tmp/g5r2_sh.dc --at=2:11 --format=json > /tmp/g5r2_sh.json 2>&1 || { echo "  shadowscope: FAIL"; exit 1; }
+grep -q '"start":18,"end":19' /tmp/g5r2_sh.json || { echo "  shadowscope: nearest binding not chosen"; exit 1; }
+cat > /tmp/g5r2_rec.dc <<'EOF'
+let rec f n = if n == 0 then 0 else f (n - 1)
+let main () = print_int (f 3)
+EOF
+./gen5check focus /tmp/g5r2_rec.dc --at=1:33 --format=json > /tmp/g5r2_rec.json 2>&1 || { echo "  recscope: FAIL"; exit 1; }
+grep -q '"name":"f"' /tmp/g5r2_rec.json || { echo "  recscope: rec name missing in own body"; exit 1; }
+grep -q '"name":"n"' /tmp/g5r2_rec.json || { echo "  recscope: param missing"; exit 1; }
+echo "  lexical scope: exited/later/sibling/lambda/shadow/rec OK"
+mkdir -p /tmp/g5r3 && printf 'module A exposing (value)\nlet value = 42\n' > /tmp/g5r3/A.dc
+printf 'module B exposing (other)\nlet other value = value\nlet value = true\n' > /tmp/g5r3/B.dc
+printf 'module C exposing (third)\nlet value = "s"\nlet third = value\n' > /tmp/g5r3/C.dc
+printf 'import A\nimport B\nimport C\nlet answer = value\n' > /tmp/g5r3/Main.dc
+./gen5check focus /tmp/g5r3/Main.dc --at=4:14 --format=json > /tmp/g5r3.json 2>&1 || { echo "  impbinding: FAIL"; exit 1; }
+grep -q '"occurrence":"Int"' /tmp/g5r3.json || { echo "  impbinding: occurrence not Int (private same-name value leaked?)"; exit 1; }
+grep -q '"binding":{"id":[0-9]*,"name":"value","decl":{"start":30,"end":35,"file":"/tmp/g5r3/A.dc"}' /tmp/g5r3.json || { echo "  impbinding: decl is not A.dc top-level value [30,35)"; exit 1; }
+echo "  import binding: decl = exporter's def despite same-name param/private values in B/C OK"
+cat > /tmp/g5r4.dc <<'EOF'
+let good = 1
+let x = 2
+let f x = if x then (?h : Int) else 0
+EOF
+./gen5check holes /tmp/g5r4.dc > /tmp/g5r4.txt 2>&1 || { echo "  shadowhole: FAIL"; exit 1; }
+grep -q 'good : Int' /tmp/g5r4.txt || { echo "  shadowhole: good missing"; exit 1; }
+if grep -q '^  x :' /tmp/g5r4.txt; then echo "  shadowhole: shadowed x kept"; exit 1; fi
+cat > /tmp/g5r4f.dc <<'EOF'
+let good = 1
+let x = 2
+let f x = if x then good else 0
+let main () = print_int (f true)
+EOF
+./gen5check check /tmp/g5r4f.dc > /dev/null 2>&1 || { echo "  shadowhole: filled recheck FAIL"; exit 1; }
+./dcc_6 /tmp/g5r4f.dc /tmp/g5r4f > /dev/null 2>&1 || { echo "  shadowhole: filled COMPILE FAIL"; exit 1; }
+[ "$(/tmp/g5r4f)" = "1" ] || { echo "  shadowhole: filled run MISMATCH"; exit 1; }
+echo "  hole shadowing: hidden binding dropped, fill rechecks+runs OK"
+
+}
+
+# Section selection (sections A-F above are functions; default runs all):
+#   GEN5_SKIP="C"     skip listed sections (space-separated letters)
+#   GEN5_ONLY="E F"   run only the listed sections
+# Later sections use ./gen5check (built by A) and ./dcc_6 (built by B); when
+# skipping A/B the existing binaries must already match the current sources
+# (test.sh regenerates gen5/g5*_full.dc, so a plain `cmp` against them tells).
+skip_sec() {
+  case " ${GEN5_SKIP:-} " in *" $1 "*) return 0;; esac
+  if [ -n "${GEN5_ONLY:-}" ]; then
+    case " $GEN5_ONLY " in *" $1 "*) return 1;; *) return 0;; esac
+  fi
+  return 1
+}
+for sec in A B C D E F; do
+  if skip_sec $sec; then echo "== $sec. skipped (GEN5_SKIP/GEN5_ONLY) =="; else sec_$sec; fi
+done
 
 echo "ALL GEN5 CHECKS PASSED"

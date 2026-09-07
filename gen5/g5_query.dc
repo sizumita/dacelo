@@ -170,7 +170,7 @@ let g5_scheme_json s sch = case sch of
 
 -- ---------- query context (assembled by driver from check results) ----------
 
-type QCtx5 = QCtx5 String Snap5 (List ItemSum5) (List NodeE5) (List SymE5) (List HoleE5) (List Warn5) (List Diag5) String String TIS5 (List (String, List (String, Sch5), List TyDecl5, List NodeE5, List SymE5))
+type QCtx5 = QCtx5 String Snap5 (List ItemSum5) (List NodeE5) (List SymE5) (List HoleE5) (List Warn5) (List Diag5) String String TIS5 (List (String, List (String, Sch5, Int), List TyDecl5, List NodeE5, List SymE5))
 
 let q_src q = case q of | QCtx5 a _ _ _ _ _ _ _ _ _ _ _ -> a
 let q_snap q = case q of | QCtx5 _ a _ _ _ _ _ _ _ _ _ _ -> a
@@ -225,62 +225,128 @@ let rec g5_sym_get syms id = case syms of
 
 -- ---------- focus ----------
 
--- Lexical local env: top-level names are always visible; other syms only
--- if declared inside the top-level item enclosing the query offset (scope
--- islands). "Declared before" alone is NOT visibility (issue #1-8).
-let rec g5_span_file_json sp file =
-  case sp of
-    | Span a b -> "{\"start\":" ++ int_to_string a ++ ",\"end\":" ++ int_to_string b ++ ",\"file\":" ++ g5_json_str file ++ "}"
+-- Lexical local env via resolved scopes (issue #1 R2): a sym is visible at
+-- the query offset iff its scope contains it (lets/lambdas/branches link
+-- their node; tops fall back to item order). Shadowing resolves to the
+-- largest decl start; display is outer-to-inner. File tags are entry-local
+-- (imported names resolve through tables at the binding site, not here).
+let rec g5_local_env q noff acc n =
+  g5_local_env_go (q_syms q) q noff acc
 
-let rec g5_local_env syms noff tops defs file acc n = case syms of
-    [] -> acc
-  | sy :: rest ->
-      if n == 0 then acc
-      else case sy of
-        | SymE5 _ nm dsp _ sch ->
-            if g5_mem_str_nm nm tops then g5_local_env rest noff tops defs file ((nm, sch, dsp, file) :: acc) (n - 1)
-            else case dsp of
-              | Span a _ ->
-                  if a <= noff then
-                    if g5_in_enclosing dsp defs noff then g5_local_env rest noff tops defs file ((nm, sch, dsp, file) :: acc) (n - 1)
-                    else g5_local_env rest noff tops defs file acc n
-                  else g5_local_env rest noff tops defs file acc n
+and g5_local_env_go syms q noff acc = case syms of
+    [] -> g5_first_per_name (g5_sort_start acc) [] [] 12
+  | sy :: rest -> case sy of
+      | SymE5 _ nm dsp nid sch ->
+          if g5_sym_visible q sy noff then g5_local_env_go rest q noff ((nm, sch, dsp) :: acc)
+          else g5_local_env_go rest q noff acc
 
-and g5_in_enclosing dsp defs noff = case dsp of
-  | Span x y -> case defs of
-      | [] -> false
-      | d :: rest -> case d of
+and g5_sym_visible q sy noff = case sy of
+  | SymE5 _ _ dsp nid _ ->
+      if g5_sym_prefilter q dsp noff then
+        if nid == (0 - 1) then g5_top_visible q dsp noff
+        else
+          case g5_node_get (q_nodes q) nid of
+            | NodeE5 i nsp _ _ _ _ _ _ ->
+                if i == nid then g5_scope_hit q nsp dsp noff
+                else g5_top_visible q dsp noff
+      else false
+
+and g5_scope_hit q nsp dsp noff = case nsp of
+  | Span a b -> case dsp of
+      | Span x y ->
+          if a == x then
+            if y == b then g5_same_item_strict q dsp noff
+            else if a <= noff then g5_lt b noff else false
+          else if a <= x then (if y <= b then (if a <= noff then g5_lt b noff else false) else false)
+          else false
+
+-- same item only (wrapped def params: equal-span scope node carries no
+-- order info, and order fallback would leak them into later items)
+and g5_same_item_strict q dsp noff =
+  case g5_item_at (q_sums q) noff of
+    | Span a b ->
+        if a < 0 then false
+        else case dsp of
+          | Span x y -> if a <= x then y <= b else false
+
+and g5_lt b noff = noff < b
+
+and g5_same_item q dsp noff =
+  case g5_item_at (q_sums q) noff of
+    | Span a b ->
+        if a < 0 then false
+        else case dsp of
+          | Span x y -> if a <= x then (if y <= b then true else x <= noff) else x <= noff
+
+-- smallest node span strictly containing the decl span; (-1,-1) if none.
+-- Strictness matters: a binder occurrence never scopes itself (e.g. wrapped
+-- def params whose span equals the lambda span fall through to item order).
+-- cheap prefilter (same item, else declared-before); scope check decides
+and g5_sym_prefilter q dsp noff =
+  case g5_item_at (q_sums q) noff of
+    | Span a b ->
+        if a < 0 then g5_started dsp noff
+        else case dsp of
+          | Span x y ->
+              if a <= x then (if y <= b then true else x <= noff)
+              else x <= noff
+
+and g5_top_visible q dsp noff =
+  case g5_item_at (q_sums q) noff of
+    | Span a b ->
+        if a < 0 then g5_started dsp noff
+        else case dsp of
+          | Span x y ->
+              if a <= x then (if y <= b then true else x <= noff)
+              else x <= noff
+
+and g5_started dsp noff = case dsp of
+  | Span x _ -> x <= noff
+
+and g5_item_at sums noff = case sums of
+    [] -> Span (0 - 1) (0 - 1)
+  | it :: rest -> case it of
+      | ItemSum5 _ sp _ _ _ -> case sp of
           | Span a b ->
-              if a <= noff then (if noff < b then (if a <= x then (if y <= b then true else g5_in_enclosing dsp rest noff) else g5_in_enclosing dsp rest noff) else g5_in_enclosing dsp rest noff)
-              else g5_in_enclosing dsp rest noff
+              if a <= noff then (if noff < b then sp else g5_item_at rest noff)
+              else g5_item_at rest noff
 
-and g5_tops_of_sums sums acc = case sums of
-    [] -> acc
-  | it :: rest -> case it of
-      | ItemSum5 _ _ binds _ _ -> g5_tops_of_sums rest (g5_tops_of_binds binds acc)
+and g5_sort_start xs = case xs of
+    [] -> []
+  | kv :: rest -> g5_insert_start kv (g5_sort_start rest)
 
-and g5_tops_of_binds binds acc = case binds of
-    [] -> acc
-  | b :: rest -> case b of
-      | BindTy5 nm _ _ _ _ -> g5_tops_of_binds rest (nm :: acc)
+and g5_insert_start kv ys = case ys of
+    [] -> kv :: []
+  | h :: rest -> case h of
+      | (_, _, dsp2) -> case kv of
+          | (_, _, dsp) -> case dsp of
+              | Span x _ -> case dsp2 of
+                  | Span y _ -> if x < y then kv :: ys else h :: g5_insert_start kv rest
 
-and g5_defspans_of_sums sums acc = case sums of
+and g5_first_per_name xs seen acc n = case xs of
     [] -> acc
-  | it :: rest -> case it of
-      | ItemSum5 _ sp _ _ _ -> g5_defspans_of_sums rest (sp :: acc)
+  | kv :: rest -> case kv of
+      | (nm, _, _) ->
+          if n == 0 then acc
+          else if g5_mem_str_nm nm seen then g5_first_per_name rest seen acc n
+          else g5_first_per_name rest (nm :: seen) (kv :: acc) (n - 1)
 
 and g5_mem_str_nm x xs = case xs of
     [] -> false
   | h :: rest -> if h == x then true else g5_mem_str_nm x rest
 
-let rec g5_local_json s envs = case envs of
+let rec g5_span_file_json sp file =
+  case sp of
+    | Span a b -> "{\"start\":" ++ int_to_string a ++ ",\"end\":" ++ int_to_string b ++ ",\"file\":" ++ g5_json_str file ++ "}"
+
+let rec g5_local_json s file envs = case envs of
     [] -> ""
   | kv :: rest -> case kv of
-      | (nm, sch, dsp, file) ->
+      | (nm, sch, dsp) ->
           let here = "{\"name\":" ++ g5_json_str nm ++ ",\"scheme\":" ++ g5_json_str (g5_scheme_text s sch) ++ ",\"decl\":" ++ g5_span_file_json dsp file ++ "}" in
           case rest of
             | [] -> here
-            | _ -> here ++ "," ++ g5_local_json s rest
+            | _ -> here ++ "," ++ g5_local_json s file rest
 
 let rec g5_inst_json s sch inst = case inst of
     [] -> ""
@@ -385,9 +451,9 @@ let g5_focus_json q off maxb =
       | NodeE5 _ sp ty symid sch inst exp reason ->
           let s = q_state q in
           let bjson = g5_binding_json q symid sch in
-          let locs = g5_local_env (q_syms q) (span_start sp) (g5_tops_of_sums (q_sums q) []) (g5_defspans_of_sums (q_sums q) []) (g5_entry_file q) [] 12 in
+          let locs = g5_local_env q (span_start sp) [] 12 in
           let cjson = g5_parent_json q nid sp in
-          let full = "{\"found\":true,\"node\":" ++ int_to_string nid ++ ",\"span\":" ++ g5_span_json sp ++ ",\"occurrence\":" ++ g5_json_str (g5_show s ty) ++ ",\"binding\":" ++ bjson ++ ",\"instantiation\":[" ++ g5_inst_json s sch inst ++ "],\"expected\":" ++ g5_maybe_ty_json s exp ++ ",\"reason\":" ++ g5_json_str reason ++ ",\"containing\":" ++ cjson ++ ",\"local_env\":[" ++ g5_local_json s locs ++ "]}" in
+          let full = "{\"found\":true,\"node\":" ++ int_to_string nid ++ ",\"span\":" ++ g5_span_json sp ++ ",\"occurrence\":" ++ g5_json_str (g5_show s ty) ++ ",\"binding\":" ++ bjson ++ ",\"instantiation\":[" ++ g5_inst_json s sch inst ++ "],\"expected\":" ++ g5_maybe_ty_json s exp ++ ",\"reason\":" ++ g5_json_str reason ++ ",\"containing\":" ++ cjson ++ ",\"local_env\":[" ++ g5_local_json s (g5_entry_file q) locs ++ "]}" in
           let reduced = "{\"found\":true,\"node\":" ++ int_to_string nid ++ ",\"span\":" ++ g5_span_json sp ++ ",\"occurrence\":" ++ g5_json_str (g5_show s ty) ++ ",\"binding\":" ++ bjson ++ "}" in
           g5_envelope (g5_snap_wrap q full) maxb (g5_snap_wrap q reduced)
 
@@ -1009,7 +1075,7 @@ let rec g5_fmt_e e = case e of
   | EBin5 op l r _ -> "(" ++ g5_fmt_e l ++ " " ++ op ++ " " ++ g5_fmt_e r ++ ")"
   | EIf5 c t el _ -> "(if " ++ g5_fmt_e c ++ " then " ++ g5_fmt_e t ++ " else " ++ g5_fmt_e el ++ ")"
   | ECase5 sc brs _ -> "(case " ++ g5_fmt_e sc ++ " of " ++ g5_fmt_brs brs ++ ")"
-  | ELet5 rc n rhs body _ -> "(let " ++ (if rc then "rec " else "") ++ n ++ " = " ++ g5_fmt_e rhs ++ " in " ++ g5_fmt_e body ++ ")"
+  | ELet5 rc n _ rhs body _ -> "(let " ++ (if rc then "rec " else "") ++ n ++ " = " ++ g5_fmt_e rhs ++ " in " ++ g5_fmt_e body ++ ")"
   | ETup5 es _ -> "(" ++ g5_fmt_es_comma es ++ ")"
   | EAnn5 x t _ -> "(" ++ g5_fmt_e x ++ " : " ++ g5_fmt_ty t ++ ")"
   | ERec5 flds _ -> if g5_fmt_fields flds == "" then "{}" else "{ " ++ g5_fmt_fields flds ++ " }"

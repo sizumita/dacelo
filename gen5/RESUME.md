@@ -1,6 +1,30 @@
 # Gen5 再開ガイド (fresh lineage, dacelo製・gen0無改変)
 
-## issue #1 追記レビュー対応（P1×6＋P2×5、11件完治）
+## issue #1 再レビュー対応（R1＋R2〜R4残件）
+
+- **R1 nominal dup拒否**：program-wideの型名重複を拒否（非公開含む）。
+  diamondは同一file単一訪問で誤検出なし。値のdup検査と文言統一。
+- **R2 scope解決**：arm node追加＋nid-link scope＋item fallback＋order。
+  同時修正：ELet5にbinder span追加、括弧のrespan（item span切詰めの根因）、
+  top symのnidは(0-1)明示。siblings/lambda/shadow/recを検証。
+- **R3 export Sid**：tablesに(name,sch,sid)、sc seedで型と束縛を統合。
+  top sidは(name,defspan)照合、ctorはfirst-match。decl file tag付き。
+- **R4 hole shadow**：seen集合＋sc優先decl。fill再検査＋実行まで検証。
+- **レビュー#2のテスト要望**：`probe_row_unify.dc`（単一化成功⇒両辺`g5_show`一致、
+  引数交換不変、残余の両tail伝播、closed/rigid/同一tail/nested occurs/型不一致の受否、
+  15行固定出力）をGen0経由でF節に追加。R3回帰はB/Cに同名引数＋private同名値を置き、
+  `binding.decl`がA.dcの`[30,35)`・`occurrence`がIntであることをJSON具体値で検証。
+- **test.shのセクション選択**：各節を`sec_X()`関数化し`GEN5_SKIP="C"`／`GEN5_ONLY="E F"`で
+  部分実行可（A/Bを飛ばす時は既存バイナリがソース一致していること。実行中のtest.shを
+  同じinodeに上書きしない）。A/B/D/E/Fで約4分。
+- **skill**：`.claude/skills/gen5-dev/`（連結順・最短ループ・C節の扱い・probeの書き方・
+  レビュー対応手順・Dacelo落とし穴 `references/dacelo-pitfalls.md`）。
+- **吸収バグの法則化**：後続`|`のあるarm直下caseは無条件に括弧化。
+  （multi-armでも吸収されることをprobeで確定。indent無関係。）
+- **Gen0の癖（追加）**：文字列リテラル後の変数腕は型検査を誤る（if化で回避）。
+  `and`束縛は複数型で使えない（既知・再確認）。
+
+## issue #1 追記レビュー対応（P1×6＋P2×5：レビュー#2で9件修正確認、8・9の残件は上のR2〜R4で対応）
 
 - **P0級の副産物：rollback反転**：`g5_rollback`が newest-ns を残し history を
   捨てていた（`g5_trunc`の向き間違い。unit probeで確定後 `g5_drop` に修正）。
@@ -62,15 +86,28 @@
   自己検査がexit 137で死ぬことを確認済み（3:58経過時点）。A/B/D/E/F＋不動点は
   現行でgreen。C完走は空き27GB+のboxで再走要（test.sh Cにtry_twice済み）。
 
-## 達成状態 (./gen5/test.sh が ALL PASSED)
+## 達成状態とcommit別結果（レビュー指摘を受け明記）
+
+- `110545d` 時点：A/B/C(自己検査exit 0) /不動点/D/E が ALL PASSED。
+- `86342dc` 時点：A/B/D/E/F green、不動点 green。C自己検査はbox都合で
+  exit 137（OOM、3:58経過。p1/pfx曲線で回帰なし確定済み）。
+- 現行（未commit、R1-R4＋rollback修正＋respan等＋レビュー#2のテスト要望を含む、2026-09-08）：
+  A 38/38・B・D・E・F green（`GEN5_SKIP=C zsh gen5/test.sh` 約4分で再確認）。
+  C 自己検査は **この box では完走不能**：`gen5check check gen5/g5cc_full.dc` は
+  エラーメッセージなしに約272秒で異常終了（`/usr/bin/time -l`: 最大RSS 23.7GB、
+  peak memory footprint 140GB → OS の OOM kill、exit 137 相当。llama-server 停止・空き 22GB でも再現）。
+  根因はチェッカのバグではなくランタイム側：rt.c の `dacelo_alloc` は `live_bytes` を sweep でしか
+  更新しないため GC トリガ条件が事実上成立せず、**mark-sweep は一度も走らない**（総確保量がそのまま常駐）。
+  よって現行 commit の C は「未検証」であり、解決はランタイム刷新（branch `gen5-gc`、`gen5/GC_DESIGN.md`）で行う。
+  不動点（`--backend-only`）も同じメモリ都合で本 box では未完。
 
 | 検証 | 結果 |
 |---|---|
 | A. `gen5check check` vs Gen0 `--types` (examples 5 + gen4 tests 33) | 38 agree, 0 differ（終了コード＋メッセージ完全一致） |
 | B. `dcc_6` vs `dcc_1` の `.s` (hello/fib/list_ops/closures/tree) | バイト同一＋実行一致 |
 | B. Gen5機能 | record→`Alice,Bob`、`{with}`更新→`11`、空レコードOK、moduleリンクOK、sig受諾、holeはexit 2、sig_wrong・unknown field・ill-typed拒否 |
-| C. `gen5check check gen5/g5cc_full.dc` (7030行) | exit 0 |
-| C. 不動点 `dcc_6.s == dcc_7.s` (4,483,043B) | 一致。dcc_7でhello/record実行OK |
+| C. `gen5check check gen5/g5cc_full.dc` (7030行) | exit 0（`110545d` 時点。現行は上記の通り OOM kill） |
+| C. 不動点 `dcc_6.s == dcc_7.s` (4,483,043B) | 一致（`110545d` 時点）。dcc_7でhello/record実行OK |
 | D. 全15ソース `format` 再parse一致 | clean |
 
 ## Layout
@@ -86,7 +123,8 @@
   （regen時のみGen0必須）。残る非Dacelo依存はzsh・cc・rt.c(Cソース)のみ。
 - 自己検査はRSS ~25GBで34GB共有機では一過性OOMがあり得る→1回だけリトライ
   （exit 0のみ通過なので誤検出なし）。実例あり（再実行でexit 0確認）。
-- `test.sh`: 検証用（build.shとほぼ同工程＋例題マトリクス＋format。約15分）。
+- `test.sh`: 検証用（build.shとほぼ同工程＋例題マトリクス＋format＋issue #1回帰。約15分、
+  `GEN5_SKIP`/`GEN5_ONLY` で節を選べる。C節は単独・空きRAM 27GB+で走らせる）。
 
 - `g5_front.dc`: span lexer (UTF-8 byte半開区間 `Span`)、位置付き `PTok`、AST5
   (`E*5/T*5/P*5` 改名でlegacy衝突回避)、supersetパーサ。Gen4サブセット構文のみ使用。

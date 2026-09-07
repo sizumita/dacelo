@@ -1,0 +1,60 @@
+-- Unit regression for row-unification invariants (issue #1 review #2 asked
+-- for an in-repo check of "unify success => both sides normalize equal"):
+--   (i)   after a successful unify, g5_show of both sides is identical
+--   (ii)  swapping the arguments yields the same normal form
+--   (iii) residual fields reach BOTH tails (flex/flex shares a fresh tail)
+--   (iv)  closed/open, rigid tails, same-tail conflicts, nested occurs and
+--         field-type mismatches are accepted/rejected as the solver spec says
+-- Build: cat gen3-dcc-dc/dcc.dc gen5/g5_front.dc gen5/g5_infer.dc gen5/probe_row_unify.dc > /tmp/g5runify_full.dc
+-- Run: ./gen0-interp-rs/target/release/dacelo /tmp/g5runify_full.dc
+-- (assembled by test.sh F; Gen0-routed to stay lean on RAM).
+-- Expect 15 lines: true, three printed normal forms, then true x 11.
+
+let showb b = if b then print_string "true\n" else print_string "false\n"
+
+-- counters above the hand-written var/row ids (1..9): fresh ids never collide
+let g5p_st = g5s_with_rowctr (g5s_with_ctr g5s_new 10) 10
+
+-- unify from the pristine state; (state, ok)
+let g5p_try a b = case g5_unify a b g5p_st "" of
+  | (s1, e) -> (s1, e == "")
+
+-- success AND both normal forms print the same
+let g5p_agree a b = case g5p_try a b of
+  | (s1, ok) -> if ok then g5_show s1 a == g5_show s1 b else false
+
+let g5p_rejects a b = case g5p_try a b of
+  | (_, ok) -> if ok then false else true
+
+let g5p_o1 = TRec5 [("x", TC5 "Int")] (ROpen5 1)
+let g5p_o2 = TRec5 [("y", TC5 "Bool")] (ROpen5 2)
+let g5p_s12 = case g5p_try g5p_o1 g5p_o2 of | (s1, _) -> s1
+let g5p_s21 = case g5p_try g5p_o2 g5p_o1 of | (s1, _) -> s1
+
+let main () =
+  -- (i)+(iii) flex/flex, disjoint fields
+  showb (g5p_agree g5p_o1 g5p_o2) ;
+  print_string (g5_show g5p_s12 g5p_o1 ++ "\n") ;
+  print_string (g5_show g5p_s12 (TRec5 [] (ROpen5 1)) ++ "\n") ;
+  print_string (g5_show g5p_s12 (TRec5 [] (ROpen5 2)) ++ "\n") ;
+  -- (ii) swapped arguments: same acceptance, same normal form
+  showb (g5p_agree g5p_o2 g5p_o1) ;
+  showb (g5_show g5p_s21 g5p_o1 == g5_show g5p_s12 g5p_o1) ;
+  -- common field unified (a := Int), tails shared
+  showb (g5p_agree (TRec5 [("x", TVI5 1)] (ROpen5 1)) (TRec5 [("x", TC5 "Int")] (ROpen5 2))) ;
+  -- rows nested inside a function type
+  showb (g5p_agree (TAr5 g5p_o1 (TC5 "Int")) (TAr5 g5p_o2 (TC5 "Int"))) ;
+  -- closed vs open: open tail absorbs the residual and closes
+  showb (g5p_agree (TRec5 [("x", TC5 "Int"), ("y", TC5 "Bool")] RClosed5) (TRec5 [("x", TC5 "Int")] (ROpen5 3))) ;
+  -- closed side lacks z: reject
+  showb (g5p_rejects (TRec5 [("x", TC5 "Int"), ("z", TC5 "Int")] (ROpen5 4)) (TRec5 [("x", TC5 "Int")] RClosed5)) ;
+  -- same tail, different fields: unsatisfiable (unique labels)
+  showb (g5p_rejects (TRec5 [("x", TC5 "Int")] (ROpen5 5)) (TRec5 [("y", TC5 "Int")] (ROpen5 5))) ;
+  -- rigid tail vs flex tail with no residual: flex binds to the rigid tail
+  showb (g5p_agree (TRec5 [("x", TC5 "Int")] (ROpen5 (0 - 1))) (TRec5 [("x", TC5 "Int")] (ROpen5 6))) ;
+  -- rigid tail cannot absorb y
+  showb (g5p_rejects (TRec5 [("x", TC5 "Int")] (ROpen5 (0 - 1))) (TRec5 [("x", TC5 "Int"), ("y", TC5 "Int")] (ROpen5 7))) ;
+  -- nested occurs through the flex/flex path: {x : {| r8} | r9} vs {y : Int | r8}
+  showb (g5p_rejects (TRec5 [("x", TRec5 [] (ROpen5 8))] (ROpen5 9)) (TRec5 [("y", TC5 "Int")] (ROpen5 8))) ;
+  -- field type mismatch surfaces through the row path
+  showb (g5p_rejects (TRec5 [("x", TC5 "Int")] (ROpen5 1)) (TRec5 [("x", TC5 "Bool")] (ROpen5 2)))

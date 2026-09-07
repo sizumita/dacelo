@@ -129,7 +129,7 @@ type Expr5 =
   | EBin5 String Expr5 Expr5 Span
   | EIf5 Expr5 Expr5 Expr5 Span
   | ECase5 Expr5 (List (Pat5, Expr5)) Span
-  | ELet5 Bool String Expr5 Expr5 Span
+  | ELet5 Bool String Span Expr5 Expr5 Span
   | ETup5 (List Expr5) Span
   | EAnn5 Expr5 TyAst5 Span
   | ERec5 (List (String, Expr5)) Span
@@ -157,6 +157,28 @@ type Mod5 = NoMod5 | Mod5 String (List String) Span
 
 type Prog5 = Prog5 Mod5 (List Item5)
 
+-- widen an expr span (parenthesized positions keep token extents, so
+-- application/item ends derived from AST spans stay truthful)
+let rec g5_respan e s e2 = case e of
+  | EInt5 n _ -> EInt5 n (Span s e2)
+  | EBool5 b _ -> EBool5 b (Span s e2)
+  | EStr5 x _ -> EStr5 x (Span s e2)
+  | EUnit5 _ -> EUnit5 (Span s e2)
+  | EVar5 n _ -> EVar5 n (Span s e2)
+  | ECtor5 c _ -> ECtor5 c (Span s e2)
+  | ELam5 p b _ -> ELam5 p b (Span s e2)
+  | EApp5 f a _ -> EApp5 f a (Span s e2)
+  | EBin5 op l r _ -> EBin5 op l r (Span s e2)
+  | EIf5 c t el _ -> EIf5 c t el (Span s e2)
+  | ECase5 sc brs _ -> ECase5 sc brs (Span s e2)
+  | ELet5 rc n nsp rhs body _ -> ELet5 rc n nsp rhs body (Span s e2)
+  | ETup5 es _ -> ETup5 es (Span s e2)
+  | EAnn5 x ty _ -> EAnn5 x ty (Span s e2)
+  | ERec5 flds _ -> ERec5 flds (Span s e2)
+  | EProj5 r lb _ -> EProj5 r lb (Span s e2)
+  | EWith5 b lb u _ -> EWith5 b lb u (Span s e2)
+  | EHole5 nm _ -> EHole5 nm (Span s e2)
+
 let e5_span e = case e of
   | EInt5 _ s -> s
   | EBool5 _ s -> s
@@ -169,7 +191,7 @@ let e5_span e = case e of
   | EBin5 _ _ _ s -> s
   | EIf5 _ _ _ s -> s
   | ECase5 _ _ s -> s
-  | ELet5 _ _ _ _ s -> s
+  | ELet5 _ _ _ _ _ s -> s
   | ETup5 _ s -> s
   | EAnn5 _ _ s -> s
   | ERec5 _ s -> s
@@ -489,7 +511,7 @@ and g5_patom toks = case toks of
         if g5_is_sym5 "," t1 then g5_ptuple_more (g5_drop1 t1) [e]
         else
           let (t2, e2) = g5_expect_sym ")" t1 in
-          (e, t2, e2)
+          (g5_respan e s e2, t2, e2)
   | PTok (TSym "[") s _ :: rest ->
       if g5_is_sym5 "]" rest then
         let (t1, e1) = g5_expect_sym "]" rest in
@@ -591,7 +613,7 @@ and g5_pseq toks =
   let (l, t1, _) = g5_pann toks in
   if g5_is_sym5 ";" t1 then
     let (r, t2, _) = g5_pexpr (g5_drop1 t1) in
-    (ELet5 false "_" l r (e5_span l), t2, span_end (e5_span r))
+    (ELet5 false "_" span_dummy l r (e5_span l), t2, span_end (e5_span r))
   else (l, t1, span_end (e5_span l))
 
 and g5_pplet toks =
@@ -653,14 +675,15 @@ and g5_plocal_let toks =
   let (isrec, t1) = (case toks of
                          | PTok (TKw "rec") _ _ :: rest -> (true, rest)
                          | r -> (false, r)) in
-  let (name, t2, _) = g5_take_ident t1 in
+  let (name, t2, ne) = g5_take_ident t1 in
+  let nsp = Span (g5_peek_start t1) ne in
   let (params, t3, _) = g5_pmany_param t2 [] in
   let (mty, t4) = g5_eat_ann_opt2 t3 in
   let (t5, _) = g5_expect_sym "=" t4 in
   let (rhs, t6, _) = g5_pexpr t5 in
   let (t7, _) = g5_expect_kw "in" t6 in
   let (body, t8, e8) = g5_pexpr t7 in
-  (ELet5 isrec name (g5_wrap_lams params rhs) body (Span s e8), t8, e8)
+(ELet5 isrec name nsp (g5_wrap_lams params rhs) body (Span s e8), t8, e8)
 
 and g5_ppat_atom toks = case toks of
   | PTok (TIdent "_") s e :: rest -> (PWild5 (Span s e), rest, e)
@@ -885,7 +908,7 @@ let rec g5_eq_e a b = case a of
   | EBin5 o x y _ -> (case b of | EBin5 p u v _ -> if o == p then (if g5_eq_e x u then g5_eq_e y v else false) else false | _ -> false)
   | EIf5 c t e _ -> (case b of | EIf5 c2 t2 e2 _ -> if g5_eq_e c c2 then (if g5_eq_e t t2 then g5_eq_e e e2 else false) else false | _ -> false)
   | ECase5 s brs _ -> (case b of | ECase5 s2 brs2 _ -> if g5_eq_e s s2 then g5_eq_brs brs brs2 else false | _ -> false)
-  | ELet5 r n x y _ -> (case b of | ELet5 r2 n2 x2 y2 _ -> if r == r2 then (if n == n2 then (if g5_eq_e x x2 then g5_eq_e y y2 else false) else false) else false | _ -> false)
+  | ELet5 r n _ x y _ -> (case b of | ELet5 r2 n2 _ x2 y2 _ -> if r == r2 then (if n == n2 then (if g5_eq_e x x2 then g5_eq_e y y2 else false) else false) else false | _ -> false)
   | ETup5 xs _ -> (case b of | ETup5 ys _ -> g5_eq_es xs ys | _ -> false)
   | EAnn5 x t _ -> (case b of | EAnn5 y u _ -> if g5_eq_e x y then g5_eq_ty t u else false | _ -> false)
   | ERec5 fx _ -> (case b of | ERec5 fy _ -> g5_eq_fields_e fx fy | _ -> false)

@@ -1129,7 +1129,7 @@ let rec g5_infer_e e env sc s = case e of
   | EBin5 op l r sp -> g5_infer_bin s e op l r sp env sc
   | EIf5 c th el sp -> g5_infer_if s e c th el sp env sc
   | ECase5 scrt brs sp -> g5_infer_case s e scrt brs sp env sc
-  | ELet5 isrec nm rhs body sp -> g5_infer_let s e isrec nm rhs body sp env sc
+  | ELet5 isrec nm nsp rhs body sp -> g5_infer_let s e isrec nm nsp rhs body sp env sc
   | ETup5 es sp -> g5_infer_tup s e es sp env sc
   | EAnn5 inner ty sp -> g5_infer_ann s e inner ty sp env sc
   | ERec5 flds sp -> g5_infer_rec s e flds sp env sc
@@ -1327,7 +1327,8 @@ and g5_case_brs brs st resty env sc s idx owner = case brs of
       | (pat, body) ->
           let e0 = g5s_ectx s in
           let s_pushed = g5_push_ctx s ("case branch " ++ int_to_string idx ++ ": ") in
-          let (s1, bnds, scb, e1) = g5_pat_each [pat] [st] [] env sc s_pushed owner in
+          let (sa, anid) = g5_fresh_node s_pushed in
+          let (s1, bnds, scb, e1) = g5_pat_each [pat] [st] [] env sc sa anid in
           if e1 == "" then
             let s2 = g5s_with_ectx s1 e0 in
             let env2 = g5_binds_env bnds env in
@@ -1335,11 +1336,15 @@ and g5_case_brs brs st resty env sc s idx owner = case brs of
             if e2 == "" then
               let s3t = g5_trace_push s3 ("branch#" ++ int_to_string idx ++ ": " ++ g5_show s3 bt) in
               let (s4, e3) = g5_unify_wrap_msg bt resty s3t ("case branch " ++ int_to_string idx ++ ": ") in
-              if e3 == "" then g5_case_brs rest st resty env sc s4 (idx + 1) owner else (s4, e3)
+              if e3 == "" then
+                let asp = Span (span_start (pat5_span pat)) (span_end (e5_span body)) in
+                let s5 = g5_record s4 anid asp bt (0 - 1) g5_null_sch [] resty "case branch" in
+                g5_case_brs rest st resty env sc s5 (idx + 1) owner
+              else (s4, e3)
             else (s3, e2)
           else (s1, e1)
 
-and g5_infer_let s e isrec nm rhs body sp env sc =
+and g5_infer_let s e isrec nm nsp rhs body sp env sc =
   let (s0, nid) = g5_fresh_node s in
   if isrec then
     let (s1, v) = g5_fresh s0 in
@@ -1352,7 +1357,7 @@ and g5_infer_let s e isrec nm rhs body sp env sc =
       if e2 == "" then
         let sch = g5_generalize env rt s3 in
         let (s4, sid) = g5_fresh_sym s3 in
-        let s5 = g5_add_sym s4 (SymE5 sid nm sp nid (g5_norm_sch s4 sch)) in
+        let s5 = g5_add_sym s4 (SymE5 sid nm nsp nid (g5_norm_sch s4 sch)) in
         let (s6, bt, e3) = g5_infer_e body ((nm, sch) :: env) ((nm, sid) :: sc) s5 in
         if e3 == "" then
           (g5_record s6 nid sp bt sid sch [] g5_no_expected "local let body", bt, "")
@@ -1371,7 +1376,7 @@ and g5_infer_let s e isrec nm rhs body sp env sc =
     if e1 == "" then
       let sch = g5_generalize env rt s1 in
       let (s2, sid) = g5_fresh_sym s1 in
-      let s3 = g5_add_sym s2 (SymE5 sid nm sp nid (g5_norm_sch s2 sch)) in
+      let s3 = g5_add_sym s2 (SymE5 sid nm nsp nid (g5_norm_sch s2 sch)) in
       let (s4, bt, e2) = g5_infer_e body ((nm, sch) :: env) ((nm, sid) :: sc) s3 in
       if e2 == "" then
         (g5_record s4 nid sp bt sid sch [] g5_no_expected "local let body", bt, "")
@@ -1456,31 +1461,41 @@ and g5_infer_hole s e nm sp env sc =
   let (s0, nid) = g5_fresh_node s in
   let (s1, v) = g5_fresh s0 in
   let s2 = g5s_with_holevars s1 (v :: g5s_holevars s1) in
-  let (s3, cands0) = g5_hole_cands env (TVI5 v) s2 in
+  let (s3, cands0) = g5_hole_cands env (TVI5 v) s2 sc in
   let s4 = g5s_with_holes s3 (HoleE5 nid nm (TVI5 v) (rev_acc [] cands0) false :: g5s_holes s3) in
   (g5_record s4 nid sp (TVI5 v) (0 - 1) g5_null_sch [] g5_no_expected "hole (partial)", TVI5 v, "")
 
-and g5_hole_cands env hty s = case env of
+and g5_hole_cands env hty s sc = g5_hole_cands_seen env hty s sc []
+
+and g5_hole_cands_seen env hty s sc seen = case env of
     [] -> (s, [])
   | kv :: rest -> case kv of
-      | (nm, sch) -> case sch of
-          | Sch5 qvars qrows sty p ->
-              if p then g5_hole_cands rest hty s
-              else
-                let (s1, inst, _, _) = g5_instantiate qvars qrows sty s in
-                if g5_mentions_hole inst s1 then g5_hole_cands rest hty s1
+      | (nm, sch) ->
+          if g5_mem_str5 nm seen then g5_hole_cands_seen rest hty s sc seen
+          else case sch of
+            | Sch5 qvars qrows sty p ->
+                if p then g5_hole_cands_seen rest hty s sc (nm :: seen)
                 else
-                  let snap = g5_snapshot s1 in
-                  let (s2, e1) = g5_unify inst hty s1 "" in
-                  if e1 == "" then
-                    let ninst = g5_norm_ty_here s2 inst in
-                    let s3 = g5_rollback s2 snap in
-                    let dsp = g5_decl_span_of s3 nm in
-                    let (s4, more) = g5_hole_cands rest hty s3 in
-                    (s4, (nm, sch, ninst, dsp) :: more)
+                  let (s1, inst, _, _) = g5_instantiate qvars qrows sty s in
+                  if g5_mentions_hole inst s1 then g5_hole_cands_seen rest hty s1 sc (nm :: seen)
                   else
-                    let s3 = g5_rollback s2 snap in
-                    g5_hole_cands rest hty s3
+                    let snap = g5_snapshot s1 in
+                    let (s2, e1) = g5_unify inst hty s1 "" in
+                    if e1 == "" then
+                      let ninst = g5_norm_ty_here s2 inst in
+                      let s3 = g5_rollback s2 snap in
+                      let dsp = g5_decl_span_sc s3 sc nm in
+                      let (s4, more) = g5_hole_cands_seen rest hty s3 sc (nm :: seen) in
+                      (s4, (nm, sch, ninst, dsp) :: more)
+                    else
+                      let s3 = g5_rollback s2 snap in
+                      g5_hole_cands_seen rest hty s3 sc (nm :: seen)
+
+and g5_decl_span_sc s sc nm =
+  let sid = g5_sc_find sc nm in
+  if sid == (0 - 1) then g5_decl_span_of s nm
+  else case g5_sym_find5 (g5s_syms s) sid of
+    | SymE5 _ _ dsp _ _ -> dsp
 
 and g5_mentions_hole inst s =
   g5_any_mem (g5_free_chase inst s []) (g5s_holevars s)
@@ -1985,12 +2000,12 @@ let rec g5_top_def_syms schs ds s sc = case schs of
   | kv :: rest -> case kv of
       | (nm, sch) ->
           let (s1, sid) = g5_fresh_sym s in
-          let (s2, nid) = g5_fresh_node s1 in
+          let (s2, nnid) = g5_fresh_node s1 in
           let dsp = g5_def_span ds nm in
-          let s3 = g5_add_sym s2 (SymE5 sid nm dsp nid (g5_norm_sch s2 sch)) in
+          let s3 = g5_add_sym s2 (SymE5 sid nm dsp (0 - 1) (g5_norm_sch s2 sch)) in
           case sch of
             | Sch5 _ _ ty _ ->
-                let s4 = g5_record s3 nid dsp ty sid sch [] g5_no_expected (g5_gen_reason sch) in
+                let s4 = g5_record s3 nnid dsp ty sid sch [] g5_no_expected (g5_gen_reason sch) in
                 let (s5, sc2) = g5_top_def_syms rest ds s4 ((nm, sid) :: sc) in
                 (s5, sc2)
 
@@ -2046,7 +2061,7 @@ and g5_fv_e e bound acc = case e of
   | EBin5 _ l r _ -> g5_fv_e l bound (g5_fv_e r bound acc)
   | EIf5 c t el _ -> g5_fv_e c bound (g5_fv_e t bound (g5_fv_e el bound acc))
   | ECase5 sc brs _ -> g5_fv_e sc bound (g5_fv_brs brs bound acc)
-  | ELet5 isrec nm rhs body _ ->
+  | ELet5 isrec nm _ rhs body _ ->
       let acc2 = g5_fv_e rhs (if isrec then nm :: bound else bound) acc in
       g5_fv_e body (nm :: bound) acc2
   | ETup5 es _ -> g5_fv_list es bound acc

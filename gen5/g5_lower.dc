@@ -49,7 +49,7 @@ and g5_uses_records_e e = case e of
       else if g5_uses_records_e t then true else g5_uses_records_e el
   | ECase5 sc brs _ ->
       if g5_uses_records_e sc then true else g5_uses_records_brs brs
-  | ELet5 _ _ rhs body _ ->
+  | ELet5 _ _ _ rhs body _ ->
       if g5_uses_records_e rhs then true else g5_uses_records_e body
   | ETup5 es _ -> g5_uses_records_list es
   | EAnn5 x _ _ -> g5_uses_records_e x
@@ -115,7 +115,7 @@ and g5_lw_e e = case e of
   | EBin5 op l r _ -> "(" ++ g5_lw_e l ++ " " ++ op ++ " " ++ g5_lw_e r ++ ")"
   | EIf5 c t el _ -> "(if " ++ g5_lw_e c ++ " then " ++ g5_lw_e t ++ " else " ++ g5_lw_e el ++ ")"
   | ECase5 sc brs _ -> "(case " ++ g5_lw_e sc ++ " of " ++ g5_lw_brs brs ++ ")"
-  | ELet5 rc n rhs body _ -> "(let " ++ (if rc then "rec " else "") ++ n ++ " = " ++ g5_lw_e rhs ++ " in " ++ g5_lw_e body ++ ")"
+  | ELet5 rc n _ rhs body _ -> "(let " ++ (if rc then "rec " else "") ++ n ++ " = " ++ g5_lw_e rhs ++ " in " ++ g5_lw_e body ++ ")"
   | ETup5 es _ -> "(" ++ g5_lw_es_comma es ++ ")"
   | EAnn5 x _ _ -> g5_lw_e x
   | ERec5 flds _ -> "[" ++ g5_lw_fields flds ++ "]"
@@ -292,7 +292,7 @@ and g5_has_reserved_e e = case e of
   | ECase5 sc brs _ ->
       let x = g5_has_reserved_e sc in
       if x == "" then g5_has_reserved_brs brs else x
-  | ELet5 _ nm rhs body _ ->
+  | ELet5 _ nm _ rhs body _ ->
       if g5_is_reserved_nm nm then nm
       else
         let x = g5_has_reserved_e rhs in

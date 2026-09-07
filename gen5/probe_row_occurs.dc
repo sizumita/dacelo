@@ -1,0 +1,20 @@
+-- Unit regression for g5_row_occurs (issue #1-2): direct tail, nested,
+-- via-fun, via-tuple, negatives, and via-subst chase. CLI-level reject
+-- tests cover the same paths end-to-end (see test.sh F); this file pins
+-- the solver predicate itself.
+-- Build: cat gen3-dcc-dc/dcc.dc gen5/g5_front.dc gen5/g5_infer.dc gen5/probe_row_occurs.dc > /tmp/g5occ_full.dc
+-- Run: ./gen0-interp-rs/target/release/dacelo /tmp/g5occ_full.dc
+-- (assembled by test.sh F; Gen0-routed to stay lean on RAM).
+-- Expect seven lines: true×4, false×2, true.
+
+let showb b = if b then print_string "true\n" else print_string "false\n"
+
+let main () =
+  showb (g5_row_occurs 7 (TRec5 [] (ROpen5 7)) g5s_new) ;
+  showb (g5_row_occurs 7 (TRec5 [("x", TRec5 [] (ROpen5 7))] RClosed5) g5s_new) ;
+  showb (g5_row_occurs 7 (TAr5 (TRec5 [] (ROpen5 7)) (TC5 "Int")) g5s_new) ;
+  showb (g5_row_occurs 7 (TTup5 [TRec5 [] (ROpen5 7)]) g5s_new) ;
+  showb (g5_row_occurs 9 (TRec5 [] (ROpen5 7)) g5s_new) ;
+  showb (g5_row_occurs 7 (TRec5 [("x", TC5 "Int")] RClosed5) g5s_new) ;
+  let s1 = g5s_with_rowsubst g5s_new [(8, RowC5 [] (ROpen5 7))] in
+  showb (g5_row_occurs 7 (TRec5 [("x", TRec5 [] (ROpen5 8))] RClosed5) s1)
