@@ -1,0 +1,541 @@
+-- ============================================================
+-- gen5/g5_cg.dc -- Gen5 ARM64 code generator over the ownership IR
+--
+-- Consumes OExpr/OPrim/ODef (gen5/g5_oir.dc, produced by g5_own.dc) and
+-- emits assembly text through the `AS` state and the ts_*/a_* helpers of
+-- gen3-dcc-dc/dcc.dc (reused unchanged). Forked from the Expr-based
+-- gen3-dcc-dc/g3_ce_v2.dc + g3_pm_v2.dc; every routine that writes a
+-- block header is re-done here for the reference-counted runtime
+-- (gen5/rt5.c, ABI in gen5/GC_DESIGN.md section 2; contract section 4).
+--
+--   header  = (rc << 40) | (words << 8) | tag
+--             fresh blocks rc = 1, statics rc = RC_IMMORTAL (0xFFFFF)
+--   values  : Int (n<<2)|1, Bool 3/7 (odd immediates), else block pointer
+--   calls   : closure call x0 = fn (borrowed), x1 = arg (owned) -> x0 owned
+--             direct call _fnn_<f>: args in x0..x(k-1), modes from sigs
+--   frame   : fixed 4032 bytes = 504 slots at [sp, #8*slot]; overflow is
+--             a compile-time error ("g5cg: frame overflow in <fn>")
+--
+-- Reference counting is NOT decided here: the IR carries explicit
+-- ODup/ODrop/ODropReuse nodes and the codegen only follows the position
+-- modes of GC_DESIGN section 3.1. The one exception is AGlob: dc_gget only
+-- borrows from the global table, so a global atom in a consumed position
+-- is dup'd by the codegen (see g5cg_pre_globs). Statics are immortal.
+-- NOTE: the allocation prims are named PMkCtor / PMkTup here (the design
+-- doc's PCtor / PTup would shadow the Pat constructors of dcc.dc).
+--
+-- State threading follows Gen3: `AS` holds REVERSED lines and every nested
+-- emit receives the latest state so instructions keep program order.
+-- Scope `sc` maps variable -> slot (newest first); `ns` = next free slot.
+-- Every OExpr ends in ORet, compiled as "value in x0; b <end label>", so
+-- if/case branches never fall through.
+-- Only Gen4-subset syntax is used in this file (bootstrap constraint).
+-- ============================================================
+
+-- ---------- constants ----------
+-- Literals must stay below 2^59: the compiling compiler forms the tagged
+-- constant (n*4)+1 in its own 62-bit arithmetic, so a larger literal would
+-- wrap (Gen0 and the native compiler would then disagree). RC_IMMORTAL << 40
+-- is therefore computed at run time from two small literals.
+let g5cg_rc_one = 1099511627776                -- 1 << 40 (rc = 1)
+let g5cg_rc_immortal = 1048575 * g5cg_rc_one   -- 0xFFFFF << 40 (RC_IMMORTAL)
+let g5cg_max_slots = 504                       -- frame_bytes / 8
+let g5cg_tag_unit = 5
+
+-- block headers: fresh (rc = 1) for heap blocks, static (immortal) for .data
+let g5cg_hdr_fresh words tg = g5cg_rc_one + (words * 256) + tg
+let g5cg_hdr_static words tg = g5cg_rc_immortal + (words * 256) + tg
+
+-- pattern tests compare (words << 8) | tag only: mask the rc field out of x9
+let g5cg_mask_hdr st = a_inst st "and x9, x9, #0xffffffffff"
+
+-- ---------- compile context ----------
+-- cx = (ctor id table, ctor arity table, direct-call signatures, current def name)
+let g5cg_cx_cid cx = case cx of | (a, _, _, _) -> a
+let g5cg_cx_ar cx = case cx of | (_, b, _, _) -> b
+let g5cg_cx_sigs cx = case cx of | (_, _, c, _) -> c
+let g5cg_cx_fn cx = case cx of | (_, _, _, d) -> d
+
+-- checked slot store: the frame is fixed, so running out of slots is a
+-- compile error rather than a silent overwrite of the saved fp/lr
+let g5cg_sts st cx reg slot =
+  if slot >= g5cg_max_slots then error ("g5cg: frame overflow in " ++ g5cg_cx_fn cx)
+  else ts_str_slot st reg slot
+
+let g5cg_slot_of cx sc x =
+  let s = assoc_ikey x sc in
+  if s == (0 - 1) then error ("g5cg: unbound variable `" ++ x ++ "` in " ++ g5cg_cx_fn cx)
+  else s
+
+let rec g5cg_slots_of cx sc xs = case xs of
+    [] -> []
+  | x :: rest -> g5cg_slot_of cx sc x :: g5cg_slots_of cx sc rest
+
+-- ownership mode lookup; out of range = owned (the conservative default)
+let rec g5cg_nth_bool xs i = case xs of
+    [] -> true
+  | h :: rest -> if i == 0 then h else g5cg_nth_bool rest (i - 1)
+
+let rec g5cg_find_idx n xs i = case xs of
+    [] -> 0 - 1
+  | h :: rest -> if h == n then i else g5cg_find_idx n rest (i + 1)
+
+let rec g5cg_zip_slots names i = case names of
+    [] -> []
+  | nm :: rest -> (nm, i) :: g5cg_zip_slots rest (i + 1)
+
+let rec g5cg_seq_slots i n = if i >= n then [] else i :: g5cg_seq_slots (i + 1) n
+
+let rec g5cg_lookup_sig f sgs = case sgs of
+    [] -> error ("g5cg: PCall to `" ++ f ++ "` which has no direct entry")
+  | kv :: rest -> (case kv of
+      | (n, modes) -> if n == f then modes else g5cg_lookup_sig f rest)
+
+-- ---------- small emitters ----------
+-- GOT-relative address load: adrp/ldr pair into register reg
+let g5cg_got st reg sym =
+  let r = "x" ++ int_to_string reg in
+  let s1 = a_inst st ("adrp " ++ r ++ ", " ++ sym ++ "@GOTPAGE") in
+  a_inst s1 ("ldr " ++ r ++ ", [" ++ r ++ ", " ++ sym ++ "@GOTPAGEOFF]")
+
+let g5cg_prologue st lbl =
+  let t0 = a_line st ".p2align 2" in
+  let t1 = a_label t0 lbl in
+  let t2 = a_line t1 "  stp x29, x30, [sp, #-16]!" in
+  let t3 = a_inst t2 "mov x29, sp" in
+  a_inst t3 ("sub sp, sp, #" ++ int_to_string frame_bytes)
+
+let g5cg_epilogue st =
+  let t1 = a_inst st ("add sp, sp, #" ++ int_to_string frame_bytes) in
+  let t2 = a_line t1 "  ldp x29, x30, [sp], #16" in
+  a_line t2 "  ret"
+
+-- pattern-failure tail: dc_match_fail(x0) never returns
+let g5cg_fail_tail st flbl =
+  let t1 = a_label st flbl in
+  let t2 = a_call_rt t1 "dc_match_fail" in
+  a_line t2 "  ret"
+
+let rec g5cg_emit_bytes st bs = case bs of
+    [] -> st
+  | b :: rest -> g5cg_emit_bytes (a_inst st (".byte " ++ int_to_string b)) rest
+
+-- intern a string literal as an immortal static block [hdr][len][bytes..]
+-- words = 2 + (n+8)/8, so at least one NUL byte always follows the content
+-- (the runtime reads paths/messages as C strings); explicit zero padding
+-- fills the block up to its declared size.
+let g5cg_intern_str st str =
+  let (st1, lid) = a_fresh_id st in
+  let lbl = "_astr" ++ int_to_string lid in
+  let n = string_length str in
+  let words = 2 + (n + 8) / 8 in
+  let pad = ((words - 2) * 8) - n in
+  let t0 = a_inst st1 ".section __DATA,__data" in
+  let t1 = a_inst t0 ".p2align 3" in
+  let t2 = a_label t1 lbl in
+  let t3 = a_inst t2 (".quad " ++ int_to_string (g5cg_hdr_static words tag_string)) in
+  let t4 = a_inst t3 (".quad " ++ int_to_string n) in
+  let t5 = g5cg_emit_bytes t4 (rev_list (bytes_of_str str 0 n []) []) in
+  let t6 = a_inst t5 (".space " ++ int_to_string pad) in
+  let t7 = a_inst t6 ".p2align 3" in
+  (a_inst t7 ".section __TEXT,__text,regular,pure_instructions", lbl)
+
+-- ---------- atoms ----------
+-- load one atom into register reg. AGlob needs a runtime call (clobbers
+-- x0-x18): when several registers must stay live, callers first route
+-- AGlob atoms through slots with g5cg_pre_globs. No counting happens here:
+-- AVar ownership is decided by the IR position, globals are count-free,
+-- literals / unit / nullary constructors are immortal statics.
+let g5cg_ld_atom st cx sc reg a = case a of
+    AVar x -> ts_ldr_slot st reg (g5cg_slot_of cx sc x)
+  | AInt n -> ts_load_const st reg ((n * 4) + 1)
+  | ABool b -> ts_load_const st reg (if b then 7 else 3)
+  | AStr s ->
+      let (s1, lbl) = g5cg_intern_str st s in
+      g5cg_got s1 reg lbl
+  | AUnit -> g5cg_got st reg "_dc_unit_block"
+  | AGlob name ->
+      let g = assoc_ikey name (a_globs st) in
+      if g == (0 - 1) then error ("g5cg: unknown global `" ++ name ++ "` in " ++ g5cg_cx_fn cx)
+      else
+        let s1 = ts_load_const st 0 g in
+        let s2 = a_call_rt s1 "dc_gget" in
+        if reg == 0 then s2 else ts_mov_rr s2 reg 0
+  | ANull c ->
+      if assoc_ikey c (g5cg_cx_ar cx) != 0 then
+        error ("g5cg: ANull of non-nullary constructor `" ++ c ++ "` in " ++ g5cg_cx_fn cx)
+      else g5cg_got st reg ("_ctorinst_" ++ c)
+
+-- route AGlob atoms through fresh slots so that the following register
+-- loads are call-free; returns (st, atoms', sc', ns') where every AGlob
+-- became an AVar bound in sc'. `flags` (parallel to atoms, missing = false)
+-- marks CONSUMED positions: dc_gget only borrows from the global table
+-- (rt5.c: dc_gset owns, dc_gget borrows), so a global flowing into an
+-- owned position (ORet, PAtom binding, PApp argument, owned PCall
+-- argument, constructor / tuple field) gets a dc_dup here. The IR never
+-- counts globals itself (GC_DESIGN 3.1: AGlob is outside counting).
+let rec g5cg_pre_globs st cx sc ns atoms flags acc = case atoms of
+    [] -> (st, rev_list acc [], sc, ns)
+  | a :: rest ->
+      let consumed = (case flags of
+          | [] -> false
+          | f :: _ -> f) in
+      let frest = (case flags of
+          | [] -> []
+          | _ :: fr -> fr) in
+      (case a of
+        | AGlob _ ->
+            let s1 = g5cg_ld_atom st cx sc 0 a in
+            let s2 = g5cg_sts s1 cx 0 ns in
+            let s3 = if consumed then a_call_rt s2 "dc_dup" else s2 in
+            let tmp = "$g" ++ int_to_string ns in
+            g5cg_pre_globs s3 cx ((tmp, ns) :: sc) (ns + 1) rest frest (AVar tmp :: acc)
+        | _ -> g5cg_pre_globs st cx sc ns rest frest (a :: acc))
+
+let rec g5cg_trues n = if n <= 0 then [] else true :: g5cg_trues (n - 1)
+
+-- load atoms (no AGlob left) into x<i>, x<i+1>, ...
+let rec g5cg_ld_regs st cx sc atoms i = case atoms of
+    [] -> st
+  | a :: rest -> g5cg_ld_regs (g5cg_ld_atom st cx sc i a) cx sc rest (i + 1)
+
+-- store atoms (no AGlob left) as consecutive words of the block in x0,
+-- starting at byte offset off
+let rec g5cg_st_fields st cx sc atoms off = case atoms of
+    [] -> st
+  | a :: rest ->
+      let s1 = g5cg_ld_atom st cx sc 9 a in
+      g5cg_st_fields (ts_str_off s1 9 0 off) cx sc rest (off + 8)
+
+-- scrutinee slot: a variable is matched in place, anything else is
+-- loaded once and spilled; returns (st, slot, ns')
+let g5cg_atom_slot st cx sc ns a = case a of
+    AVar x -> (st, g5cg_slot_of cx sc x, ns)
+  | _ ->
+      let s1 = g5cg_ld_atom st cx sc 0 a in
+      let s2 = g5cg_sts s1 cx 0 ns in
+      (s2, ns, ns + 1)
+
+-- ---------- allocation ----------
+-- allocate a `words`-word block with tag tg: through the reuse token `tok`
+-- (dc_reuse_or_alloc; the token may be 0 at run time) or fresh
+-- (dc_alloc_rc); writes the fresh header; block pointer in x0
+let g5cg_alloc st cx sc tok words tg =
+  let s1 = if tok == "" then
+      a_call_rt (ts_load_const st 0 (words * 8)) "dc_alloc_rc"
+    else
+      let a1 = ts_ldr_slot st 0 (g5cg_slot_of cx sc tok) in
+      a_call_rt (ts_load_const a1 1 (words * 8)) "dc_reuse_or_alloc" in
+  let s2 = ts_load_const s1 9 (g5cg_hdr_fresh words tg) in
+  ts_str_off s2 9 0 0
+
+let rec g5cg_copy_env st j slots = case slots of
+    [] -> st
+  | s :: rest ->
+      let ta = ts_ldr_slot st 9 s in
+      g5cg_copy_env (ts_str_off ta 9 0 (24 + (8 * j))) (j + 1) rest
+
+-- allocate closure [hdr][code = lbl][nenv][env = values of `slots`]; x0
+let g5cg_mk_closure st lbl slots =
+  let n = len slots in
+  let words = 3 + n in
+  let s1 = ts_load_const st 0 (words * 8) in
+  let s2 = a_call_rt s1 "dc_alloc_rc" in
+  let s3 = ts_load_const s2 9 (g5cg_hdr_fresh words tag_closure) in
+  let s4 = ts_str_off s3 9 0 0 in
+  let s5 = g5cg_got s4 9 lbl in
+  let s6 = ts_str_off s5 9 0 8 in
+  let s7 = ts_load_const s6 9 n in
+  let s8 = ts_str_off s7 9 0 16 in
+  g5cg_copy_env s8 0 slots
+
+-- copy env words [x0 + 24 + 8j] of the current closure into slots j..n-1
+let rec g5cg_ld_env st cx j n = if j >= n then st
+  else
+    let ta = ts_ldr_off st 9 0 (24 + (8 * j)) in
+    g5cg_ld_env (g5cg_sts ta cx 9 j) cx (j + 1) n
+
+-- ---------- pattern compiler ----------
+-- The value being matched arrives in register `reg`; on mismatch control
+-- goes to flbl. Compound patterns spill the value to a fresh slot and
+-- reload through it (nested tests reuse x9/x10; PStr calls the runtime).
+-- Bindings are field loads only (no rc operations). Header tests mask
+-- the rc field before comparing (words << 8) | tag.
+let rec g5cg_cm st cx sc ns pat reg flbl = case pat of
+    PWild -> (st, sc, ns)
+  | PVar n ->
+      let s1 = g5cg_sts st cx reg ns in
+      (s1, (n, ns) :: sc, ns + 1)
+  | PInt k ->
+      let s1 = ts_load_const st 10 ((k * 4) + 1) in
+      let s2 = ts_cmp_reg s1 reg 10 in
+      (ts_bcond s2 c_ne flbl, sc, ns)
+  | PBool b ->
+      let s1 = ts_load_const st 10 (if b then 7 else 3) in
+      let s2 = ts_cmp_reg s1 reg 10 in
+      (ts_bcond s2 c_ne flbl, sc, ns)
+  | PStr str ->
+      -- compare by content (dc_val_eq); keep the scrutinee in a slot across the call
+      let (s1, lbl) = g5cg_intern_str st str in
+      let sv = ns in
+      let s2 = g5cg_sts s1 cx reg sv in
+      let s3 = g5cg_got s2 0 lbl in
+      let s4 = ts_ldr_slot s3 1 sv in
+      let s5 = a_call_rt s4 "dc_val_eq" in
+      let s6 = ts_cmp_imm s5 0 7 in
+      (ts_bcond s6 c_ne flbl, sc, ns)
+  | PUnit ->
+      let s1 = g5cg_got st 10 "_dc_unit_block" in
+      let s2 = ts_cmp_reg s1 reg 10 in
+      (ts_bcond s2 c_ne flbl, sc, ns)
+  | PTup ps ->
+      let sv = ns in
+      let ta = g5cg_sts st cx reg sv in
+      let tb = ts_ldr_slot ta 9 sv in
+      let tc = g5cg_mask_hdr (ts_ldr_off tb 9 9 0) in
+      let td = ts_load_const tc 10 ((256 * (1 + len ps)) + tag_tuple) in
+      let te = ts_cmp_reg td 9 10 in
+      let tf = ts_bcond te c_ne flbl in
+      g5cg_cm_fields tf cx sc (ns + 1) ps sv 8 flbl
+  | PCtor nm ps ->
+      let ar = assoc_ikey nm (g5cg_cx_ar cx) in
+      if ar == (0 - 1) then error ("g5cg: unknown constructor `" ++ nm ++ "` in pattern")
+      else if ar != len ps then error ("g5cg: constructor `" ++ nm ++ "` pattern arity mismatch")
+      else if ar == 0 then
+        -- nullary constructors are unique static instances: compare by address
+        let s1 = g5cg_got st 10 ("_ctorinst_" ++ nm) in
+        let s2 = ts_cmp_reg s1 reg 10 in
+        (ts_bcond s2 c_ne flbl, sc, ns)
+      else
+        let cid = assoc_ikey nm (g5cg_cx_cid cx) in
+        let sv = ns in
+        let ta = g5cg_sts st cx reg sv in
+        let tb = ts_ldr_slot ta 9 sv in
+        let tc = g5cg_mask_hdr (ts_ldr_off tb 9 9 0) in
+        let td = ts_load_const tc 10 ((256 * (2 + ar)) + tag_adt) in
+        let te = ts_cmp_reg td 9 10 in
+        let tf = ts_bcond te c_ne flbl in
+        -- ctor id at block[1]
+        let tg = ts_ldr_slot tf 9 sv in
+        let th = ts_ldr_off tg 9 9 8 in
+        let ti = ts_load_const th 10 cid in
+        let tj = ts_cmp_reg ti 9 10 in
+        let tk = ts_bcond tj c_ne flbl in
+        g5cg_cm_fields tk cx sc (ns + 1) ps sv 16 flbl
+
+-- sub-patterns of the block spilled at slot sv, fields from byte offset off
+and g5cg_cm_fields st cx sc ns ps sv off flbl = case ps of
+    [] -> (st, sc, ns)
+  | p :: rest ->
+      let t1 = ts_ldr_slot st 9 sv in
+      let t2 = ts_ldr_off t1 9 9 off in
+      let (t3, sc2, ns2) = g5cg_cm t2 cx sc ns p 9 flbl in
+      g5cg_cm_fields t3 cx sc2 ns2 rest sv (off + 8) flbl
+
+-- bind parameter patterns from consecutive slots i, i+1, ...: a PVar
+-- aliases its slot directly, a compound pattern reloads x0 from the slot
+-- and runs the pattern compiler (bindings are field loads only)
+let rec g5cg_bind_params st cx sc ns params i flbl = case params of
+    [] -> (st, sc, ns)
+  | p :: rest -> (case p of
+      | PVar n -> g5cg_bind_params st cx ((n, i) :: sc) ns rest (i + 1) flbl
+      | PWild -> g5cg_bind_params st cx sc ns rest (i + 1) flbl
+      | _ ->
+          let s1 = ts_ldr_slot st 0 i in
+          let (s2, sc2, ns2) = g5cg_cm s1 cx sc ns p 0 flbl in
+          g5cg_bind_params s2 cx sc2 ns2 rest (i + 1) flbl)
+
+-- ---------- binary operators ----------
+-- operands are atoms (borrowed): x0 = a, x1 = b, result in x0
+let g5cg_binop st cx sc ns op a b =
+  let (s0, ats, sc2, ns2) = g5cg_pre_globs st cx sc ns [a, b] [] [] in
+  let s1 = g5cg_ld_regs s0 cx sc2 ats 0 in
+  if op == "+" then
+    -- tagged sum: (a + b) - 1 keeps the tag bits right
+    a_inst (ts_add_rr s1 0 0 1) "sub x0, x0, #1"
+  else if op == "-" then
+    a_inst (a_inst s1 "sub x0, x0, x1") "add x0, x0, #1"
+  else if op == "*" then
+    let s2 = ts_asr s1 0 0 2 in
+    let s3 = ts_asr s2 1 1 2 in
+    ts_retag (ts_mul s3 0 0 1) 0
+  else if op == "/" then
+    let s2 = ts_asr s1 0 0 2 in
+    let s3 = ts_asr s2 1 1 2 in
+    ts_retag (a_inst s3 "sdiv x0, x0, x1") 0
+  else if op == "%" then
+    let s2 = ts_asr s1 0 0 2 in
+    let s3 = ts_asr s2 1 1 2 in
+    let s4 = a_inst s3 "sdiv x9, x0, x1" in
+    ts_retag (a_inst s4 "msub x0, x9, x1, x0") 0
+  else if op == "<" || op == ">" || op == "<=" || op == ">=" then
+    let (s2, eno) = a_fresh_id s1 in
+    let l_true = "Lbt" ++ int_to_string eno in
+    let l_end = "Lbe" ++ int_to_string eno in
+    let s3 = ts_cmp_reg s2 0 1 in
+    let cnd = if op == "<" then c_lt else if op == ">" then c_gt
+              else if op == "<=" then c_le else c_ge in
+    let s4 = ts_bcond s3 cnd l_true in
+    let s5 = ts_load_const s4 0 3 in
+    let s6 = ts_b s5 l_end in
+    let s7 = a_label s6 l_true in
+    let s8 = ts_load_const s7 0 7 in
+    a_label s8 l_end
+  else if op == "==" || op == "!=" then
+    -- structural equality in the runtime; != flips 3 <-> 7
+    let s2 = a_call_rt s1 "dc_val_eq" in
+    if op == "==" then s2 else a_inst s2 "eor x0, x0, #4"
+  else if op == "++" then a_call_rt s1 "dc_bi_str_concat"
+  else if op == "&&" || op == "||" then
+    -- atoms have no effects, so no short-circuit is needed:
+    -- && : x0 = (x0 == true) ? x1 : x0     || : x0 = (x0 == true) ? x0 : x1
+    let (s2, eno) = a_fresh_id s1 in
+    let l_end = "Lsc" ++ int_to_string eno in
+    let s3 = ts_cmp_imm s2 0 7 in
+    let s4 = ts_bcond s3 (if op == "&&" then c_ne else c_eq) l_end in
+    let s5 = ts_mov_rr s4 0 1 in
+    a_label s5 l_end
+  else error ("g5cg: unknown binary operator `" ++ op ++ "` in " ++ g5cg_cx_fn cx)
+
+-- ---------- expression compiler ----------
+-- g5cg_ce st cx sc ns endl e : emit e; every path ends with "b endl" and
+-- the value in x0. Slots >= ns are free for temporaries.
+let rec g5cg_ce st cx sc ns endl e = case e of
+    ORet a ->
+      let (s1, ats, sc2, ns2) = g5cg_pre_globs st cx sc ns [a] [true] [] in
+      ts_b (g5cg_ld_regs s1 cx sc2 ats 0) endl
+  | OLet x prim body -> (case prim of
+      | PAtom (AVar y) ->
+          -- ownership moves with the value: x simply aliases y's slot
+          g5cg_ce st cx ((x, g5cg_slot_of cx sc y) :: sc) ns endl body
+      | _ ->
+          let s1 = g5cg_prim st cx sc ns prim in
+          let s2 = g5cg_sts s1 cx 0 ns in
+          g5cg_ce s2 cx ((x, ns) :: sc) (ns + 1) endl body)
+  | OLetRec x prim body -> (case prim of
+      | PLam pat lbody caps ->
+          -- reserve the slot first so the closure captures it (stale), store
+          -- the closure, then patch the self env word from the slot (no dup:
+          -- the runtime treats the self pointer as a non-owning edge)
+          let slot = ns in
+          let sc2 = (x, slot) :: sc in
+          let s1 = g5cg_lam st cx sc2 pat lbody caps in
+          let s2 = g5cg_sts s1 cx 0 slot in
+          let sidx = g5cg_find_idx x caps 0 in
+          let s3 = if sidx == (0 - 1) then s2
+            else ts_str_off (ts_ldr_slot s2 9 slot) 9 0 (24 + (8 * sidx)) in
+          g5cg_ce s3 cx sc2 (ns + 1) endl body
+      | _ -> error ("g5cg: OLetRec `" ++ x ++ "` must bind a PLam in " ++ g5cg_cx_fn cx))
+  | OIf a e1 e2 ->
+      let (st0, eno) = a_fresh_id st in
+      let else_lbl = "Lelse" ++ int_to_string eno in
+      let s1 = g5cg_ld_atom st0 cx sc 0 a in
+      let s2 = ts_cmp_imm s1 0 7 in
+      let s3 = ts_bcond s2 c_ne else_lbl in
+      let s4 = g5cg_ce s3 cx sc ns endl e1 in
+      g5cg_ce (a_label s4 else_lbl) cx sc ns endl e2
+  | OCase a brs ->
+      let (s0, base, ns1) = g5cg_atom_slot st cx sc ns a in
+      g5cg_cases s0 cx sc ns1 base brs endl
+  | ODup x body ->
+      let s1 = ts_ldr_slot st 0 (g5cg_slot_of cx sc x) in
+      g5cg_ce (a_call_rt s1 "dc_dup") cx sc ns endl body
+  | ODrop x body ->
+      let s1 = ts_ldr_slot st 0 (g5cg_slot_of cx sc x) in
+      g5cg_ce (a_call_rt s1 "dc_drop") cx sc ns endl body
+  | ODropReuse x tok body ->
+      let s1 = ts_ldr_slot st 0 (g5cg_slot_of cx sc x) in
+      let s2 = a_call_rt s1 "dc_drop_reuse" in
+      let s3 = g5cg_sts s2 cx 0 ns in
+      g5cg_ce s3 cx ((tok, ns) :: sc) (ns + 1) endl body
+
+-- case branches: the scrutinee stays in slot `base` and is reloaded per
+-- branch (tests clobber x0); each body branches to endl on its own, and
+-- exhausting the branches is a match failure
+and g5cg_cases st cx sc ns base brs endl = case brs of
+    [] -> a_call_rt (ts_ldr_slot st 0 base) "dc_match_fail"
+  | br :: rest -> (case br of
+      | (pat, body) ->
+          let (stg, gid) = a_fresh_id st in
+          let next_lbl = "Lcn" ++ int_to_string gid in
+          let tb = ts_ldr_slot stg 0 base in
+          let (sa, sc2, ns2) = g5cg_cm tb cx sc ns pat 0 next_lbl in
+          let sb = g5cg_ce sa cx sc2 ns2 endl body in
+          g5cg_cases (a_label sb next_lbl) cx sc ns base rest endl)
+
+-- primitives: result (owned / immediate / immortal) in x0
+and g5cg_prim st cx sc ns prim = case prim of
+    PAtom a ->
+      -- (AVar case is aliased by OLet; a global binding is dup'd: consumed position)
+      let (s1, ats, sc2, ns2) = g5cg_pre_globs st cx sc ns [a] [true] [] in
+      g5cg_ld_regs s1 cx sc2 ats 0
+  | PApp f a ->
+      -- generic closure call: x0 = fn (borrowed), x1 = arg (owned)
+      let (s1, ats, sc2, ns2) = g5cg_pre_globs st cx sc ns [f, a] [false, true] [] in
+      let s2 = g5cg_ld_regs s1 cx sc2 ats 0 in
+      ts_blr (ts_ldr_off s2 9 0 8) 9
+  | PCall f args ->
+      let modes = g5cg_lookup_sig f (g5cg_cx_sigs cx) in
+      if len modes != len args then
+        error ("g5cg: direct call to `" ++ f ++ "` with " ++ int_to_string (len args) ++ " args in " ++ g5cg_cx_fn cx)
+      else if len args > g5o_max_direct then
+        error ("g5cg: direct call to `" ++ f ++ "` exceeds " ++ int_to_string g5o_max_direct ++ " args")
+      else
+        let (s1, ats, sc2, ns2) = g5cg_pre_globs st cx sc ns args modes [] in
+        ts_bl (g5cg_ld_regs s1 cx sc2 ats 0) ("_fnn_" ++ f)
+  | PBi name args ->
+      -- builtins take every argument borrowed; result owned / immediate / immortal
+      if mem_str name builtins then
+        let (s1, ats, sc2, ns2) = g5cg_pre_globs st cx sc ns args [] [] in
+        a_call_rt (g5cg_ld_regs s1 cx sc2 ats 0) ("dc_bi_" ++ name)
+      else error ("g5cg: unknown builtin `" ++ name ++ "` in " ++ g5cg_cx_fn cx)
+  | PMkCtor c args tok ->
+      let ar = assoc_ikey c (g5cg_cx_ar cx) in
+      if ar == (0 - 1) then error ("g5cg: unknown constructor `" ++ c ++ "` in " ++ g5cg_cx_fn cx)
+      else if ar != len args then
+        error ("g5cg: constructor `" ++ c ++ "` applied to " ++ int_to_string (len args) ++ " fields in " ++ g5cg_cx_fn cx)
+      else if ar == 0 then
+        (if tok == "" then g5cg_got st 0 ("_ctorinst_" ++ c)
+         else error ("g5cg: reuse token on nullary constructor `" ++ c ++ "`"))
+      else
+        -- [hdr][ctor id][fields...]
+        let cid = assoc_ikey c (g5cg_cx_cid cx) in
+        let (s1, ats, sc2, ns2) = g5cg_pre_globs st cx sc ns args (g5cg_trues ar) [] in
+        let s2 = g5cg_alloc s1 cx sc2 tok (2 + ar) tag_adt in
+        let s3 = ts_str_off (ts_load_const s2 9 cid) 9 0 8 in
+        g5cg_st_fields s3 cx sc2 ats 16
+  | PMkTup args tok ->
+      -- [hdr][elems...]
+      let (s1, ats, sc2, ns2) = g5cg_pre_globs st cx sc ns args (g5cg_trues (len args)) [] in
+      let s2 = g5cg_alloc s1 cx sc2 tok (1 + len args) tag_tuple in
+      g5cg_st_fields s2 cx sc2 ats 8
+  | PLam pat body caps -> g5cg_lam st cx sc pat body caps
+  | PBin op a b -> g5cg_binop st cx sc ns op a b
+  | PBlock e ->
+      let (st0, eno) = a_fresh_id st in
+      let lbl = "Lblk" ++ int_to_string eno in
+      a_label (g5cg_ce st0 cx sc ns lbl e) lbl
+
+-- closure creation. The body is emitted out of line but inline in the
+-- text stream ([b skip][_lamN body][skip:]) followed by the allocation.
+-- Entry: x0 = closure (borrowed), x1 = argument (owned). Captured values
+-- are copied from the env into slots 0..nc-1 (borrowed inside the body);
+-- the parameter pattern binds from x1 into the following slots.
+and g5cg_lam st cx sc pat body caps =
+  let (st0, eno) = a_fresh_id st in
+  let lbl = "_lam" ++ int_to_string eno in
+  let skip_lbl = "Lamskip" ++ int_to_string eno in
+  let flbl = "Lpfail" ++ int_to_string eno in
+  let endl = "Lfend" ++ int_to_string eno in
+  let cap_slots = g5cg_slots_of cx sc caps in
+  let nc = len caps in
+  let t0 = a_inst st0 ("b " ++ skip_lbl) in
+  let t1 = g5cg_prologue t0 lbl in
+  let t2 = g5cg_ld_env t1 cx 0 nc in
+  let sc1 = g5cg_zip_slots caps 0 in
+  let (t3, sc2, ns2) = g5cg_cm t2 cx sc1 nc pat 1 flbl in
+  let t4 = g5cg_ce t3 cx sc2 ns2 endl body in
+  let t5 = g5cg_epilogue (a_label t4 endl) in
+  let t6 = g5cg_fail_tail t5 flbl in
+  let t7 = a_label t6 skip_lbl in
+  g5cg_mk_closure t7 lbl cap_slots

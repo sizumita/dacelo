@@ -530,7 +530,34 @@ and g5_types_json_of b opts =
     | (file, src, _, sums, s, snapdeps, _, _, _, _, _, status, _, _) ->
         let maxb = g5_parse_int_opt (g5_opt_val opts "--max-bytes=") 65536 in
         let q = QCtx5 src (Snap5 file (g5_hash_str src) (string_length src) g5_lang_tag g5_build_tag snapdeps) sums [] [] [] [] [] status "" s [] in
-        g5_types_json q maxb
+        g5_types_json q maxb (g5_own_sigs_of (g5_load_files file) status)
+
+-- ownership signatures (borrowed/owned per parameter) as the backend infers
+-- them on the lowered program (gen5/g5_own.dc). Only checked programs can be
+-- lowered (holes/invalid yield no signatures). Same lowering order as the
+-- compiler: files arrive entry-first, lowering is dep-first, prelude iff records.
+and g5_own_sigs_of files status =
+  if status == "checked" then
+    let progs = g5_progs_of_files files [] in
+    let anyrec = g5_any_rec_progs progs in
+    let body = g5_lowered_texts (rev_acc [] files) "" in
+    let src = if anyrec then g5_rec_prelude_src ++ body else body in
+    g5o_sigs_of (parse_prog (lex_all src))
+  else []
+
+and g5_progs_of_files files acc = case files of
+    [] -> rev_acc [] acc
+  | f :: rest -> case f of
+      | (_, _, pr) -> g5_progs_of_files rest (pr :: acc)
+
+and g5_any_rec_progs progs = case progs of
+    [] -> false
+  | pr :: rest -> if g5_uses_records_prog pr then true else g5_any_rec_progs rest
+
+and g5_lowered_texts files acc = case files of
+    [] -> acc
+  | f :: rest -> case f of
+      | (_, _, pr) -> g5_lowered_texts rest (acc ++ g5_lower_prog_src pr ++ "\n")
 
 and g5_print_types_text sums s = case sums of
     [] -> print_string ""

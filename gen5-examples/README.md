@@ -16,6 +16,7 @@ can retrieve the matching example from diagnostics).
 | `hole.dc` | static holes `?name` (`partial`, exit 2) | `./gen5check holes gen5-examples/hole.dc` |
 | `hole_filled.dc` | `hole.dc` with `?body` filled (`checked`, exit 0) | `./gen5check check gen5-examples/hole_filled.dc` |
 | `unicode_span.dc` | CJK comments/strings: UTF-8 byte spans vs scalar columns | `./gen5check focus gen5-examples/unicode_span.dc --at=11:5` |
+| `inplace_map.dc` | Gen5-RC: inferred ownership + drop-guided reuse (functional but in-place) | `./dcc_6 gen5-examples/inplace_map.dc /tmp/im && DACELO_RC_STATS=1 /tmp/im` → `5050`, `reuses=100` |
 
 Query entry points (all share one Typed IR; byte budgets via `--max-bytes`;
 implemented by `gen5check`, execution by `dcc_6` check-then-compile):
@@ -53,7 +54,8 @@ Notes:
 - Match exhaustiveness/redundancy are advisory warnings (not rejections) in v1.
 - No persistent cache in v1 (always clean); snapshots carry source/dependency
   hashes so future incremental results must equal clean results to be `checked`.
-- Native ARM64 codegen for records/modules is staged after the interpreter
-  runtime (shape descriptors + label lookup first, evidence/dictionary
-  optimization later). The legacy backend rejects Gen5-only syntax loudly
-  instead of miscompiling.
+- Memory management (Gen5-RC): precise reference counting with inferred
+  borrowed parameters and drop-guided reuse (see `gen5/GC_DESIGN.md`).
+  `gen5check types --format=json` shows the inferred `ownership` of every
+  direct-callable function; `DACELO_RC_CHECK=1` verifies leak-freedom at
+  exit, `DACELO_RC_STATS=1` prints alloc/free/reuse counters.

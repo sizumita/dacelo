@@ -25,14 +25,14 @@ G5CC_SRC=gen5/g5cc_full.dc
 
 sec_A() {
 echo "== A. checker =="
-cat gen3-dcc-dc/dcc.dc gen5/g5_front.dc gen5/g5_infer.dc gen5/g5_query.dc gen5/g5_lower.dc gen5/g5_driver.dc gen5/g5_main.dc > $G5CHECK_SRC
+cat gen3-dcc-dc/dcc.dc gen5/g5_front.dc gen5/g5_infer.dc gen5/g5_query.dc gen5/g5_lower.dc gen5/g5_oir.dc gen5/g5_own.dc gen5/g5_driver.dc gen5/g5_main.dc > $G5CHECK_SRC
 $GEN0 $G5CHECK_SRC --types > /dev/null && echo "gen5 typecheck OK"
 
 if [ ! -x ./dcc_1 ]; then
   echo "dcc_1 missing: build it first (see gen3-dcc-dc/test.sh)"; exit 1
 fi
-./dcc_1 $G5CHECK_SRC gen5check > /dev/null
-echo "gen5check built (by dcc_1)"
+if [ -n "${GEN5_KEEP_BIN:-}" ] && [ -x ./gen5check ]; then echo "gen5check kept (GEN5_KEEP_BIN)";
+else ./dcc_1 $G5CHECK_SRC gen5check > /dev/null; [ -x ./gen5check ] || { echo "gen5check build produced no binary (dcc_1 ignores cc failures; check memory)"; exit 1; }; echo "gen5check built (by dcc_1)"; fi
 
 pass=0; fail=0
 check_one() {
@@ -56,23 +56,24 @@ echo "checker oracle: $pass agree, $fail differ"
 }
 
 sec_B() {
-echo "== B. compiler (dcc_6) =="
-cat gen3-dcc-dc/dcc.dc gen3-dcc-dc/g3_pm_v2.dc gen3-dcc-dc/g3_ce_v2.dc gen3-dcc-dc/g3_driver_v2.dc gen5/g5_front.dc gen5/g5_infer.dc gen5/g5_query.dc gen5/g5_lower.dc gen5/g5_driver.dc gen5/g5cc_driver.dc > $G5CC_SRC
+echo "== B. compiler (dcc_6: Gen5-RC backend = Perceus RC + borrow inference + reuse) =="
+cat gen3-dcc-dc/dcc.dc gen5/g5_front.dc gen5/g5_infer.dc gen5/g5_query.dc gen5/g5_lower.dc gen5/g5_oir.dc gen5/g5_own.dc gen5/g5_driver.dc gen5/g5_cg.dc gen5/g5_cgdriver.dc gen5/g5cc_driver.dc > $G5CC_SRC
 $GEN0 $G5CC_SRC --types > /dev/null && echo "g5cc typecheck OK"
-./dcc_1 $G5CC_SRC dcc_6 > /dev/null
-echo "dcc_6 built (by dcc_1)"
+if [ -n "${GEN5_KEEP_BIN:-}" ] && [ -x ./dcc_6 ]; then echo "dcc_6 kept (GEN5_KEEP_BIN)";
+else ./dcc_1 $G5CC_SRC dcc_6 > /dev/null; [ -x ./dcc_6 ] || { echo "dcc_6 build produced no binary (dcc_1 ignores cc failures; check memory)"; exit 1; }; echo "dcc_6 built (by dcc_1; emits RC code, links gen5/rt5.c)"; fi
+# every example: native output == Gen0, and DACELO_RC_CHECK proves every block is freed
 for f in hello fib list_ops closures tree gc_stress; do
   ./dcc_6 examples/$f.dc /tmp/g6_$f > /dev/null 2>&1 || { echo "  $f: COMPILE FAIL"; exit 1; }
-  ./dcc_1 examples/$f.dc /tmp/g1_$f > /dev/null 2>&1
-  diff -q /tmp/g6_$f.s /tmp/g1_$f.s > /dev/null || { echo "  $f: .s DIFFERS from dcc_1"; exit 1; }
   /tmp/g6_$f > /tmp/g6_$f.out 2>&1 || { echo "  $f: RUNTIME FAIL"; exit 1; }
   $GEN0 examples/$f.dc > /tmp/ref_$f.out 2>&1
   diff -q /tmp/ref_$f.out /tmp/g6_$f.out > /dev/null || { echo "  $f: OUTPUT MISMATCH"; exit 1; }
-  echo "  $f: .s identical, runs OK"
+  DACELO_RC_CHECK=1 /tmp/g6_$f > /dev/null 2> /tmp/g6_$f.leak || { echo "  $f: LEAK/UAF CHECK FAIL"; cat /tmp/g6_$f.leak; exit 1; }
+  echo "  $f: output == Gen0, leak-free"
 done
 ./dcc_6 gen5-examples/record.dc /tmp/g6_record > /dev/null 2>&1 || { echo "  record: COMPILE FAIL"; exit 1; }
 [ "$(/tmp/g6_record)" = "Alice,Bob" ] || { echo "  record: OUTPUT MISMATCH"; exit 1; }
-echo "  record: runs OK (Alice,Bob)"
+DACELO_RC_CHECK=1 /tmp/g6_record > /dev/null 2>&1 || { echo "  record: LEAK"; exit 1; }
+echo "  record: runs OK (Alice,Bob), leak-free"
 ./dcc_6 gen5-examples/module.dc /tmp/g6_module > /dev/null 2>&1 || { echo "  module: COMPILE FAIL"; exit 1; }
 echo "  module: links OK"
 ./gen5check check gen5-examples/sig.dc > /dev/null 2>&1 || { echo "  sig: CHECK FAIL"; exit 1; }
@@ -84,7 +85,8 @@ set -e
 echo "  sig_wrong: rejected OK"
 ./dcc_6 gen5-examples/record_with.dc /tmp/g6_recw > /dev/null 2>&1 || { echo "  record_with: COMPILE FAIL"; exit 1; }
 [ "$(/tmp/g6_recw)" = "2" ] || { echo "  record_with: OUTPUT MISMATCH"; exit 1; }
-echo "  record_with: runs OK (2)"
+DACELO_RC_CHECK=1 /tmp/g6_recw > /dev/null 2>&1 || { echo "  record_with: LEAK"; exit 1; }
+echo "  record_with: runs OK (2), leak-free"
 ./dcc_6 gen5-examples/use_mymod.dc /tmp/g6_usemod > /dev/null 2>&1 || { echo "  use_mymod: COMPILE FAIL"; exit 1; }
 [ "$(/tmp/g6_usemod)" = "42" ] || { echo "  use_mymod: OUTPUT MISMATCH"; exit 1; }
 echo "  use_mymod: runs OK (42)"
@@ -99,31 +101,76 @@ echo "  hole: partial OK"
 $GEN0 gen4-infer-dc/tests/t_bad.dc --types > /tmp/o_g0.log 2>&1 || true
 diff -q /tmp/o_g6.log /tmp/o_g0.log > /dev/null || { echo "  REJECT-MSG-DIFFER(t_bad)"; exit 1; }
 echo "  reject OK (t_bad, Gen0-comparable message)"
-
+# drop-guided reuse: a unique list mapped in place must recycle every cons cell
+cat > /tmp/g6_reuse.dc <<'EOF'
+let rec range n acc = if n == 0 then acc else range (n - 1) (n :: acc)
+let rec inc xs = case xs of
+  | [] -> []
+  | h :: t -> (h + 1) :: inc t
+let rec sum xs acc = case xs of
+  | [] -> acc
+  | h :: t -> sum t (acc + h)
+let main () = print_int (sum (inc (range 1000 [])) 0)
+EOF
+./dcc_6 /tmp/g6_reuse.dc /tmp/g6_reuse > /dev/null 2>&1 || { echo "  reuse: COMPILE FAIL"; exit 1; }
+[ "$(/tmp/g6_reuse)" = "501500" ] || { echo "  reuse: OUTPUT MISMATCH"; exit 1; }
+DACELO_RC_STATS=1 DACELO_RC_CHECK=1 /tmp/g6_reuse > /dev/null 2> /tmp/g6_reuse.stats || { echo "  reuse: LEAK"; cat /tmp/g6_reuse.stats; exit 1; }
+grep -qE 'reuses=(1000|[1-9][0-9]{3,})' /tmp/g6_reuse.stats || { echo "  reuse: expected >= 1000 in-place reuses"; cat /tmp/g6_reuse.stats; exit 1; }
+echo "  reuse: unique list mapped in place ($(grep -oE 'reuses=[0-9]+' /tmp/g6_reuse.stats)), leak-free"
+# use-after-free / double-free guard never fires on a closure-heavy program
+DACELO_RC_CHECK=1 /tmp/g6_closures > /dev/null 2>&1 || { echo "  closures: RC CHECK FAIL"; exit 1; }
+echo "  closures: partial application + local let rec leak-free"
 }
 
 sec_C() {
-echo "== C. self-build fixpoint (dcc_7) =="
-# self-check peaks ~27GB; retry once on transient OOM (a pass is conclusive)
-try_twice() {
-  "$@" > /dev/null 2>&1 || { echo "  retrying self-check after failure..."; sleep 5; "$@" > /dev/null 2>&1; } || return 1
-}
-try_twice ./gen5check check $G5CC_SRC || { echo "  self-check FAIL"; exit 1; }
-echo "  gen5check accepts its own compiler source (exit 0)"
+echo "== C. self-host: Gen5-RC builds Gen5-RC (dcc_7 -> dcc_8 fixpoint) =="
+# stage1: dcc_6 (runs on the old runtime) builds the RC-compiled compiler and checker
 ./dcc_6 $G5CC_SRC dcc_7 --backend-only > /dev/null 2>&1 || { echo "  dcc_7 BUILD FAIL"; exit 1; }
-diff -q dcc_6.s dcc_7.s > /dev/null || { echo "  FIXPOINT FAIL: dcc_6.s != dcc_7.s"; exit 1; }
-echo "  FIXPOINT: dcc_6.s == dcc_7.s"
-./dcc_7 examples/hello.dc /tmp/g7_hello > /dev/null 2>&1 || { echo "  dcc_7 SMOKE FAIL"; exit 1; }
-/tmp/g7_hello > /tmp/g7_hello.out 2>&1
+./dcc_6 $G5CHECK_SRC gen5check_rc --backend-only > /dev/null 2>&1 || { echo "  gen5check_rc BUILD FAIL"; exit 1; }
+echo "  stage1: dcc_7 + gen5check_rc built by dcc_6 (both run under RC)"
+# stage2: the RC-compiled compiler rebuilds itself; assembly fixpoint
+./dcc_7 $G5CC_SRC dcc_8 --backend-only > /dev/null 2>&1 || { echo "  dcc_8 BUILD FAIL"; exit 1; }
+cmp -s dcc_7.s dcc_8.s || { echo "  FIXPOINT FAIL: dcc_7.s != dcc_8.s"; exit 1; }
+echo "  FIXPOINT: dcc_7.s == dcc_8.s ($(wc -c < dcc_7.s | tr -d ' ') bytes)"
+./dcc_8 examples/hello.dc /tmp/g8_hello > /dev/null 2>&1 || { echo "  dcc_8 SMOKE FAIL"; exit 1; }
+/tmp/g8_hello > /tmp/g8_hello.out 2>&1
 $GEN0 examples/hello.dc > /tmp/ref_hello.out 2>&1
-diff -q /tmp/ref_hello.out /tmp/g7_hello.out > /dev/null || { echo "  dcc_7 OUTPUT MISMATCH"; exit 1; }
-echo "  dcc_7 smokes OK"
-
+diff -q /tmp/ref_hello.out /tmp/g8_hello.out > /dev/null || { echo "  dcc_8 OUTPUT MISMATCH"; exit 1; }
+DACELO_RC_CHECK=1 ./dcc_8 examples/tree.dc /tmp/g8_tree > /dev/null 2>&1 || { echo "  dcc_8 (RC-compiled compiler) leaked or crashed while compiling"; exit 1; }
+echo "  dcc_8 smokes OK; the RC-compiled compiler itself is leak-free on tree.dc"
+# the RC-compiled checker must agree with Gen0 on the 38-case oracle
+pass=0; fail=0
+for f in examples/hello.dc examples/fib.dc examples/list_ops.dc examples/closures.dc examples/tree.dc gen4-infer-dc/tests/*.dc; do
+  g5=0; ./gen5check_rc check "$f" > /tmp/o_g5.log 2>&1 || g5=$?
+  g0=0; $GEN0 "$f" --types > /tmp/o_g0.log 2>&1 || g0=$?
+  if [ $g5 -ne $g0 ]; then echo "EXIT-DIFFER($f): g5=$g5 g0=$g0"; fail=$((fail+1)); continue; fi
+  diff -q /tmp/o_g5.log /tmp/o_g0.log > /dev/null || { echo "MSG-DIFFER($f)"; fail=$((fail+1)); continue; }
+  pass=$((pass+1))
+done
+echo "  gen5check_rc oracle: $pass agree, $fail differ"
+[ $fail -eq 0 ]
+# headline: self-check under RC (the checker checks the compiler source), with time + peak RSS
+set +e
+/usr/bin/time -l ./gen5check_rc check $G5CC_SRC > /tmp/g5_selfcheck_rc.log 2>&1; sc2=$?
+set -e
+echo "  self-check (RC build): exit $sc2; $(grep -E 'maximum resident|real' /tmp/g5_selfcheck_rc.log | tr -s ' ' | tr '\n' ' ')"
+[ $sc2 -eq 0 ] || { echo "  self-check FAIL under RC (log: /tmp/g5_selfcheck_rc.log)"; exit 1; }
+DACELO_RC_CHECK=1 ./gen5check_rc check examples/tree.dc > /dev/null 2>&1 || { echo "  gen5check_rc leaked while checking tree.dc"; exit 1; }
+echo "  gen5check_rc accepts its own compiler source and is leak-free on tree.dc"
+# comparison point: the same self-check with the mark-sweep-built checker (never collects;
+# known to be OOM-killed on 34GB boxes). Informational unless GEN5_SELFCHECK_STRICT=1.
+if [ -n "${GEN5_SELFCHECK_STRICT:-}" ] || [ -n "${GEN5_SELFCHECK_COMPARE:-}" ]; then
+  set +e
+  /usr/bin/time -l ./gen5check check $G5CC_SRC > /tmp/g5_selfcheck.log 2>&1; sc=$?
+  set -e
+  echo "  self-check (mark-sweep build): exit $sc; $(grep -E 'maximum resident|real' /tmp/g5_selfcheck.log | tr -s ' ' | tr '\n' ' ')"
+  if [ -n "${GEN5_SELFCHECK_STRICT:-}" ]; then [ $sc -eq 0 ] || { echo "  self-check FAIL (mark-sweep build)"; exit 1; }; fi
+fi
 }
 
 sec_D() {
 echo "== D. formatter round-trip =="
-for f in gen3-dcc-dc/dcc.dc gen3-dcc-dc/g3_pm_v2.dc gen3-dcc-dc/g3_ce_v2.dc gen3-dcc-dc/g3_driver_v2.dc gen5/g5_front.dc gen5/g5_infer.dc gen5/g5_query.dc gen5/g5_lower.dc gen5/g5_driver.dc gen5/g5cc_driver.dc gen5/g5_main.dc gen4-infer-dc/infer.dc gen4-infer-dc/g4_check.dc gen4-infer-dc/g4_main.dc gen4-infer-dc/g4cc_driver.dc; do
+for f in gen3-dcc-dc/dcc.dc gen3-dcc-dc/g3_pm_v2.dc gen3-dcc-dc/g3_ce_v2.dc gen3-dcc-dc/g3_driver_v2.dc gen5/g5_front.dc gen5/g5_infer.dc gen5/g5_query.dc gen5/g5_lower.dc gen5/g5_oir.dc gen5/g5_own.dc gen5/g5_cg.dc gen5/g5_cgdriver.dc gen5/g5_driver.dc gen5/g5cc_driver.dc gen5/g5_main.dc gen5/probe_row_occurs.dc gen5/probe_row_unify.dc gen5/probe_own.dc gen5/probe_cg.dc gen4-infer-dc/infer.dc gen4-infer-dc/g4_check.dc gen4-infer-dc/g4_main.dc gen4-infer-dc/g4cc_driver.dc; do
   ./gen5check format "$f" > /dev/null 2>&1 || { echo "  FORMAT FAIL: $f"; exit 1; }
 done
 for f in gen5-examples/*.dc; do
@@ -546,6 +593,44 @@ echo "  hole shadowing: hidden binding dropped, fill rechecks+runs OK"
 
 }
 
+sec_G() {
+echo "== G. ownership: borrow inference visible through the query API =="
+cat > /tmp/g5g_own.dc <<'EOF'
+let id x = x
+let rec len xs = case xs of
+  | [] -> 0
+  | _ :: t -> 1 + len t
+let rec map f xs = case xs of
+  | [] -> []
+  | h :: t -> f h :: map f t
+let pair a b = (a, b)
+let main () = print_int (len (map id [1, 2, 3]))
+EOF
+./gen5check types /tmp/g5g_own.dc --format=json > /tmp/g5g_own.json 2>&1 || { echo "  ownership types: FAIL"; exit 1; }
+python3 - <<'PYEOF' || { echo "  ownership: JSON signatures differ from the inferred contract"; exit 1; }
+import json
+d = json.load(open('/tmp/g5g_own.json'))
+got = {b['name']: b.get('ownership') for it in d['result']['items'] for b in it['binds']}
+want = {'id': ['owned'],                 # returned -> consumed
+        'len': ['borrowed'],             # only inspected
+        'map': ['borrowed', 'owned'],    # f only applied; xs matched + rebuilt (reuse)
+        'pair': ['owned', 'owned'],      # stored in a tuple
+        'main': ['borrowed']}            # unit parameter, only matched
+bad = {k: (got.get(k), v) for k, v in want.items() if got.get(k) != v}
+if bad:
+    print("  ownership mismatch:", bad); raise SystemExit(1)
+PYEOF
+echo "  ownership signatures: id/len/map/pair as inferred OK"
+./dcc_6 /tmp/g5g_own.dc /tmp/g5g_own > /dev/null 2>&1 || { echo "  ownership program: COMPILE FAIL"; exit 1; }
+[ "$(/tmp/g5g_own)" = "3" ] || { echo "  ownership program: expected 3"; exit 1; }
+DACELO_RC_CHECK=1 /tmp/g5g_own > /dev/null 2>&1 || { echo "  ownership program: LEAK"; exit 1; }
+echo "  ownership program: runs and is leak-free OK"
+cat gen3-dcc-dc/dcc.dc gen5/g5_oir.dc gen5/g5_own.dc gen5/probe_own.dc > /tmp/g5own_full.dc
+$GEN0 /tmp/g5own_full.dc > /tmp/g5own.out 2>&1 || { echo "  ownership probe: RUN FAIL"; exit 1; }
+diff -q gen5/oracle/probe_own.expected /tmp/g5own.out > /dev/null || { echo "  ownership probe: IR dump changed (diff vs gen5/oracle/probe_own.expected)"; diff gen5/oracle/probe_own.expected /tmp/g5own.out | head -20; exit 1; }
+echo "  ownership probe: ANF/borrow inference/dup-drop/reuse dump pinned OK"
+}
+
 # Section selection (sections A-F above are functions; default runs all):
 #   GEN5_SKIP="C"     skip listed sections (space-separated letters)
 #   GEN5_ONLY="E F"   run only the listed sections
@@ -559,7 +644,7 @@ skip_sec() {
   fi
   return 1
 }
-for sec in A B C D E F; do
+for sec in A B C D E F G; do
   if skip_sec $sec; then echo "== $sec. skipped (GEN5_SKIP/GEN5_ONLY) =="; else sec_$sec; fi
 done
 

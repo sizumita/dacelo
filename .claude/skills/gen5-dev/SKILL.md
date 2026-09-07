@@ -106,3 +106,15 @@ CLI 例だけでは「通常の occurs-check でも弾ける例」になりが�
 - exit code: 0 checked / 1 invalid / 2 partial（hole あり）/ 3 interface diff。
 - `focus` は `binding.scheme`（定義スキーム）と `occurrence`（使用箇所の単相型）を分けて返す。
   `local_env` は解決済みスコープ由来で、「宣言が前にある」だけでは載らない。
+
+## 8. Gen5-RC（branch `gen5-gc` 以降）
+
+- バックエンドは `gen5/g5_oir.dc`（IR）→ `gen5/g5_own.dc`（ANF・借用推論・Perceus dup/drop・reuse）→
+  `gen5/g5_cg.dc`＋`gen5/g5_cgdriver.dc`（ARM64）→ `gen5/rt5.c`（参照カウントランタイム）。
+  設計は `gen5/GC_DESIGN.md`。旧 `gen3-dcc-dc/*`・`rt.c` は seed（dcc_1）専用で触らない。
+- concat 順は **g5_oir, g5_own を g5_driver より前**（Gen0 は前方参照不可）。
+- 実行時デバッグ: `DACELO_RC_CHECK=1`（終了時に全グローバルを drop してリークがあれば exit 3、
+  use-after-free は即 abort）、`DACELO_RC_STATS=1`（allocs/frees/reuses/peak_live を stderr）。
+- test.sh: B は「Gen0 と出力一致＋リークゼロ＋reuse 実測」、C は `dcc_7`（RC 上のコンパイラ）→`dcc_8` の
+  `.s` 不動点と RC 版チェッカの oracle、G は所有権パスの単体出力。旧 B の「dcc_1 と .s 同一」は廃止。
+- ブートストラップは `gen5/build.sh`（seed→stage1→stage2(RC)→自己検査→stage3 不動点→promote）。

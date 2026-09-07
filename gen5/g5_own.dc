@@ -1,0 +1,904 @@
+-- ============================================================
+-- gen5/g5_own.dc -- Gen5 ownership analysis pass (GC_DESIGN.md §3)
+-- legacy `Expr`/`Prog` (dcc.dc) -> ownership IR `OProg` (g5_oir.dc):
+--   1. ANF conversion, lexical name resolution, alpha-renaming of every
+--      local binder (no shadowing survives into the IR)
+--   2. borrowed-parameter inference (fixpoint over direct-callable defs)
+--   3. Perceus dup/drop insertion (owned by default; borrowing positions
+--      per GC_DESIGN §3.1)
+--   4. drop-guided reuse pairing (straight-line only)
+-- API (fixed names): g5o_program : Prog -> OProg,
+--   g5o_sigs_of : Prog -> List (String, List Bool) (true = owned),
+--   g5o_print_prog : OProg -> String.
+-- IR naming: user binders `name#N`, temporaries `%N`, reuse tokens `%rN`
+-- (N unique within one definition). Parameters are always `PVar`s: a
+-- wildcard parameter gets a fresh variable, any other pattern a fresh
+-- variable matched by a one-branch OCase. Allocation prims are
+-- `PMkCtor`/`PMkTup` (`PCtor`/`PTup` clash with the legacy `Pat`) and
+-- OPrim/OExpr are one `type` (Gen0 has no `type ... and`/forward types).
+-- Gen4-subset syntax only (bootstrap constraint); all names carry g5o_.
+-- ============================================================
+
+-- ---------- generic helpers ----------
+
+let g5o_not b = if b then false else true
+
+let rec g5o_mem x xs = case xs of
+    [] -> false
+  | h :: t -> if h == x then true else g5o_mem x t
+
+-- elements of xs not in ys (order of xs kept)
+let rec g5o_diff xs ys = case xs of
+    [] -> []
+  | h :: t -> if g5o_mem h ys then g5o_diff t ys else h :: g5o_diff t ys
+
+-- elements of xs that are in ys (order of xs kept)
+let rec g5o_inter xs ys = case xs of
+    [] -> []
+  | h :: t -> if g5o_mem h ys then h :: g5o_inter t ys else g5o_inter t ys
+
+let rec g5o_assoc key lm dflt = case lm of
+    [] -> dflt
+  | kv :: rest -> case kv of
+      | (k, v) -> if k == key then v else g5o_assoc key rest dflt
+
+let rec g5o_has_key key lm = case lm of
+    [] -> false
+  | kv :: rest -> case kv of
+      | (k, _) -> if k == key then true else g5o_has_key key rest
+
+let rec g5o_take n xs = if n == 0 then [] else case xs of
+    [] -> []
+  | h :: t -> h :: g5o_take (n - 1) t
+
+let rec g5o_dropn n xs = if n == 0 then xs else case xs of
+    [] -> []
+  | _ :: t -> g5o_dropn (n - 1) t
+
+let rec g5o_replicate n x = if n <= 0 then [] else x :: g5o_replicate (n - 1) x
+
+let rec g5o_count_true bs = case bs of
+    [] -> 0
+  | b :: rest -> (if b then 1 else 0) + g5o_count_true rest
+
+-- ---------- legacy program accessors (copies of g3_driver_v2.dc helpers) ----------
+
+let g5o_d_name d = case d of | Def3 _ n _ -> n
+let g5o_d_rhs d = case d of | Def3 _ _ b -> b
+let g5o_g_defs g = case g of | Group ds -> ds
+let g5o_p_ctorpairs pr = case pr of | Prog c _ _ _ -> c
+let g5o_p_groups pr = case pr of | Prog _ gs _ _ -> gs
+
+-- definition order used by the backend (same as flatten_groups2: groups in
+-- source order, members of one `and` group reversed)
+let rec g5o_flatten_groups gs acc = case gs of
+    [] -> rev_list acc []
+  | g :: rest -> g5o_flatten_groups rest (app_list (g5o_g_defs g) acc)
+
+-- strip nested ELam (and annotations) from a def rhs: (params, body)
+let rec g5o_strip_lams e ps = case e of
+    | ELam p body -> g5o_strip_lams body (p :: ps)
+    | EAnn inner _ -> g5o_strip_lams inner ps
+    | _ -> (rev_list ps [], e)
+
+let rec g5o_strip_ann e = case e of
+    | EAnn inner _ -> g5o_strip_ann inner
+    | _ -> e
+
+-- ---------- fresh names and pattern renaming ----------
+
+let g5o_fresh base cnt = (base ++ "#" ++ int_to_string cnt, cnt + 1)
+let g5o_tmp cnt = ("%" ++ int_to_string cnt, cnt + 1)
+
+-- rename every PVar of a pattern: (pattern, extended scope, counter)
+let rec g5o_ren_pat p sc cnt = case p of
+    | PVar n ->
+        let (n2, c2) = g5o_fresh n cnt in
+        (PVar n2, (n, n2) :: sc, c2)
+    | PTup ps ->
+        let (ps2, sc2, c2) = g5o_ren_pats ps sc cnt in
+        (PTup ps2, sc2, c2)
+    | PCtor c ps ->
+        let (ps2, sc2, c2) = g5o_ren_pats ps sc cnt in
+        (PCtor c ps2, sc2, c2)
+    | _ -> (p, sc, cnt)
+and g5o_ren_pats ps sc cnt = case ps of
+    [] -> ([], sc, cnt)
+  | p :: rest ->
+      let (p2, sc2, c2) = g5o_ren_pat p sc cnt in
+      let (rest2, sc3, c3) = g5o_ren_pats rest sc2 c2 in
+      (p2 :: rest2, sc3, c3)
+
+-- variables bound by a pattern, left to right
+let rec g5o_pat_vars_acc p acc = case p of
+    | PVar n -> n :: acc
+    | PTup ps -> g5o_pats_vars_acc ps acc
+    | PCtor _ ps -> g5o_pats_vars_acc ps acc
+    | _ -> acc
+and g5o_pats_vars_acc ps acc = case ps of
+    [] -> acc
+  | p :: rest -> g5o_pats_vars_acc rest (g5o_pat_vars_acc p acc)
+
+let g5o_pvars p = rev_acc [] (g5o_pat_vars_acc p [])
+
+let rec g5o_pats_names ps = case ps of
+    [] -> []
+  | p :: rest -> app_list (g5o_pvars p) (g5o_pats_names rest)
+
+-- ---------- free variables of IR expressions ----------
+-- acc holds names in reverse order of first occurrence, deduplicated
+
+let g5o_fv_name x bound acc =
+  if x == "" then acc
+  else if g5o_mem x bound then acc
+  else if g5o_mem x acc then acc
+  else x :: acc
+
+let g5o_fv_atom a bound acc = case a of
+    | AVar x -> g5o_fv_name x bound acc
+    | _ -> acc
+
+let rec g5o_fv_atoms atoms bound acc = case atoms of
+    [] -> acc
+  | a :: rest -> g5o_fv_atoms rest bound (g5o_fv_atom a bound acc)
+
+let rec g5o_fv_names ns bound acc = case ns of
+    [] -> acc
+  | n :: rest -> g5o_fv_names rest bound (g5o_fv_name n bound acc)
+
+let rec g5o_fv_e e bound acc = case e of
+    | ORet a -> g5o_fv_atom a bound acc
+    | OLet x p rest -> g5o_fv_e rest (x :: bound) (g5o_fv_prim p bound acc)
+    | OLetRec x p rest -> g5o_fv_e rest (x :: bound) (g5o_fv_prim p (x :: bound) acc)
+    | OIf c t f -> g5o_fv_e f bound (g5o_fv_e t bound (g5o_fv_atom c bound acc))
+    | OCase a brs -> g5o_fv_brs brs bound (g5o_fv_atom a bound acc)
+    | ODup x rest -> g5o_fv_e rest bound (g5o_fv_name x bound acc)
+    | ODrop x rest -> g5o_fv_e rest bound (g5o_fv_name x bound acc)
+    | ODropReuse x tok rest -> g5o_fv_e rest (tok :: bound) (g5o_fv_name x bound acc)
+and g5o_fv_brs brs bound acc = case brs of
+    [] -> acc
+  | br :: rest -> case br of
+      | (p, b) -> g5o_fv_brs rest bound (g5o_fv_e b (app_list (g5o_pvars p) bound) acc)
+and g5o_fv_prim p bound acc = case p of
+    | PAtom a -> g5o_fv_atom a bound acc
+    | PApp f a -> g5o_fv_atom a bound (g5o_fv_atom f bound acc)
+    | PCall _ atoms -> g5o_fv_atoms atoms bound acc
+    | PBi _ atoms -> g5o_fv_atoms atoms bound acc
+    | PMkCtor _ atoms tok -> g5o_fv_atoms atoms bound (g5o_fv_name tok bound acc)
+    | PMkTup atoms tok -> g5o_fv_atoms atoms bound (g5o_fv_name tok bound acc)
+    | PLam _ _ caps -> g5o_fv_names caps bound acc
+    | PBin _ a b -> g5o_fv_atom b bound (g5o_fv_atom a bound acc)
+    | PBlock b -> g5o_fv_e b bound acc
+
+let g5o_fv e = rev_acc [] (g5o_fv_e e [] [])
+
+-- ---------- ANF conversion ----------
+-- static context g = (ctor arity table, (top-level def name, param count));
+-- sc = lexical scope (source name, renamed name), newest first; cnt = counter.
+-- Three modes: tail (produces an OExpr ending in ORet), named x (produces a
+-- wrapper `OExpr -> OExpr` that binds x), atom (wrapper + atom).
+
+let g5o_g_ctors g = case g of | (c, _) -> c
+let g5o_g_funs g = case g of | (_, f) -> f
+
+let g5o_bi_arity n =
+  if n == "str_concat" then 2
+  else if n == "write_file" then 2
+  else if n == "string_get" then 2
+  else if n == "substring" then 3
+  else 1
+
+let g5o_ctor_arity g c =
+  if g5o_has_key c (g5o_g_ctors g) then g5o_assoc c (g5o_g_ctors g) 0
+  else error ("g5o: unknown constructor " ++ c)
+
+-- variable occurrence: local -> AVar (renamed); top-level def (shadows a
+-- builtin of the same name) or builtin -> AGlob; anything else is an error
+let g5o_resolve g sc n =
+  if g5o_has_key n sc then AVar (g5o_assoc n sc "")
+  else if g5o_has_key n (g5o_g_funs g) then AGlob n
+  else if mem_str n builtins then AGlob n
+  else error ("g5o: unbound variable " ++ n)
+
+let g5o_wid k = k
+
+let g5o_mk_bool_if op c rhs =
+  if op == "&&" then OIf c rhs (ORet (ABool false)) else OIf c (ORet (ABool true)) rhs
+
+-- parameter pattern -> (variable, body wrapper, scope, counter)
+let g5o_cv_param sc cnt p = case p of
+    | PVar n ->
+        let (v, c1) = g5o_fresh n cnt in
+        (v, g5o_wid, (n, v) :: sc, c1)
+    | PWild ->
+        let (v, c1) = g5o_fresh "_" cnt in
+        (v, g5o_wid, sc, c1)
+    | _ ->
+        let (v, c1) = g5o_fresh "_p" cnt in
+        let (p2, sc2, c2) = g5o_ren_pat p sc c1 in
+        (v, (fun b -> OCase (AVar v) [(p2, b)]), sc2, c2)
+
+-- all parameters of a def; the first parameter's match is outermost
+let rec g5o_cv_params ps sc cnt = case ps of
+    [] -> ([], g5o_wid, sc, cnt)
+  | p :: rest ->
+      let (v, w1, sc2, c1) = g5o_cv_param sc cnt p in
+      let (vs, w2, sc3, c2) = g5o_cv_params rest sc2 c1 in
+      (v :: vs, (fun b -> w1 (w2 b)), sc3, c2)
+
+-- application spine: (head, args in order)
+let rec g5o_spine e args = case e of
+    | EApp f a -> g5o_spine f (a :: args)
+    | EAnn inner _ -> g5o_spine inner args
+    | _ -> (e, args)
+
+-- tail position: (OExpr, counter)
+let rec g5o_cv_tail g sc cnt e = case e of
+    | EIf c t f ->
+        let (w, ca, c1) = g5o_cv_atom g sc cnt c in
+        let (t2, c2) = g5o_cv_tail g sc c1 t in
+        let (f2, c3) = g5o_cv_tail g sc c2 f in
+        (w (OIf ca t2 f2), c3)
+    | ECase s brs ->
+        let (w, sa, c1) = g5o_cv_scrut g sc cnt s in
+        let (brs2, c2) = g5o_cv_branches g sc c1 brs in
+        (w (OCase sa brs2), c2)
+    | ELet isrec x rhs body ->
+        let (w, sc2, c1) = g5o_cv_let g sc cnt isrec x rhs in
+        let (b2, c2) = g5o_cv_tail g sc2 c1 body in
+        (w b2, c2)
+    | EBin op l r ->
+        if op == "&&" || op == "||" then
+          let (w, la, c1) = g5o_cv_atom g sc cnt l in
+          let (r2, c2) = g5o_cv_tail g sc c1 r in
+          (w (g5o_mk_bool_if op la r2), c2)
+        else
+          let (w, a, c1) = g5o_cv_atom g sc cnt e in
+          (w (ORet a), c1)
+    | EAnn inner _ -> g5o_cv_tail g sc cnt inner
+    | _ ->
+        let (w, a, c1) = g5o_cv_atom g sc cnt e in
+        (w (ORet a), c1)
+
+-- bind x to the value of e: (wrapper, counter). if/case become PBlock;
+-- a let in non-tail position is flattened (its binder stays in scope)
+and g5o_cv_named g sc cnt x e = case e of
+    | EApp _ _ -> g5o_cv_app g sc cnt x e
+    | EBin op l r ->
+        if op == "&&" || op == "||" then
+          let (b, c1) = g5o_cv_tail g sc cnt e in
+          ((fun k -> OLet x (PBlock b) k), c1)
+        else
+          let (w1, la, c1) = g5o_cv_atom g sc cnt l in
+          let (w2, ra, c2) = g5o_cv_atom g sc c1 r in
+          ((fun k -> w1 (w2 (OLet x (PBin op la ra) k))), c2)
+    | EIf _ _ _ ->
+        let (b, c1) = g5o_cv_tail g sc cnt e in
+        ((fun k -> OLet x (PBlock b) k), c1)
+    | ECase _ _ ->
+        let (b, c1) = g5o_cv_tail g sc cnt e in
+        ((fun k -> OLet x (PBlock b) k), c1)
+    | ELet isrec y rhs body ->
+        let (w1, sc2, c1) = g5o_cv_let g sc cnt isrec y rhs in
+        let (w2, c2) = g5o_cv_named g sc2 c1 x body in
+        ((fun k -> w1 (w2 k)), c2)
+    | ELam p body ->
+        let (lam, c1) = g5o_cv_lam g sc cnt p body in
+        ((fun k -> OLet x lam k), c1)
+    | ETup es ->
+        let (w, atoms, c1) = g5o_cv_atoms g sc cnt es in
+        ((fun k -> w (OLet x (PMkTup atoms "") k)), c1)
+    | EAnn inner _ -> g5o_cv_named g sc cnt x inner
+    | _ ->
+        let (w, a, c1) = g5o_cv_atom g sc cnt e in
+        ((fun k -> w (OLet x (PAtom a) k)), c1)
+
+-- non-tail position: (wrapper, atom, counter)
+and g5o_cv_atom g sc cnt e = case e of
+    | EInt n -> (g5o_wid, AInt n, cnt)
+    | EBool b -> (g5o_wid, ABool b, cnt)
+    | EStr s -> (g5o_wid, AStr s, cnt)
+    | EUnit -> (g5o_wid, AUnit, cnt)
+    | EVar n -> (g5o_wid, g5o_resolve g sc n, cnt)
+    | ECtor c -> (g5o_wid, (if g5o_ctor_arity g c == 0 then ANull c else AGlob c), cnt)
+    | EAnn inner _ -> g5o_cv_atom g sc cnt inner
+    | _ ->
+        let (t, c1) = g5o_tmp cnt in
+        let (w, c2) = g5o_cv_named g sc c1 t e in
+        (w, AVar t, c2)
+
+-- arguments left to right
+and g5o_cv_atoms g sc cnt es = case es of
+    [] -> (g5o_wid, [], cnt)
+  | e :: rest ->
+      let (w1, a, c1) = g5o_cv_atom g sc cnt e in
+      let (w2, rest2, c2) = g5o_cv_atoms g sc c1 rest in
+      ((fun k -> w1 (w2 k)), a :: rest2, c2)
+
+-- case scrutinee: a variable-like atom (literals are bound to a temporary)
+and g5o_cv_scrut g sc cnt e =
+  let (w, a, c1) = g5o_cv_atom g sc cnt e in
+  case a of
+    | AVar _ -> (w, a, c1)
+    | AGlob _ -> (w, a, c1)
+    | ANull _ -> (w, a, c1)
+    | _ ->
+        let (t, c2) = g5o_tmp c1 in
+        ((fun k -> w (OLet t (PAtom a) k)), AVar t, c2)
+
+and g5o_cv_branches g sc cnt brs = case brs of
+    [] -> ([], cnt)
+  | br :: rest -> case br of
+      | (p, body) ->
+          let (p2, sc2, c1) = g5o_ren_pat p sc cnt in
+          let (b2, c2) = g5o_cv_tail g sc2 c1 body in
+          let (rest2, c3) = g5o_cv_branches g sc c2 rest in
+          ((p2, b2) :: rest2, c3)
+
+-- local let: (wrapper, scope including the binder, counter).
+-- `let rec f = fun ...` becomes OLetRec with f visible in its own body;
+-- a `let rec` whose rhs is not a lambda is treated as a plain let.
+and g5o_cv_let g sc cnt isrec x rhs =
+  let (x2, c1) = g5o_fresh x cnt in
+  let rhs2 = g5o_strip_ann rhs in
+  let sc2 = (x, x2) :: sc in
+  if isrec then
+    (case rhs2 of
+      | ELam p body ->
+          let (lam, c2) = g5o_cv_lam g sc2 c1 p body in
+          ((fun k -> OLetRec x2 lam k), sc2, c2)
+      | _ ->
+          let (w, c2) = g5o_cv_named g sc c1 x2 rhs2 in
+          (w, sc2, c2))
+  else
+    let (w, c2) = g5o_cv_named g sc c1 x2 rhs2 in
+    (w, sc2, c2)
+
+-- lambda: one PVar parameter; captures = free locals of the body
+and g5o_cv_lam g sc cnt p body =
+  let (v, wrap, sc2, c1) = g5o_cv_param sc cnt p in
+  let (b2, c2) = g5o_cv_tail g sc2 c1 body in
+  let b3 = wrap b2 in
+  (PLam (PVar v) b3 (g5o_diff (g5o_fv b3) [v]), c2)
+
+-- application spine: saturated direct call (PCall / PBi / PMkCtor) on the
+-- first k arguments, generic PApp chain for the rest
+and g5o_cv_app g sc cnt x e =
+  let (hd, args) = g5o_spine e [] in
+  case hd of
+    | EVar n ->
+        if g5o_has_key n sc then
+          g5o_cv_generic g sc cnt x (AVar (g5o_assoc n sc "")) args
+        else
+          let k = g5o_assoc n (g5o_g_funs g) (0 - 1) in
+          if k >= 1 && k <= g5o_max_direct && len args >= k then
+            let (w, atoms, c1) = g5o_cv_atoms g sc cnt (g5o_take k args) in
+            g5o_cv_rest g sc c1 x w (PCall n atoms) (g5o_dropn k args)
+          else if k == (0 - 1) && mem_str n builtins && len args >= g5o_bi_arity n then
+            let a = g5o_bi_arity n in
+            let (w, atoms, c1) = g5o_cv_atoms g sc cnt (g5o_take a args) in
+            g5o_cv_rest g sc c1 x w (PBi n atoms) (g5o_dropn a args)
+          else
+            g5o_cv_generic g sc cnt x (g5o_resolve g sc n) args
+    | ECtor c ->
+        let a = g5o_ctor_arity g c in
+        if a > 0 && len args >= a then
+          let (w, atoms, c1) = g5o_cv_atoms g sc cnt (g5o_take a args) in
+          g5o_cv_rest g sc c1 x w (PMkCtor c atoms "") (g5o_dropn a args)
+        else
+          g5o_cv_generic g sc cnt x (if a == 0 then ANull c else AGlob c) args
+    | _ ->
+        let (w, ha, c1) = g5o_cv_atom g sc cnt hd in
+        let (w2, c2) = g5o_cv_generic g sc c1 x ha args in
+        ((fun k -> w (w2 k)), c2)
+
+-- bind the saturated prim, then apply any extra arguments generically
+and g5o_cv_rest g sc cnt x w prim rest = case rest of
+    | [] -> ((fun k -> w (OLet x prim k)), cnt)
+    | _ ->
+        let (t, c1) = g5o_tmp cnt in
+        let (w2, c2) = g5o_cv_generic g sc c1 x (AVar t) rest in
+        ((fun k -> w (OLet t prim (w2 k))), c2)
+
+-- generic closure-call chain: the function atom first, then each argument
+-- is evaluated and applied, left to right
+and g5o_cv_generic g sc cnt x fa args = case args of
+    | [] -> ((fun k -> OLet x (PAtom fa) k), cnt)
+    | a :: [] ->
+        let (w, aa, c1) = g5o_cv_atom g sc cnt a in
+        ((fun k -> w (OLet x (PApp fa aa) k)), c1)
+    | a :: rest ->
+        let (w, aa, c1) = g5o_cv_atom g sc cnt a in
+        let (t, c2) = g5o_tmp c1 in
+        let (w2, c3) = g5o_cv_generic g sc c2 x (AVar t) rest in
+        ((fun k -> w (OLet t (PApp fa aa) (w2 k))), c3)
+
+-- number of parameters of each top-level def (nested ELam count)
+let rec g5o_def_arities defs = case defs of
+    [] -> []
+  | d :: rest ->
+      let (ps, _) = g5o_strip_lams (g5o_d_rhs d) [] in
+      (g5o_d_name d, len ps) :: g5o_def_arities rest
+
+let rec g5o_pvar_pats vs = case vs of
+    [] -> []
+  | v :: rest -> PVar v :: g5o_pvar_pats rest
+
+-- one definition -> ODef with initial modes: direct (1..8 params) all
+-- borrowed (refined by inference), >8 params all owned (closure path only),
+-- value (no params) []
+let g5o_cv_def g d =
+  let (pats, body) = g5o_strip_lams (g5o_d_rhs d) [] in
+  let (vs, wrap, sc, cnt) = g5o_cv_params pats [] 1 in
+  let (b, _) = g5o_cv_tail g sc cnt body in
+  let k = len vs in
+  let direct = k >= 1 && k <= g5o_max_direct in
+  let modes = if direct then g5o_replicate k false else g5o_replicate k true in
+  ODef (g5o_d_name d) (g5o_pvar_pats vs) (wrap b) modes direct
+
+let rec g5o_cv_defs g defs = case defs of
+    [] -> []
+  | d :: rest -> g5o_cv_def g d :: g5o_cv_defs g rest
+
+-- ---------- reuse candidates (shared by inference §3.2 and pairing §3.4) ----------
+
+-- heap words of the block matched by a branch pattern (0 = not a heap block)
+let g5o_pat_words p = case p of
+    | PCtor _ ps -> if len ps == 0 then 0 else g5o_ctor_words (len ps)
+    | PTup ps -> g5o_tup_words (len ps)
+    | _ -> 0
+
+-- straight-line search for the first unpaired same-size PMkCtor/PMkTup: follows
+-- OLet/OLetRec/ODup/ODrop/ODropReuse, never enters PLam/PBlock/OIf/OCase.
+-- Returns (found, expression with the token set on that allocation)
+let rec g5o_find_alloc words tok e = case e of
+    | OLet y p rest ->
+        (case p of
+          | PMkCtor c atoms t0 ->
+              if t0 == "" && g5o_ctor_words (len atoms) == words then (true, OLet y (PMkCtor c atoms tok) rest)
+              else g5o_find_alloc_rest words tok y p rest
+          | PMkTup atoms t0 ->
+              if t0 == "" && g5o_tup_words (len atoms) == words then (true, OLet y (PMkTup atoms tok) rest)
+              else g5o_find_alloc_rest words tok y p rest
+          | _ -> g5o_find_alloc_rest words tok y p rest)
+    | OLetRec y p rest ->
+        let (f, r2) = g5o_find_alloc words tok rest in (f, OLetRec y p r2)
+    | ODup v rest ->
+        let (f, r2) = g5o_find_alloc words tok rest in (f, ODup v r2)
+    | ODrop v rest ->
+        let (f, r2) = g5o_find_alloc words tok rest in (f, ODrop v r2)
+    | ODropReuse v t rest ->
+        let (f, r2) = g5o_find_alloc words tok rest in (f, ODropReuse v t r2)
+    | _ -> (false, e)
+and g5o_find_alloc_rest words tok y p rest =
+  let (f, r2) = g5o_find_alloc words tok rest in (f, OLet y p r2)
+
+let g5o_alloc_in words e = case g5o_find_alloc words "?" e of | (f, _) -> f
+
+-- scrutinee x is reusable in some branch: heap-block pattern, x unused in
+-- the branch body (so its drop lands at the branch head), same-size
+-- allocation in the straight-line part of the body
+let rec g5o_case_reusable x brs = case brs of
+    [] -> false
+  | br :: rest -> case br of
+      | (p, body) ->
+          let w = g5o_pat_words p in
+          if w > 0 && g5o_not (g5o_mem x (g5o_fv body)) && g5o_alloc_in w body then true
+          else g5o_case_reusable x rest
+
+-- ---------- borrowed-parameter inference (GC_DESIGN §3.2) ----------
+-- collect variables at consuming positions; PCall positions follow the
+-- current sigs (an unknown callee counts as all owned: the safe direction)
+
+let g5o_cons_atom a acc = case a of
+    | AVar x -> x :: acc
+    | _ -> acc
+
+let rec g5o_cons_atoms atoms acc = case atoms of
+    [] -> acc
+  | a :: rest -> g5o_cons_atoms rest (g5o_cons_atom a acc)
+
+let rec g5o_cons_call modes atoms acc = case atoms of
+    [] -> acc
+  | a :: rest ->
+      (case modes of
+        | m :: ms -> g5o_cons_call ms rest (if m then g5o_cons_atom a acc else acc)
+        | [] -> g5o_cons_call [] rest (g5o_cons_atom a acc))
+
+let rec g5o_cons_e sigs e acc = case e of
+    | ORet a -> g5o_cons_atom a acc
+    | OLet _ p rest -> g5o_cons_e sigs rest (g5o_cons_prim sigs p acc)
+    | OLetRec _ p rest -> g5o_cons_e sigs rest (g5o_cons_prim sigs p acc)
+    | OIf _ t f -> g5o_cons_e sigs f (g5o_cons_e sigs t acc)
+    | OCase a brs ->
+        let acc2 = (case a of
+          | AVar x -> if g5o_case_reusable x brs then x :: acc else acc
+          | _ -> acc) in
+        g5o_cons_brs sigs brs acc2
+    | ODup _ rest -> g5o_cons_e sigs rest acc
+    | ODrop _ rest -> g5o_cons_e sigs rest acc
+    | ODropReuse _ _ rest -> g5o_cons_e sigs rest acc
+and g5o_cons_brs sigs brs acc = case brs of
+    [] -> acc
+  | br :: rest -> case br of
+      | (_, b) -> g5o_cons_brs sigs rest (g5o_cons_e sigs b acc)
+and g5o_cons_prim sigs p acc = case p of
+    | PAtom a -> g5o_cons_atom a acc
+    | PApp _ a -> g5o_cons_atom a acc
+    | PCall f atoms -> g5o_cons_call (g5o_assoc f sigs []) atoms acc
+    | PBi _ _ -> acc
+    | PMkCtor _ atoms _ -> g5o_cons_atoms atoms acc
+    | PMkTup atoms _ -> g5o_cons_atoms atoms acc
+    | PLam _ _ caps -> app_list caps acc
+    | PBin _ _ _ -> acc
+    | PBlock b -> g5o_cons_e sigs b acc
+
+-- new modes = old modes OR consumed (monotone: borrowed -> owned only)
+let rec g5o_modes_join names old consumed = case names of
+    [] -> []
+  | n :: rest ->
+      let o = (case old of | m :: _ -> m | [] -> false) in
+      let old2 = (case old of | _ :: ms -> ms | [] -> []) in
+      (o || g5o_mem n consumed) :: g5o_modes_join rest old2 consumed
+
+let rec g5o_init_sigs odefs = case odefs of
+    [] -> []
+  | d :: rest ->
+      if odef_direct d then (odef_name d, odef_modes d) :: g5o_init_sigs rest
+      else g5o_init_sigs rest
+
+let rec g5o_infer_once odefs sigs = case odefs of
+    [] -> []
+  | d :: rest ->
+      if odef_direct d then
+        let consumed = g5o_cons_e sigs (odef_body d) [] in
+        let names = g5o_pats_names (odef_params d) in
+        let old = g5o_assoc (odef_name d) sigs [] in
+        (odef_name d, g5o_modes_join names old consumed) :: g5o_infer_once rest sigs
+      else g5o_infer_once rest sigs
+
+let rec g5o_count_owned sigs = case sigs of
+    [] -> 0
+  | kv :: rest -> case kv of
+      | (_, ms) -> g5o_count_true ms + g5o_count_owned rest
+
+-- the owned count grows strictly until the fixpoint (termination measure)
+let rec g5o_infer_loop odefs sigs =
+  let sigs2 = g5o_infer_once odefs sigs in
+  if g5o_count_owned sigs2 == g5o_count_owned sigs then sigs2
+  else g5o_infer_loop odefs sigs2
+
+let rec g5o_apply_sigs odefs sigs = case odefs of
+    [] -> []
+  | d :: rest -> case d of
+      | ODef name params body modes direct ->
+          let modes2 = if direct then g5o_assoc name sigs modes else modes in
+          ODef name params body modes2 direct :: g5o_apply_sigs rest sigs
+
+-- ---------- Perceus dup/drop insertion (GC_DESIGN §3.3) ----------
+
+let rec g5o_wrap_dups vs e = case vs of
+    [] -> e
+  | v :: rest -> ODup v (g5o_wrap_dups rest e)
+
+let rec g5o_wrap_drops vs e = case vs of
+    [] -> e
+  | v :: rest -> ODrop v (g5o_wrap_drops rest e)
+
+-- AVar occurrences of one prim with their position mode (true = consuming)
+let g5o_occ_atom a consuming acc = case a of
+    | AVar x -> (x, consuming) :: acc
+    | _ -> acc
+
+let rec g5o_occ_atoms atoms consuming acc = case atoms of
+    [] -> acc
+  | a :: rest -> g5o_occ_atoms rest consuming (g5o_occ_atom a consuming acc)
+
+let rec g5o_occ_names ns acc = case ns of
+    [] -> acc
+  | n :: rest -> g5o_occ_names rest ((n, true) :: acc)
+
+let rec g5o_occ_call modes atoms acc = case atoms of
+    [] -> acc
+  | a :: rest ->
+      (case modes of
+        | m :: ms -> g5o_occ_call ms rest (g5o_occ_atom a m acc)
+        | [] -> g5o_occ_call [] rest (g5o_occ_atom a true acc))
+
+-- self = the OLetRec binder (its self-capture is never dup'd), "" otherwise
+let g5o_prim_occ sigs p self = case p of
+    | PAtom a -> g5o_occ_atom a true []
+    | PApp f a -> g5o_occ_atom a true (g5o_occ_atom f false [])
+    | PCall f atoms -> g5o_occ_call (g5o_assoc f sigs []) atoms []
+    | PBi _ atoms -> g5o_occ_atoms atoms false []
+    | PMkCtor _ atoms _ -> g5o_occ_atoms atoms true []
+    | PMkTup atoms _ -> g5o_occ_atoms atoms true []
+    | PLam _ _ caps -> g5o_occ_names (g5o_diff caps [self]) []
+    | PBin _ a b -> g5o_occ_atom b false (g5o_occ_atom a false [])
+    | PBlock _ -> []
+
+let rec g5o_occ_vars occ acc = case occ of
+    [] -> rev_acc [] acc
+  | o :: rest -> case o of
+      | (v, _) -> g5o_occ_vars rest (if g5o_mem v acc then acc else v :: acc)
+
+let rec g5o_occ_count occ v consuming = case occ of
+    [] -> 0
+  | o :: rest -> case o of
+      | (v2, m) ->
+          let same = if m then consuming else g5o_not consuming in
+          (if v2 == v && same then 1 else 0) + g5o_occ_count rest v consuming
+
+-- (dups before, drops after) one prim. ownedP = owned variables whose last
+-- use is this prim. Each consuming occurrence needs its own reference; a
+-- borrowing occurrence needs the caller to keep one alive during the call.
+let rec g5o_occ_split vars occ ownedP dups drops = case vars of
+    [] -> (rev_acc [] dups, rev_acc [] drops)
+  | v :: rest ->
+      let c = g5o_occ_count occ v true in
+      let b = g5o_occ_count occ v false in
+      if g5o_mem v ownedP then
+        (if c == 0 then g5o_occ_split rest occ ownedP dups (v :: drops)
+         else if b == 0 then g5o_occ_split rest occ ownedP (app_list (g5o_replicate (c - 1) v) dups) drops
+         else g5o_occ_split rest occ ownedP (app_list (g5o_replicate c v) dups) (v :: drops))
+      else g5o_occ_split rest occ ownedP (app_list (g5o_replicate c v) dups) drops
+
+-- owned = variables this scope owns and must consume exactly once; every
+-- other variable is borrowed. Dead owned variables are dropped right here
+-- (function entry, after a binding, at a branch head).
+let rec g5o_own sigs e owned =
+  let fvs = g5o_fv e in
+  let dead = g5o_diff owned fvs in
+  let live = g5o_inter owned fvs in
+  g5o_wrap_drops dead (g5o_own_live sigs e live)
+
+-- precondition: owned is a subset of fv e
+and g5o_own_live sigs e owned = case e of
+    | ORet a ->
+        (case a of
+          | AVar x -> if g5o_mem x owned then e else ODup x e
+          | _ -> e)
+    | OLet x p rest -> g5o_own_bind sigs false x p rest owned
+    | OLetRec x p rest -> g5o_own_bind sigs true x p rest owned
+    | OIf c t f -> OIf c (g5o_own sigs t owned) (g5o_own sigs f owned)
+    | OCase a brs -> OCase a (g5o_own_brs sigs a brs owned)
+    | ODup _ _ -> error "g5o: unexpected dup in input"
+    | ODrop _ _ -> error "g5o: unexpected drop in input"
+    | ODropReuse _ _ _ -> error "g5o: unexpected drop-reuse in input"
+
+-- variables used after the binding are borrowed by the prim (dup where
+-- consumed) and owned by the rest; the others are consumed or dropped here
+and g5o_own_bind sigs isrec x p rest owned =
+  let fv2 = g5o_fv rest in
+  let ownedE = g5o_inter owned fv2 in
+  let ownedP = g5o_diff owned fv2 in
+  let self = if isrec then x else "" in
+  let (dups, p2, drops) = g5o_own_prim sigs p ownedP self in
+  let rest2 = g5o_wrap_drops drops (g5o_own sigs rest (x :: ownedE)) in
+  g5o_wrap_dups dups (if isrec then OLetRec x p2 rest2 else OLet x p2 rest2)
+
+-- (dups, prim, drops); lambda bodies own their parameter and borrow their
+-- captures; a block consumes exactly the variables whose last use it holds
+and g5o_own_prim sigs p ownedP self = case p of
+    | PLam pat body caps ->
+        let body2 = g5o_own sigs body (g5o_pvars pat) in
+        let occ = g5o_prim_occ sigs p self in
+        let (dups, drops) = g5o_occ_split (g5o_occ_vars occ []) occ ownedP [] [] in
+        (dups, PLam pat body2 caps, drops)
+    | PBlock b -> ([], PBlock (g5o_own sigs b ownedP), [])
+    | _ ->
+        let occ = g5o_prim_occ sigs p self in
+        let (dups, drops) = g5o_occ_split (g5o_occ_vars occ []) occ ownedP [] [] in
+        (dups, p, drops)
+
+-- owned scrutinee: dup the pattern variables the body uses (they become
+-- owned), then the scrutinee is dropped at the head if unused, else kept
+-- owned. Borrowed (or non-variable) scrutinee: pattern variables are borrowed.
+and g5o_own_brs sigs a brs owned = case brs of
+    [] -> []
+  | br :: rest -> case br of
+      | (p, body) ->
+          let body2 = (case a of
+            | AVar x ->
+                if g5o_mem x owned then
+                  let used = g5o_inter (g5o_pvars p) (g5o_fv body) in
+                  g5o_wrap_dups used (g5o_own sigs body (app_list owned used))
+                else g5o_own sigs body owned
+            | _ -> g5o_own sigs body owned) in
+          (p, body2) :: g5o_own_brs sigs a rest owned
+
+let rec g5o_owned_params names modes = case names of
+    [] -> []
+  | n :: rest ->
+      (case modes of
+        | m :: ms -> if m then n :: g5o_owned_params rest ms else g5o_owned_params rest ms
+        | [] -> g5o_owned_params rest [])
+
+-- function body: parameters per mode; value body: nothing owned initially
+let g5o_own_def sigs d = case d of
+  | ODef name params body modes direct ->
+      let owned = g5o_owned_params (g5o_pats_names params) modes in
+      ODef name params (g5o_own sigs body owned) modes direct
+
+let rec g5o_own_defs sigs odefs = case odefs of
+    [] -> []
+  | d :: rest -> g5o_own_def sigs d :: g5o_own_defs sigs rest
+
+-- ---------- drop-guided reuse pairing (GC_DESIGN §3.4) ----------
+
+let rec g5o_reuse_e e cnt = case e of
+    | ORet _ -> (e, cnt)
+    | OLet x p rest ->
+        let (p2, c1) = g5o_reuse_prim p cnt in
+        let (r2, c2) = g5o_reuse_e rest c1 in
+        (OLet x p2 r2, c2)
+    | OLetRec x p rest ->
+        let (p2, c1) = g5o_reuse_prim p cnt in
+        let (r2, c2) = g5o_reuse_e rest c1 in
+        (OLetRec x p2 r2, c2)
+    | OIf c t f ->
+        let (t2, c1) = g5o_reuse_e t cnt in
+        let (f2, c2) = g5o_reuse_e f c1 in
+        (OIf c t2 f2, c2)
+    | OCase a brs ->
+        let (brs2, c1) = g5o_reuse_brs a brs cnt in
+        (OCase a brs2, c1)
+    | ODup x rest ->
+        let (r2, c1) = g5o_reuse_e rest cnt in (ODup x r2, c1)
+    | ODrop x rest ->
+        let (r2, c1) = g5o_reuse_e rest cnt in (ODrop x r2, c1)
+    | ODropReuse x t rest ->
+        let (r2, c1) = g5o_reuse_e rest cnt in (ODropReuse x t r2, c1)
+and g5o_reuse_prim p cnt = case p of
+    | PLam pat body caps ->
+        let (b2, c1) = g5o_reuse_e body cnt in (PLam pat b2 caps, c1)
+    | PBlock b ->
+        let (b2, c1) = g5o_reuse_e b cnt in (PBlock b2, c1)
+    | _ -> (p, cnt)
+and g5o_reuse_brs a brs cnt = case brs of
+    [] -> ([], cnt)
+  | br :: rest -> case br of
+      | (p, body) ->
+          let words = g5o_pat_words p in
+          let (body2, c1) = (case a of
+            | AVar x -> if words > 0 then g5o_reuse_head x words body cnt else (body, cnt)
+            | _ -> (body, cnt)) in
+          let (body3, c2) = g5o_reuse_e body2 c1 in
+          let (rest2, c3) = g5o_reuse_brs a rest c2 in
+          ((p, body3) :: rest2, c3)
+-- branch head: skip the pattern-variable dups (and other drops) up to the
+-- scrutinee's drop, then pair it with the first same-size allocation
+and g5o_reuse_head x words body cnt = case body of
+    | ODup v rest ->
+        let (r2, c1) = g5o_reuse_head x words rest cnt in (ODup v r2, c1)
+    | ODrop v rest ->
+        if v == x then
+          let tok = "%r" ++ int_to_string cnt in
+          let (found, rest2) = g5o_find_alloc words tok rest in
+          (if found then (ODropReuse x tok rest2, cnt + 1) else (body, cnt))
+        else
+          let (r2, c1) = g5o_reuse_head x words rest cnt in (ODrop v r2, c1)
+    | _ -> (body, cnt)
+
+let rec g5o_reuse_defs odefs = case odefs of
+    [] -> []
+  | d :: rest -> case d of
+      | ODef name params body modes direct ->
+          let (b2, _) = g5o_reuse_e body 1 in
+          ODef name params b2 modes direct :: g5o_reuse_defs rest
+
+-- ---------- printer (deterministic, indented; one def per block) ----------
+
+let rec g5o_esc_at s i acc =
+  let c = string_get s i in
+  if c == (0 - 1) then acc
+  else if c == 34 then g5o_esc_at s (i + 1) (acc ++ "\\\"")
+  else if c == 92 then g5o_esc_at s (i + 1) (acc ++ "\\\\")
+  else if c == 10 then g5o_esc_at s (i + 1) (acc ++ "\\n")
+  else if c == 13 then g5o_esc_at s (i + 1) (acc ++ "\\r")
+  else if c == 9 then g5o_esc_at s (i + 1) (acc ++ "\\t")
+  else g5o_esc_at s (i + 1) (acc ++ substring s i 1)
+
+let g5o_str_lit s = "\"" ++ g5o_esc_at s 0 "" ++ "\""
+
+let g5o_show_atom a = case a of
+    | AVar x -> x
+    | AInt n -> int_to_string n
+    | ABool b -> if b then "true" else "false"
+    | AStr s -> g5o_str_lit s
+    | AUnit -> "()"
+    | AGlob n -> "@" ++ n
+    | ANull c -> c
+
+let rec g5o_show_args atoms = case atoms of
+    [] -> ""
+  | a :: rest -> " " ++ g5o_show_atom a ++ g5o_show_args rest
+
+let rec g5o_show_pat p = case p of
+    | PWild -> "_"
+    | PVar x -> x
+    | PInt n -> int_to_string n
+    | PBool b -> if b then "true" else "false"
+    | PStr s -> g5o_str_lit s
+    | PUnit -> "()"
+    | PTup ps -> "(" ++ join ", " (g5o_show_pats ps) ++ ")"
+    | PCtor c ps -> if len ps == 0 then c else "(" ++ c ++ " " ++ join " " (g5o_show_pats ps) ++ ")"
+and g5o_show_pats ps = case ps of
+    [] -> []
+  | p :: rest -> g5o_show_pat p :: g5o_show_pats rest
+
+let g5o_show_tok tok = if tok == "" then "" else " reuse=" ++ tok
+
+let g5o_show_prim p = case p of
+    | PAtom a -> g5o_show_atom a
+    | PApp f a -> "(app " ++ g5o_show_atom f ++ " " ++ g5o_show_atom a ++ ")"
+    | PCall f atoms -> "(call " ++ f ++ g5o_show_args atoms ++ ")"
+    | PBi n atoms -> "(bi " ++ n ++ g5o_show_args atoms ++ ")"
+    | PMkCtor c atoms tok -> "(ctor " ++ c ++ g5o_show_args atoms ++ g5o_show_tok tok ++ ")"
+    | PMkTup atoms tok -> "(tup" ++ g5o_show_args atoms ++ g5o_show_tok tok ++ ")"
+    | PBin op a b -> "(" ++ op ++ " " ++ g5o_show_atom a ++ " " ++ g5o_show_atom b ++ ")"
+    | PLam _ _ _ -> "(lam)"
+    | PBlock _ -> "(block)"
+
+let rec g5o_pp_e ind e = case e of
+    | ORet a -> ind ++ "ret " ++ g5o_show_atom a
+    | OLet x p rest -> g5o_pp_bind ind "let" x p ++ "\n" ++ g5o_pp_e ind rest
+    | OLetRec x p rest -> g5o_pp_bind ind "letrec" x p ++ "\n" ++ g5o_pp_e ind rest
+    | OIf c t f ->
+        ind ++ "if " ++ g5o_show_atom c ++ "\n" ++ g5o_pp_e (ind ++ "  ") t ++ "\n"
+        ++ ind ++ "else\n" ++ g5o_pp_e (ind ++ "  ") f
+    | OCase a brs -> ind ++ "case " ++ g5o_show_atom a ++ g5o_pp_brs ind brs
+    | ODup x rest -> ind ++ "dup " ++ x ++ "\n" ++ g5o_pp_e ind rest
+    | ODrop x rest -> ind ++ "drop " ++ x ++ "\n" ++ g5o_pp_e ind rest
+    | ODropReuse x t rest -> ind ++ "drop-reuse " ++ x ++ " -> " ++ t ++ "\n" ++ g5o_pp_e ind rest
+and g5o_pp_bind ind kw x p = case p of
+    | PLam pat body caps ->
+        ind ++ kw ++ " " ++ x ++ " = (lam " ++ g5o_show_pat pat ++ " caps(" ++ join " " caps ++ ")\n"
+        ++ g5o_pp_e (ind ++ "  ") body ++ ")"
+    | PBlock b -> ind ++ kw ++ " " ++ x ++ " = (block\n" ++ g5o_pp_e (ind ++ "  ") b ++ ")"
+    | _ -> ind ++ kw ++ " " ++ x ++ " = " ++ g5o_show_prim p
+and g5o_pp_brs ind brs = case brs of
+    [] -> ""
+  | br :: rest -> case br of
+      | (p, b) -> "\n" ++ ind ++ "| " ++ g5o_show_pat p ++ " ->\n" ++ g5o_pp_e (ind ++ "  ") b ++ g5o_pp_brs ind rest
+
+let rec g5o_show_modes ms = case ms of
+    [] -> []
+  | m :: rest -> (if m then "owned" else "borrowed") :: g5o_show_modes rest
+
+let g5o_pp_def d = case d of
+  | ODef name params body modes direct ->
+      let kind = if direct then "direct" else if len params == 0 then "value" else "closure" in
+      "def " ++ name ++ " (" ++ join " " (g5o_show_pats params) ++ ") modes=("
+      ++ join " " (g5o_show_modes modes) ++ ") " ++ kind ++ "\n" ++ g5o_pp_e "  " body
+
+let rec g5o_pp_defs ds = case ds of
+    [] -> ""
+  | d :: rest -> g5o_pp_def d ++ "\n\n" ++ g5o_pp_defs rest
+
+let rec g5o_pp_sigs sigs = case sigs of
+    [] -> ""
+  | kv :: rest -> case kv of
+      | (n, ms) -> "  " ++ n ++ ": " ++ join " " (g5o_show_modes ms) ++ "\n" ++ g5o_pp_sigs rest
+
+let g5o_print_prog p = case p of
+  | OProg _ defs sigs -> g5o_pp_defs defs ++ "sigs:\n" ++ g5o_pp_sigs sigs
+
+-- ---------- pipeline ----------
+
+-- (ctor arity table, ANF defs with initial modes, inferred sigs)
+let g5o_analyze prog =
+  let ctors = app_list [("Nil", 0), ("Cons", 2)] (g5o_p_ctorpairs prog) in
+  let defs = g5o_flatten_groups (g5o_p_groups prog) [] in
+  let g = (ctors, g5o_def_arities defs) in
+  let odefs = g5o_cv_defs g defs in
+  let sigs = g5o_infer_loop odefs (g5o_init_sigs odefs) in
+  (ctors, odefs, sigs)
+
+let g5o_sigs_of prog = case g5o_analyze prog of | (_, _, sigs) -> sigs
+
+let g5o_program prog =
+  let (ctors, odefs, sigs) = g5o_analyze prog in
+  let odefs2 = g5o_apply_sigs odefs sigs in
+  let odefs3 = g5o_own_defs sigs odefs2 in
+  OProg ctors (g5o_reuse_defs odefs3) sigs

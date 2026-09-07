@@ -1,0 +1,70 @@
+-- ============================================================
+-- gen5/g5_oir.dc -- Gen5 ownership IR (shared by g5_own.dc / g5_cg.dc)
+--
+-- ANF form of the legacy `Expr` (dcc.dc) with explicit reference-count
+-- operations (Perceus dup/drop/drop-reuse). Every intermediate value is
+-- bound to a variable; atoms never allocate and never have effects.
+-- Only Gen4-subset syntax is used here (bootstrap constraint).
+-- See gen5/GC_DESIGN.md §3 for the ownership modes of every position.
+-- ============================================================
+
+-- atoms
+type OAtom =
+  | AVar String              -- local variable (frame slot); ownership decided by position
+  | AInt Int                 -- immediate (n<<2)|1
+  | ABool Bool               -- immediate 3/7
+  | AStr String              -- interned static string (immortal)
+  | AUnit                    -- static unit block (immortal)
+  | AGlob String             -- top-level def / builtin closure / partial-ctor closure via dc_gget (borrowed;
+                             --   in a CONSUMING position the codegen emits dc_gget + dc_dup, so the pass
+                             --   never needs ODup for globals and the table keeps its own reference)
+  | ANull String             -- nullary constructor static instance (immortal)
+
+-- primitives: one allocation or call each; result is a fresh OWNED value
+-- (or an immediate / immortal static), bound by OLet
+type OExpr =
+  | PAtom OAtom                                  -- x = atom (AVar is consumed)
+  | PApp OAtom OAtom                             -- generic closure call: fn borrowed, arg consumed
+  | PCall String (List OAtom)                    -- direct saturated call to top-level fn (modes from g5o sigs)
+  | PBi String (List OAtom)                      -- direct builtin call (all args borrowed), e.g. "print_int"
+  | PMkCtor String (List OAtom) String             -- constructor alloc: name, fields (consumed), reuse token var or ""
+  | PMkTup (List OAtom) String                     -- tuple alloc: elems (consumed), reuse token var or ""
+  | PLam Pat OExpr (List String)                 -- closure alloc: param pattern, body, captured vars (consumed; body sees them borrowed)
+  | PBin String OAtom OAtom                      -- + - * / % < > <= >= == != ++  (operands borrowed; && || are lowered to OIf)
+  | PBlock OExpr                                 -- nested expression (if/case in non-tail position); its ORet yields the value
+
+  | ORet OAtom                                   -- return atom (AVar consumed)
+  | OLet String OExpr OExpr                      -- x = prim ; e
+  | OLetRec String OExpr OExpr                   -- x = PLam … with self-capture (no dup, backpatched) ; e
+  | OIf OAtom OExpr OExpr                        -- condition atom borrowed
+  | OCase OAtom (List (Pat, OExpr))              -- scrutinee var borrowed while matching; pattern vars bound by field loads
+  | ODup String OExpr                            -- rc++ x ; e
+  | ODrop String OExpr                           -- rc-- x ; e
+  | ODropReuse String String OExpr               -- tok = dc_drop_reuse x ; e   (tok is a fresh var, may be 0 at run time)
+
+-- one top-level definition after ownership analysis
+-- ODef name params(patterns, in order) body modes(true = owned; length = len params) direct?(1..8 params)
+-- values (no params) have modes [] and direct = false
+type ODef = ODef String (List Pat) OExpr (List Bool) Bool
+
+-- whole program: ctor arity pairs (as in Prog), ordered defs, ownership signatures
+-- OProg ctor_pairs defs sigs   where sigs = [(fname, modes)] for direct-callable functions
+type OProg = OProg (List (String, Int)) (List ODef) (List (String, List Bool))
+
+let odef_name d = case d of | ODef n _ _ _ _ -> n
+let odef_params d = case d of | ODef _ p _ _ _ -> p
+let odef_body d = case d of | ODef _ _ b _ _ -> b
+let odef_modes d = case d of | ODef _ _ _ m _ -> m
+let odef_direct d = case d of | ODef _ _ _ _ x -> x
+
+let oprog_ctors p = case p of | OProg c _ _ -> c
+let oprog_defs p = case p of | OProg _ d _ -> d
+let oprog_sigs p = case p of | OProg _ _ s -> s
+
+-- words of a heap block for reuse pairing
+let g5o_ctor_words arity = 2 + arity
+let g5o_tup_words n = 1 + n
+let g5o_closure_words ncaps = 3 + ncaps
+
+-- max arity for direct n-ary entries (args in x0..x7)
+let g5o_max_direct = 8

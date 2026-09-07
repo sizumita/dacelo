@@ -13,7 +13,9 @@ gen4check
 gen4dbg
 dcc_6
 dcc_7
+dcc_8
 gen5check
+gen5check_rc
 
 # Generated test outputs (native binaries, objects, assembly)
 *_g3

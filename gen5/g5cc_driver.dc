@@ -125,19 +125,15 @@ and g5cc_lowered files progs out_base =
   let prog = parse_prog (lex_all src) in
   g5cc_emit prog out_base
 
+-- Gen5-RC backend: ownership IR (g5_own.dc) -> reference-counting ARM64
+-- (g5_cg.dc / g5_cgdriver.dc), linked against gen5/rt5.c
 and g5cc_emit prog out_base =
-  let tabs = build_tables prog in
-  let all_defs = case tabs of
-      | (a, b, c) -> c in
-  let ct_id_tbl = case tabs of
-      | (a, b, c) -> a in
-  let ct_ar_tbl = case tabs of
-      | (a, b, c) -> b in
-  let lines_fwd = emit_code prog in
-  let content = join_chunks lines_fwd in
+  let oprog = g5o_program prog in
+  let lines_fwd = g5cg_emit_code oprog in
+  let content = g5cg_join_lines lines_fwd in
   let s_path = out_base ++ ".s" in
   write_file s_path content ;
-  let rt_c = "gen2-dcc-rs/rt/rt.c" in
+  let rt_c = "gen5/rt5.c" in
   let tmpbin = out_base ++ ".linktmp" in
   let r1 = system ("cc -O2 -arch arm64 -c " ++ s_path ++ " -o " ++ out_base ++ ".o") in
   if r1 != 0 then error ("g5: assembler failed on " ++ s_path ++ " (exit " ++ int_to_string (r1 / 256) ++ ")")

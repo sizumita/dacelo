@@ -655,28 +655,49 @@ let g5_contract_json sg =
   if g5_sig_contract_text sg == "" then "null"
   else g5_json_str (g5_sig_contract_text sg)
 
-let rec g5_binds_json s src docs binds = case binds of
+-- ownership modes inferred by the backend (gen5/g5_own.dc): one entry per
+-- parameter of a direct-callable top-level function, "owned" (the callee
+-- consumes the reference) or "borrowed" (caller keeps it; no dup/drop).
+-- Not a type-level contract: a read-only view of what the compiler decided.
+let rec g5_modes_json ms = case ms of
+    [] -> ""
+  | m :: rest ->
+      let here = if m then "\"owned\"" else "\"borrowed\"" in
+      case rest of
+        | [] -> here
+        | _ -> here ++ "," ++ g5_modes_json rest
+
+let rec g5_sig_lookup sigs nm = case sigs of
+    [] -> ("", [])
+  | kv :: rest -> case kv of
+      | (n, ms) -> if n == nm then (n, ms) else g5_sig_lookup rest nm
+
+let g5_ownership_json sigs nm =
+  let (fn, ms) = g5_sig_lookup sigs nm in
+  if fn == "" then "" else ",\"ownership\":[" ++ g5_modes_json ms ++ "]"
+
+let rec g5_binds_json s src docs sigs binds = case binds of
     [] -> ""
   | b :: rest -> case b of
       | BindTy5 nm sp sch st sg ->
           let dt = g5_doc_at docs (g5_span_line src sp) in
           let dj = if dt == "" then "null" else g5_json_str dt in
-          let here = "{\"name\":" ++ g5_json_str nm ++ ",\"span\":" ++ g5_span_json sp ++ ",\"scheme\":" ++ g5_json_str (g5_scheme_text s sch) ++ ",\"structured\":" ++ g5_scheme_json s sch ++ ",\"contract\":" ++ g5_contract_json sg ++ ",\"status\":" ++ g5_json_str st ++ ",\"doc\":" ++ dj ++ "}" in
+          let here = "{\"name\":" ++ g5_json_str nm ++ ",\"span\":" ++ g5_span_json sp ++ ",\"scheme\":" ++ g5_json_str (g5_scheme_text s sch) ++ ",\"structured\":" ++ g5_scheme_json s sch ++ ",\"contract\":" ++ g5_contract_json sg ++ ",\"status\":" ++ g5_json_str st ++ ",\"doc\":" ++ dj ++ g5_ownership_json sigs nm ++ "}" in
           case rest of
             | [] -> here
-            | _ -> here ++ "," ++ g5_binds_json s src docs rest
+            | _ -> here ++ "," ++ g5_binds_json s src docs sigs rest
 
-let rec g5_sums_json s src docs sums = case sums of
+let rec g5_sums_json s src docs sigs sums = case sums of
     [] -> ""
   | it :: rest -> case it of
       | ItemSum5 kind sp binds _ st ->
-          let here = "{\"kind\":" ++ g5_json_str kind ++ ",\"span\":" ++ g5_span_json sp ++ ",\"binds\":[" ++ g5_binds_json s src docs binds ++ "],\"status\":" ++ g5_json_str st ++ "}" in
+          let here = "{\"kind\":" ++ g5_json_str kind ++ ",\"span\":" ++ g5_span_json sp ++ ",\"binds\":[" ++ g5_binds_json s src docs sigs binds ++ "],\"status\":" ++ g5_json_str st ++ "}" in
           case rest of
             | [] -> here
-            | _ -> here ++ "," ++ g5_sums_json s src docs rest
+            | _ -> here ++ "," ++ g5_sums_json s src docs sigs rest
 
 let g5_check_json q maxb =
-  let full = "{\"diags\":[" ++ g5_diags_json (q_diags q) ++ "],\"warnings\":[" ++ g5_warns_json (q_warns q) ++ "],\"holes\":" ++ int_to_string (len (q_holes q)) ++ ",\"items\":[" ++ g5_sums_json (q_state q) (q_src q) (g5_collect_docs (q_src q)) (q_sums q) ++ "]}" in
+  let full = "{\"diags\":[" ++ g5_diags_json (q_diags q) ++ "],\"warnings\":[" ++ g5_warns_json (q_warns q) ++ "],\"holes\":" ++ int_to_string (len (q_holes q)) ++ ",\"items\":[" ++ g5_sums_json (q_state q) (q_src q) (g5_collect_docs (q_src q)) [] (q_sums q) ++ "]}" in
   g5_envelope (g5_snap_wrap q full) maxb (g5_snap_wrap q full)
 
 -- RFC 5.3: principal (inferred) vs contract (sig) in separate fields.
@@ -685,8 +706,8 @@ let g5_check_json q maxb =
 
 
 
-let g5_types_json q maxb =
-  let full = "{\"items\":[" ++ g5_sums_json (q_state q) (q_src q) (g5_collect_docs (q_src q)) (q_sums q) ++ "],\"warnings\":[" ++ g5_warns_json (q_warns q) ++ "]}" in
+let g5_types_json q maxb sigs =
+  let full = "{\"items\":[" ++ g5_sums_json (q_state q) (q_src q) (g5_collect_docs (q_src q)) sigs (q_sums q) ++ "],\"warnings\":[" ++ g5_warns_json (q_warns q) ++ "]}" in
   g5_envelope (g5_snap_wrap q full) maxb (g5_snap_wrap q full)
 
 -- ---------- interface (.dci text) + diff ----------

@@ -1,0 +1,310 @@
+-- ============================================================
+-- gen5/g5_cgdriver.dc -- Gen5 whole-program emission over OProg
+--
+-- Entry: g5cg_emit_code : OProg -> List String (assembly lines, forward
+-- order); g5cg_join_lines joins them. Forked from the emit_code /
+-- emit_fns_asm / emit_thunks_asm of gen3-dcc-dc/g3_driver_v2.dc.
+--
+-- Per top-level definition `f` with k parameters (ODef):
+--   _thunk_f      k = 0: evaluates the body (full frame), result owned;
+--                 k > 0: allocates the level-1 closure {_fn_f_1, env = []}
+--   _fnn_f        (direct = true, k <= 8) n-ary entry: args x0..x(k-1)
+--                 with the ownership modes of the ODef; result x0 owned
+--   _fn_f_i, i<k  curried level: x0 = closure with env v1..v(i-1) (raw
+--                 argument values, owned by that closure), x1 = vi owned;
+--                 returns the level-(i+1) closure whose env = dup'd
+--                 copies of v1..v(i-1) plus vi
+--   _fn_f_k       final level: gathers v1..v(k-1) (borrowed from the env)
+--                 and vk = x1 (owned); dups every env value whose mode is
+--                 owned, then calls _fnn_f (direct) or binds the parameter
+--                 patterns and compiles the body inline (direct = false);
+--                 drops vk afterwards when its mode is borrowed
+-- Statics: string literals (interned on use), _ctorinst_<C> for every
+-- nullary constructor (emitted up front), all with immortal headers.
+-- _dc_init / _dc_user_main / _dc_ctor_names follow the Gen3 protocol;
+-- dc_gset takes ownership of each thunk result, and _dc_user_main drops
+-- the (owned) result of main. The runtime calls dc_rt_shutdown itself.
+-- Only Gen4-subset syntax is used in this file.
+-- ============================================================
+
+-- ---------- tables ----------
+let rec g5cg_alloc_seq names slot acc = case names of
+    [] -> (rev_list acc [], slot)
+  | nm :: rest -> g5cg_alloc_seq rest (slot + 1) ((nm, slot) :: acc)
+
+let rec g5cg_nonnullary tbl = case tbl of
+    [] -> []
+  | kv :: rest -> (case kv of
+      | (nm, ar) -> if ar > 0 then nm :: g5cg_nonnullary rest else g5cg_nonnullary rest)
+
+let rec g5cg_def_names ds = case ds of
+    [] -> []
+  | d :: rest -> odef_name d :: g5cg_def_names rest
+
+-- global slots: builtins, then non-nullary constructors (partial-ctor
+-- closures), then definitions in order (same layout as Gen3 build_globs)
+let g5cg_build_globs ar_tbl defs =
+  let (b_globs, n1) = g5cg_alloc_seq builtins 0 [] in
+  let (c_globs, n2) = g5cg_alloc_seq (g5cg_nonnullary ar_tbl) n1 [] in
+  let (d_globs, n3) = g5cg_alloc_seq (g5cg_def_names defs) n2 [] in
+  (app_list (app_list b_globs c_globs) d_globs, n3)
+
+-- constructor table: the list prelude (Nil = 0, Cons = 1) then user ctors
+-- (OProg carries the user pairs as in Prog; tolerate a prelude already present)
+let g5cg_ctor_table pairs =
+  if assoc_ikey "Nil" pairs == (0 - 1) then app_list [("Nil", 0), ("Cons", 2)] pairs
+  else pairs
+
+-- ---------- statics ----------
+-- one immortal instance per nullary constructor: [hdr][ctor id]
+let rec g5cg_emit_nullary st ar_tbl cid_tbl = case ar_tbl of
+    [] -> st
+  | kv :: rest -> (case kv of
+      | (nm, ar) ->
+          if ar != 0 then g5cg_emit_nullary st rest cid_tbl
+          else
+            let cid = assoc_ikey nm cid_tbl in
+            let t0 = a_inst st ".section __DATA,__data" in
+            let t1 = a_inst t0 ".p2align 3" in
+            let t2 = a_label t1 ("_ctorinst_" ++ nm) in
+            let t3 = a_inst t2 (".quad " ++ int_to_string (g5cg_hdr_static 2 tag_adt)) in
+            let t4 = a_inst t3 (".quad " ++ int_to_string cid) in
+            let t5 = a_inst t4 ".section __TEXT,__text,regular,pure_instructions" in
+            g5cg_emit_nullary t5 rest cid_tbl)
+
+-- constructor name table for the runtime's show / match_fail
+let rec g5cg_emit_names st i names = case names of
+    [] -> st
+  | nm :: rest ->
+      let ta = a_label st ("_nm" ++ int_to_string i) in
+      let tb = a_inst ta (".asciz \"" ++ nm ++ "\"") in
+      g5cg_emit_names tb (i + 1) rest
+
+let rec g5cg_emit_name_tbl st i n = if i >= n then st
+  else g5cg_emit_name_tbl (a_inst st (".quad _nm" ++ int_to_string i)) (i + 1) n
+
+let g5cg_emit_ctor_names st names =
+  let t0 = a_inst st ".section __DATA,__data" in
+  let t1 = g5cg_emit_names t0 0 names in
+  let t2 = a_inst t1 ".section __DATA,__data" in
+  let t3 = a_inst t2 ".p2align 3" in
+  let t4 = a_line t3 ".globl _dc_ctor_names" in
+  let t5 = a_label t4 "_dc_ctor_names" in
+  let t6 = g5cg_emit_name_tbl t5 0 (len names) in
+  let t7 = a_inst t6 ".p2align 3" in
+  a_inst t7 ".section __TEXT,__text,regular,pure_instructions"
+
+-- ---------- definitions ----------
+-- value definition: full frame, body result owned in x0
+let g5cg_emit_value_thunk st cx d =
+  let (st0, fid) = a_fresh_id st in
+  let endl = "Lfend" ++ int_to_string fid in
+  let t1 = g5cg_prologue st0 ("_thunk_" ++ odef_name d) in
+  let t2 = g5cg_ce t1 cx [] 0 endl (odef_body d) in
+  g5cg_epilogue (a_label t2 endl)
+
+-- function definition: the thunk just allocates the level-1 closure
+let g5cg_emit_fn_thunk st name =
+  let t0 = a_line st ".p2align 2" in
+  let t1 = a_label t0 ("_thunk_" ++ name) in
+  let t2 = a_line t1 "  stp x29, x30, [sp, #-16]!" in
+  let t3 = a_inst t2 "mov x29, sp" in
+  let t4 = g5cg_mk_closure t3 ("_fn_" ++ name ++ "_1") [] in
+  let t5 = a_line t4 "  ldp x29, x30, [sp], #16" in
+  a_line t5 "  ret"
+
+-- str x<i>, [sp, #8i] for i in 0..k-1 (arguments arrive in registers)
+let rec g5cg_store_args st cx i k = if i >= k then st
+  else g5cg_store_args (g5cg_sts st cx i i) cx (i + 1) k
+
+-- ldr x<i>, [sp, #8i] for i in 0..k-1
+let rec g5cg_ld_arg_regs st i k = if i >= k then st
+  else g5cg_ld_arg_regs (ts_ldr_slot st i i) (i + 1) k
+
+-- n-ary direct entry _fnn_<f>: spill the register arguments first, then
+-- bind each parameter pattern from its slot, then the body
+let g5cg_emit_fnn st cx d =
+  let name = odef_name d in
+  let params = odef_params d in
+  let k = len params in
+  let (st0, fid) = a_fresh_id st in
+  let flbl = "Lpfail" ++ int_to_string fid in
+  let endl = "Lfend" ++ int_to_string fid in
+  let t1 = g5cg_prologue st0 ("_fnn_" ++ name) in
+  let t2 = g5cg_store_args t1 cx 0 k in
+  let (t3, sc, ns) = g5cg_bind_params t2 cx [] k params 0 flbl in
+  let t4 = g5cg_ce t3 cx sc ns endl (odef_body d) in
+  let t5 = g5cg_epilogue (a_label t4 endl) in
+  g5cg_fail_tail t5 flbl
+
+-- dc_dup the values in slots j..n-1
+let rec g5cg_dup_slots st j n = if j >= n then st
+  else g5cg_dup_slots (a_call_rt (ts_ldr_slot st 0 j) "dc_dup") (j + 1) n
+
+-- dc_dup the values in slots j..n-1 whose parameter mode is owned
+let rec g5cg_dup_owned st modes j n = if j >= n then st
+  else
+    let s1 = if g5cg_nth_bool modes j then a_call_rt (ts_ldr_slot st 0 j) "dc_dup" else st in
+    g5cg_dup_owned s1 modes (j + 1) n
+
+-- curried level i of a k-parameter function (see the header comment)
+let g5cg_emit_level st cx d i k =
+  let name = odef_name d in
+  let (st0, fid) = a_fresh_id st in
+  let t1 = g5cg_prologue st0 ("_fn_" ++ name ++ "_" ++ int_to_string i) in
+  -- env words v1..v(i-1) -> slots 0..i-2 (borrowed from the closure);
+  -- x1 = vi (owned) -> slot i-1
+  let t2 = g5cg_ld_env t1 cx 0 (i - 1) in
+  let t3 = g5cg_sts t2 cx 1 (i - 1) in
+  if i < k then
+    -- the next level's closure owns its own copies of v1..v(i-1)
+    let t4 = g5cg_dup_slots t3 0 (i - 1) in
+    let t5 = g5cg_mk_closure t4 ("_fn_" ++ name ++ "_" ++ int_to_string (i + 1)) (g5cg_seq_slots 0 i) in
+    g5cg_epilogue t5
+  else
+    let modes = odef_modes d in
+    let flbl = "Lpfail" ++ int_to_string fid in
+    let endl = "Lfend" ++ int_to_string fid in
+    let t4 = g5cg_dup_owned t3 modes 0 (k - 1) in
+    let t5 = if odef_direct d then
+        ts_bl (g5cg_ld_arg_regs t4 0 k) ("_fnn_" ++ name)
+      else
+        let (ta, sc, ns) = g5cg_bind_params t4 cx [] k (odef_params d) 0 flbl in
+        a_label (g5cg_ce ta cx sc ns endl (odef_body d)) endl in
+    -- a borrowed last parameter is still owned by this level: drop it now
+    let t6 = if g5cg_nth_bool modes (k - 1) then t5
+      else
+        let ta = g5cg_sts t5 cx 0 k in
+        let tb = a_call_rt (ts_ldr_slot ta 0 (k - 1)) "dc_drop" in
+        ts_ldr_slot tb 0 k in
+    let t7 = g5cg_epilogue t6 in
+    if odef_direct d then t7 else g5cg_fail_tail t7 flbl
+
+let rec g5cg_emit_levels st cx d i k = if i > k then st
+  else g5cg_emit_levels (g5cg_emit_level st cx d i k) cx d (i + 1) k
+
+let rec g5cg_emit_defs st cid ar sgs defs = case defs of
+    [] -> st
+  | d :: rest ->
+      let name = odef_name d in
+      let k = len (odef_params d) in
+      let cx = (cid, ar, sgs, name) in
+      let s1 = if k == 0 then g5cg_emit_value_thunk st cx d
+        else if odef_direct d && k > g5o_max_direct then
+          error ("g5cg: direct function `" ++ name ++ "` has more than " ++ int_to_string g5o_max_direct ++ " parameters")
+        else
+          let sa = g5cg_emit_fn_thunk st name in
+          let sb = if odef_direct d then g5cg_emit_fnn sa cx d else sa in
+          g5cg_emit_levels sb cx d 1 k in
+      g5cg_emit_defs s1 cid ar sgs rest
+
+-- ---------- _dc_init / _dc_user_main ----------
+let rec g5cg_init_ctors st cid_tbl ar_tbl names = case names of
+    [] -> st
+  | nm :: rest ->
+      let ta = ts_load_const st 0 (assoc_ikey nm cid_tbl) in
+      let tb = ts_load_const ta 1 (assoc_ikey nm ar_tbl) in
+      g5cg_init_ctors (a_call_rt tb "dc_register_ctor") cid_tbl ar_tbl rest
+
+let rec g5cg_init_builtins st globs i = if i >= len builtins then st
+  else
+    let slot = assoc_ikey (nth_str builtins i) globs in
+    let ta = ts_load_const st 0 i in
+    let tb = a_call_rt ta "dc_mk_partial_builtin" in
+    let tc = ts_mov_rr tb 1 0 in
+    let td = ts_load_const tc 0 slot in
+    g5cg_init_builtins (a_call_rt td "dc_gset") globs (i + 1)
+
+let rec g5cg_init_partial_ctors st cid_tbl ar_tbl globs names = case names of
+    [] -> st
+  | nm :: rest ->
+      if assoc_ikey nm ar_tbl == 0 then g5cg_init_partial_ctors st cid_tbl ar_tbl globs rest
+      else
+        let ta = ts_load_const st 0 (assoc_ikey nm cid_tbl) in
+        let tb = a_call_rt ta "dc_mk_partial_ctor" in
+        let tc = ts_mov_rr tb 1 0 in
+        let td = ts_load_const tc 0 (assoc_ikey nm globs) in
+        g5cg_init_partial_ctors (a_call_rt td "dc_gset") cid_tbl ar_tbl globs rest
+
+-- thunk results are owned; dc_gset moves them into the global table
+let rec g5cg_init_thunks st globs defs = case defs of
+    [] -> st
+  | d :: rest ->
+      let nm = odef_name d in
+      let ta = ts_bl st ("_thunk_" ++ nm) in
+      let tb = ts_mov_rr ta 1 0 in
+      let tc = ts_load_const tb 0 (assoc_ikey nm globs) in
+      g5cg_init_thunks (a_call_rt tc "dc_gset") globs rest
+
+let g5cg_emit_init st cid_tbl ar_tbl globs defs =
+  let names = map_fst ar_tbl in
+  let t0 = a_globl st "_dc_init" in
+  let t1 = a_label t0 "_dc_init" in
+  let t2 = a_line t1 "  stp x29, x30, [sp, #-16]!" in
+  let t3 = a_inst t2 "mov x29, sp" in
+  let t4 = g5cg_init_ctors t3 cid_tbl ar_tbl names in
+  let t5 = g5cg_init_builtins t4 globs 0 in
+  let t6 = g5cg_init_partial_ctors t5 cid_tbl ar_tbl globs names in
+  let t7 = g5cg_init_thunks t6 globs defs in
+  let t8 = a_line t7 "  ldp x29, x30, [sp], #16" in
+  a_line t8 "  ret"
+
+-- main (borrowed from its global slot) applied to unit; the owned result
+-- is dropped. Without a main the entry point returns immediately.
+let g5cg_emit_user_main st globs =
+  let main_slot = assoc_ikey "main" globs in
+  let u0 = a_globl st "_dc_user_main" in
+  let u1 = a_label u0 "_dc_user_main" in
+  let u2 = a_line u1 "  stp x29, x30, [sp, #-16]!" in
+  let u3 = a_inst u2 "mov x29, sp" in
+  let u4 = if main_slot == (0 - 1) then u3
+    else
+      let m1 = ts_load_const u3 0 main_slot in
+      let m2 = a_call_rt m1 "dc_gget" in
+      let m3 = g5cg_got m2 1 "_dc_unit_block" in
+      let m4 = ts_ldr_off m3 9 0 8 in
+      let m5 = ts_blr m4 9 in
+      a_call_rt m5 "dc_drop" in
+  let u5 = a_line u4 "  ldp x29, x30, [sp], #16" in
+  a_line u5 "  ret"
+
+-- ---------- whole program ----------
+let g5cg_emit_code oprog =
+  let ar_tbl = g5cg_ctor_table (oprog_ctors oprog) in
+  let cid_tbl = g5cg_zip_slots (map_fst ar_tbl) 0 in
+  let defs = oprog_defs oprog in
+  let sgs = oprog_sigs oprog in
+  let (globs, nglob) = g5cg_build_globs ar_tbl defs in
+  let st0 = a_set_nglob (a_set_globs as_new globs) nglob in
+  let st1 = a_line st0 ".section __TEXT,__text,regular,pure_instructions" in
+  let st2 = g5cg_emit_nullary st1 ar_tbl cid_tbl in
+  let st3 = g5cg_emit_defs st2 cid_tbl ar_tbl sgs defs in
+  let st4 = g5cg_emit_ctor_names st3 (map_fst ar_tbl) in
+  let st5 = g5cg_emit_init st4 cid_tbl ar_tbl globs defs in
+  let st6 = g5cg_emit_user_main st5 globs in
+  let h0 = a_line st6 "" in
+  let h1 = a_line h0 ".globl _dc_init" in
+  let h2 = a_line h1 ".globl _dc_user_main" in
+  rev_list (a_lines h2) []
+
+-- ---------- output joining ----------
+-- Balanced divide-and-conquer join: every recursion level copies the
+-- output once, so the total copying is O(n log n) bytes. (The Gen3
+-- join_chunks scheme, `chunk ++ join rest`, copied the whole remaining
+-- output at each 24-line chunk: quadratic, ~37 GB of copying for a 6 MB
+-- .s on the never-collecting seed runtime.) Depth is log2 n.
+-- g5cg_join_n ls n = (first n lines each followed by "\n", remaining lines)
+let rec g5cg_join_n ls n =
+  if n <= 0 then ("", ls)
+  else if n == 1 then (case ls of
+      [] -> ("", [])
+    | l :: rest -> (l ++ "\n", rest))
+  else
+    let h = n / 2 in
+    let (a, r1) = g5cg_join_n ls h in
+    let (b, r2) = g5cg_join_n r1 (n - h) in
+    (a ++ b, r2)
+
+let g5cg_join_lines ls =
+  let (s, _) = g5cg_join_n ls (len ls) in
+  s

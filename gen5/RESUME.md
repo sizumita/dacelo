@@ -1,5 +1,36 @@
 # Gen5 再開ガイド (fresh lineage, dacelo製・gen0無改変)
 
+## Gen5-RC：メモリ管理と所有権の刷新（2026-09-08、branch `gen5-gc`）
+
+設計は `gen5/GC_DESIGN.md`。要点：
+
+- **発見**：旧 `rt.c` の mark-sweep は `live_bytes` が sweep でしか更新されず、トリガ条件が
+  8MB 超の単一要求でしか成立しないため**一度も走らない**。全プログラムが総確保量を常駐させ、
+  自己検査（7000 行）が 34GB 機で OOM kill（最大 RSS 23.7GB、footprint 140GB）される直接の原因。
+- **採用**：Perceus 系の精密参照カウント（dup/drop 自動挿入・早期 drop）、Lean/Koka 流の
+  借用パラメータ推論（注釈なし、一階のトップレベル関数、不動点）、drop-guided reuse（FBIP）、
+  既知関数への飽和直接呼出（x0..x7、arity ≤ 8）。Morphic の寿命付き借用は延期。
+- **ファイル**：`g5_oir.dc`（IR、単一型 `OExpr`：Gen0 は `type … and …` も前方参照する型も
+  受理しない。`PCtor`/`PTup` は `Pat` と衝突するので `PMkCtor`/`PMkTup`）、`g5_own.dc`（ANF・
+  借用推論・Perceus・reuse 対付け、`g5o_program`/`g5o_sigs_of`/`g5o_print_prog`）、
+  `g5_cg.dc`＋`g5_cgdriver.dc`（RC 対応 ARM64、`_fnn_<f>` 直接エントリ、40bit マスク付きヘッダ比較）、
+  `rt5.c`（ヘッダ `rc<<40|size<<8|tag`、反復 drop、サイズ別 free list、`dc_drop_reuse`、
+  `DACELO_RC_CHECK`/`DACELO_RC_STATS`、use-after-free 検出）。旧 Gen3 backend と `rt.c` は
+  seed（`dcc_1`）専用で無改変。
+- **concat 順**：`dcc.dc g5_front g5_infer g5_query g5_lower g5_oir g5_own g5_driver [g5_cg g5_cgdriver g5cc_driver | g5_main]`
+  （`g5_driver` が `g5o_sigs_of` を呼ぶため g5_oir/g5_own は前）。
+- **型が見える**：`gen5check types --format=json` の各 bind に `"ownership":["borrowed"|"owned",…]`
+  （推論結果の読み取り専用ビュー。`.dci` への出力は ABI 互換性の意味論を決めてから）。
+- **検証**（`gen5/test.sh`）：A 38 一致 / B 全 example＋gen5-examples が Gen0 と出力一致・
+  `DACELO_RC_CHECK=1` でリークゼロ・`reuse` 例で reuses=1000 / D format / E / F / G（所有権 JSON＋
+  `probe_own.dc` の IR dump を `gen5/oracle/probe_own.expected` に固定）。C は下記。
+  `GEN5_KEEP_BIN=1` で A/B のバイナリ再生成を省略可。
+- **落とし穴（追加）**：`dcc_1`（Gen3、GC なし）で 8500 行の concat をビルドすると数 GB 常駐するため、
+  **同時に 2 本走らせると `cc`/`malloc` が失敗して黙って `.o` が消える**（dcc_1 は system() の戻り値を
+  見ない）。ビルドは 1 本ずつ。単独なら決定的（`.s` バイト一致）。
+- **C（自己ホスト）の結果**：<TBD-C>
+
+
 ## issue #1 再レビュー対応（R1＋R2〜R4残件）
 
 - **R1 nominal dup拒否**：program-wideの型名重複を拒否（非公開含む）。

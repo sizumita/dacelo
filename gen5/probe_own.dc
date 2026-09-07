@@ -1,0 +1,207 @@
+-- Unit probe for the ownership pass (gen5/g5_own.dc): parses small programs
+-- from string literals, runs g5o_program and prints the IR dump.
+-- Build: cat gen3-dcc-dc/dcc.dc gen5/g5_oir.dc gen5/g5_own.dc gen5/probe_own.dc > /tmp/own_full.dc
+-- Run:   ./gen0-interp-rs/target/release/dacelo /tmp/own_full.dc
+-- (Gen0-routed like probe_row_*.dc: fast, no RAM.)
+--
+-- Expected output: see the comment block at the end of this file.
+
+let g5p_own_src name src =
+  print_string ("== " ++ name ++ " ==\n") ;
+  print_string (g5o_print_prog (g5o_program (parse_prog (lex_all src)))) ;
+  print_string "\n"
+
+-- A: borrow inference basics + drop-guided reuse
+let g5p_own_a =
+  "let id x = x\n"
+  ++ "let rec len xs = case xs of | [] -> 0 | _ :: t -> 1 + len t\n"
+  ++ "let rec map f xs = case xs of | [] -> [] | h :: t -> f h :: map f t\n"
+  ++ "let pair x y = (x, y)\n"
+
+-- B: closures (capture of a variable used again later; local let rec)
+let g5p_own_b =
+  "let mk n = let g = fun x -> x + n in (g, n)\n"
+  ++ "let sum n = let rec go i = if i == 0 then n else go (i - 1) in go 3\n"
+
+-- C: short-circuit, sequencing, saturated / unsaturated / over-saturated calls
+let g5p_own_c =
+  "let both a b = a && b > 1\n"
+  ++ "let main () = print_int 1 ; print_int 2\n"
+  ++ "let add a b = a + b\n"
+  ++ "let id x = x\n"
+  ++ "let use () = (add 1 2, add 1)\n"
+  ++ "let over () = id add 1 2\n"
+
+-- D: compound parameter pattern, owned scrutinee kept alive, nested reuse
+let g5p_own_d =
+  "let fst2 (a, b) = a\n"
+  ++ "let swap p = case p of | (a, b) -> (b, a)\n"
+  ++ "let keep xs = case xs of | [] -> xs | h :: t -> if h == 0 then xs else t\n"
+
+let main () =
+  g5p_own_src "A" g5p_own_a ;
+  g5p_own_src "B" g5p_own_b ;
+  g5p_own_src "C" g5p_own_c ;
+  g5p_own_src "D" g5p_own_d
+
+-- ---------------------------------------------------------------
+-- EXPECTED OUTPUT BEGIN (verbatim; every line below is prefixed with '-- ')
+-- == A ==
+-- def id (x#1) modes=(owned) direct
+--   ret x#1
+--
+-- def len (xs#1) modes=(borrowed) direct
+--   case xs#1
+--   | Nil ->
+--     ret 0
+--   | (Cons _ t#2) ->
+--     let %4 = (call len t#2)
+--     let %3 = (+ 1 %4)
+--     drop %4
+--     ret %3
+--
+-- def map (f#1 xs#2) modes=(borrowed owned) direct
+--   case xs#2
+--   | Nil ->
+--     drop xs#2
+--     ret Nil
+--   | (Cons h#3 t#4) ->
+--     dup h#3
+--     dup t#4
+--     drop-reuse xs#2 -> %r1
+--     let %6 = (app f#1 h#3)
+--     let %7 = (call map f#1 t#4)
+--     let %5 = (ctor Cons %6 %7 reuse=%r1)
+--     ret %5
+--
+-- def pair (x#1 y#2) modes=(owned owned) direct
+--   let %3 = (tup x#1 y#2)
+--   ret %3
+--
+-- sigs:
+--   id: owned
+--   len: borrowed
+--   map: borrowed owned
+--   pair: owned owned
+--
+-- == B ==
+-- def mk (n#1) modes=(owned) direct
+--   dup n#1
+--   let g#2 = (lam x#3 caps(n#1)
+--     let %4 = (+ x#3 n#1)
+--     drop x#3
+--     ret %4)
+--   let %5 = (tup g#2 n#1)
+--   ret %5
+--
+-- def sum (n#1) modes=(owned) direct
+--   letrec go#2 = (lam i#3 caps(n#1 go#2)
+--     let %4 = (== i#3 0)
+--     if %4
+--       drop %4
+--       drop i#3
+--       dup n#1
+--       ret n#1
+--     else
+--       drop %4
+--       let %6 = (- i#3 1)
+--       drop i#3
+--       let %5 = (app go#2 %6)
+--       ret %5)
+--   let %7 = (app go#2 3)
+--   drop go#2
+--   ret %7
+--
+-- sigs:
+--   mk: owned
+--   sum: owned
+--
+-- == C ==
+-- def both (a#1 b#2) modes=(borrowed borrowed) direct
+--   if a#1
+--     let %3 = (> b#2 1)
+--     ret %3
+--   else
+--     ret false
+--
+-- def main (_p#1) modes=(borrowed) direct
+--   case _p#1
+--   | () ->
+--     let _#2 = (bi print_int 1)
+--     drop _#2
+--     let %3 = (bi print_int 2)
+--     ret %3
+--
+-- def add (a#1 b#2) modes=(borrowed borrowed) direct
+--   let %3 = (+ a#1 b#2)
+--   ret %3
+--
+-- def id (x#1) modes=(owned) direct
+--   ret x#1
+--
+-- def use (_p#1) modes=(borrowed) direct
+--   case _p#1
+--   | () ->
+--     let %3 = (call add 1 2)
+--     let %4 = (app @add 1)
+--     let %2 = (tup %3 %4)
+--     ret %2
+--
+-- def over (_p#1) modes=(borrowed) direct
+--   case _p#1
+--   | () ->
+--     let %3 = (call id @add)
+--     let %4 = (app %3 1)
+--     drop %3
+--     let %2 = (app %4 2)
+--     drop %4
+--     ret %2
+--
+-- sigs:
+--   both: borrowed borrowed
+--   main: borrowed
+--   add: borrowed borrowed
+--   id: owned
+--   use: borrowed
+--   over: borrowed
+--
+-- == D ==
+-- def fst2 (_p#1) modes=(borrowed) direct
+--   case _p#1
+--   | (a#2, b#3) ->
+--     dup a#2
+--     ret a#2
+--
+-- def swap (p#1) modes=(owned) direct
+--   case p#1
+--   | (a#2, b#3) ->
+--     dup a#2
+--     dup b#3
+--     drop-reuse p#1 -> %r1
+--     let %4 = (tup b#3 a#2 reuse=%r1)
+--     ret %4
+--
+-- def keep (xs#1) modes=(owned) direct
+--   case xs#1
+--   | Nil ->
+--     ret xs#1
+--   | (Cons h#2 t#3) ->
+--     dup h#2
+--     dup t#3
+--     let %4 = (== h#2 0)
+--     drop h#2
+--     if %4
+--       drop %4
+--       drop t#3
+--       ret xs#1
+--     else
+--       drop %4
+--       drop xs#1
+--       ret t#3
+--
+-- sigs:
+--   fst2: borrowed
+--   swap: owned
+--   keep: owned
+--
+-- EXPECTED OUTPUT END

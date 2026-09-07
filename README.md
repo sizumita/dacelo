@@ -130,6 +130,19 @@ zsh・cc・rt.cのみ）。検証は `./gen5/test.sh`
 (A:38一致 B:同一.s＋実行＋否定例 C:不動点 D:format E:RFC受入)。例は
 [gen5-examples/README.md](./gen5-examples/README.md)。
 
+**Gen5-RC（メモリ管理・所有権の刷新、branch `gen5-gc`）**: 調査で判明した事実として、旧ランタイム
+`rt.c` の mark-sweep は `live_bytes` が sweep でしか更新されないため**一度も起動せず**、全プログラムが
+総確保量ぶんのメモリを保持していた（自己検査 7000 行が 34GB 機で OOM kill される直接の原因）。
+Gen5 はこれを **Perceus 系の精密参照カウント**（dup/drop 自動挿入、注釈なしの**借用パラメータ推論**、
+drop-guided reuse による関数型のままの in-place 更新、既知関数への飽和直接呼出）に置き換えた
+（設計: [gen5/GC_DESIGN.md](./gen5/GC_DESIGN.md)、IR: `gen5/g5_oir.dc`、所有権パス: `gen5/g5_own.dc`、
+コード生成: `gen5/g5_cg.dc`＋`gen5/g5_cgdriver.dc`、ランタイム: `gen5/rt5.c`）。
+`gen5check types --format=json` は各関数の推論済み所有権（`"ownership":["borrowed","owned"]`）を返す。
+実行時: `DACELO_RC_CHECK=1` で終了時に全ブロック解放を検証（リークで exit 3）、`DACELO_RC_STATS=1` で
+alloc/free/reuse 数を stderr に出力。検証は `./gen5/test.sh`（B: 全例が Gen0 と出力一致＋リークゼロ＋
+reuse 実測、C: `dcc_7`（RC 上で動くコンパイラ）→`dcc_8` の `.s` 不動点＋RC 版チェッカの 38 一致＋
+自己検査の RSS 比較、G: 所有権パスの単体出力）。結果: <TBD-RESULTS>
+
 **Gen 3 完了**: `gen3-dcc-dc/` — dacelo 自身で書かれたコンパイラが
 自分自身をコンパイルして完全動作する `dcc_2` を生成し、`dcc_2` の
 自己コンパイル出力とバイト一致する不動点に到達。完成後のゴール:

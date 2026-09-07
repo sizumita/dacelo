@@ -1,0 +1,19 @@
+-- Functional but in-place (Gen5-RC): `bump` rebuilds a list it owns, so every
+-- cons cell it takes apart is reused for the cell it builds (drop-guided
+-- reuse). No annotation is needed: the compiler infers that `bump` owns
+-- `xs` (it pattern-matches it and allocates a same-sized cell) while `sum`
+-- only borrows its list.
+-- Run: ./dcc_6 gen5-examples/inplace_map.dc /tmp/im && DACELO_RC_STATS=1 /tmp/im
+-- Expect: 5050 on stdout and `reuses=100` (one per cell) in the stats line.
+
+let rec range n acc = if n == 0 then acc else range (n - 1) (n :: acc)
+
+let rec bump xs = case xs of
+  | [] -> []
+  | h :: t -> (h + 0) :: bump t
+
+let rec sum xs acc = case xs of
+  | [] -> acc
+  | h :: t -> sum t (acc + h)
+
+let main () = print_int (sum (bump (range 100 [])) 0)

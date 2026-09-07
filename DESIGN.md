@@ -7,7 +7,7 @@ Dacelo(ワライカワセミ属)— 笑うように高速にセルフホスト�
 - **ML/Haskell 系構文**: `let` / `case-of` / カリー化 / ADT + パターンマッチ
 - **最初から静的型**: Hindley-Milner 型推論(Algorithm J)。注釈ほぼ不要
 - **最終形態: 直接機械語生成**: dacelo 製コンパイラが ARM64 機械語を直接吐く
-- **メモリ管理: mark-sweep GC**
+- **メモリ管理: mark-sweep GC**（Gen 2〜4）→ Gen5-RC で精密参照カウント＋借用推論＋reuse に刷新（[gen5/GC_DESIGN.md](./gen5/GC_DESIGN.md)）
 - **目標: セルフホスト**。コンパイラが自分自身をコンパイルできるまで世代を重ねる
 
 ## 2. 言語仕様 v0(Gen 0 スコープ)

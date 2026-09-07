@@ -1,0 +1,289 @@
+-- ============================================================
+-- gen5/probe_cg.dc -- hand-built OProg values -> .s (codegen probes)
+--
+-- Run with Gen0 on the concat
+--   dcc.dc g5_oir.dc g5_cg.dc g5_cgdriver.dc probe_cg.dc  [outdir]
+-- (argv 1 = output directory, default "."). Each <name>.s is then built
+-- with `cc -O2 -arch arm64 <name>.s gen5/rt5.c -o <name>` and run with
+-- DACELO_RC_CHECK=1 (must not report LEAK) and DACELO_RC_STATS=1.
+-- Expected outputs are noted next to each program.
+-- NOTE: the allocation prims are spelled PMkCtor / PMkTup (as in g5_own.dc);
+-- the PCtor / PTup names of GC_DESIGN.md would shadow the Pat constructors
+-- of dcc.dc, so gen5/g5_oir.dc has to carry the renamed constructors.
+-- The IR below is written the way g5_own.dc is expected to produce it:
+-- every owned variable is consumed exactly once (dup before a second
+-- use, drop when unused), pattern variables of an owned scrutinee are
+-- dup'd before the scrutinee is dropped / drop-reused.
+-- ============================================================
+
+let g5cg_probe_write dir name oprog =
+  let lines = g5cg_emit_code oprog in
+  let path = dir ++ "/" ++ name ++ ".s" in
+  write_file path (g5cg_join_lines lines) ;
+  print_string ("wrote " ++ path ++ "\n")
+
+-- print_int v ; print_string "\n" ; k   (unit results are immortal statics)
+let g5cg_pb_int v k =
+  OLet "_u" (PBi "print_int" [AVar v]) (OLet "_u2" (PBi "print_string" [AStr "\n"]) k)
+
+-- print_string (bool_to_string v) ; newline ; k
+let g5cg_pb_bool v k =
+  OLet "_b" (PBi "bool_to_string" [AVar v])
+    (OLet "_u" (PBi "print_string" [AVar "_b"])
+      (ODrop "_b" (OLet "_u2" (PBi "print_string" [AStr "\n"]) k)))
+
+-- print_string v ; drop v ; newline ; k
+let g5cg_pb_str v k =
+  OLet "_u" (PBi "print_string" [AVar v])
+    (ODrop v (OLet "_u2" (PBi "print_string" [AStr "\n"]) k))
+
+-- ---------- hello: "Hello\n" ----------
+let g5cg_probe_hello () =
+  let body = OLet "r" (PBi "print_string" [AStr "Hello\n"]) (ORet (AVar "r")) in
+  OProg [] [ODef "main" [PUnit] body [false] true] [("main", [false])]
+
+-- ---------- fib: direct recursive call, borrowed Int parameter ----------
+-- expected: "fib 20 = 6765\n"
+let g5cg_probe_fib () =
+  let fib_body =
+    OLet "c" (PBin "<" (AVar "n") (AInt 2))
+      (OIf (AVar "c")
+        (ODup "n" (ORet (AVar "n")))
+        (OLet "a" (PBin "-" (AVar "n") (AInt 1))
+          (OLet "r1" (PCall "fib" [AVar "a"])
+            (OLet "b" (PBin "-" (AVar "n") (AInt 2))
+              (OLet "r2" (PCall "fib" [AVar "b"])
+                (OLet "s" (PBin "+" (AVar "r1") (AVar "r2"))
+                  (ORet (AVar "s")))))))) in
+  let main_body =
+    OLet "r" (PCall "fib" [AInt 20])
+      (OLet "s" (PBi "int_to_string" [AVar "r"])
+        (ODrop "r"
+          (OLet "s2" (PBin "++" (AStr "fib 20 = ") (AVar "s"))
+            (ODrop "s"
+              (OLet "s3" (PBin "++" (AVar "s2") (AStr "\n"))
+                (ODrop "s2"
+                  (OLet "u" (PBi "print_string" [AVar "s3"])
+                    (ODrop "s3" (ORet (AVar "u")))))))))) in
+  OProg []
+    [ODef "fib" [PVar "n"] fib_body [false] true,
+     ODef "main" [PUnit] main_body [false] true]
+    [("fib", [false]), ("main", [false])]
+
+-- ---------- list: build 1::2::3::[], map (+1) with reuse, show, sum ----------
+-- expected: "[2,3,4]\n9\n", rc stats: reuses = 3
+let g5cg_probe_list () =
+  -- map_inc xs (owned): the matched cell is drop-reused for the new cell
+  let map_body =
+    OCase (AVar "xs")
+      [(PCtor "Nil" [], ODrop "xs" (ORet (ANull "Nil"))),
+       (PCtor "Cons" [PVar "h", PVar "t"],
+          ODup "h" (ODup "t" (ODropReuse "xs" "tok"
+            (OLet "h2" (PBin "+" (AVar "h") (AInt 1))
+              (ODrop "h"
+                (OLet "t2" (PCall "map_inc" [AVar "t"])
+                  (OLet "r" (PMkCtor "Cons" [AVar "h2", AVar "t2"] "tok")
+                    (ORet (AVar "r")))))))))] in
+  -- sum xs (borrowed): plain traversal, no rc operations
+  let sum_body =
+    OCase (AVar "xs")
+      [(PCtor "Nil" [], ORet (AInt 0)),
+       (PCtor "Cons" [PVar "h", PVar "t"],
+          OLet "r" (PCall "sum" [AVar "t"])
+            (OLet "s" (PBin "+" (AVar "h") (AVar "r")) (ORet (AVar "s"))))] in
+  let main_body =
+    OLet "l0" (PMkCtor "Cons" [AInt 3, ANull "Nil"] "")
+    (OLet "l1" (PMkCtor "Cons" [AInt 2, AVar "l0"] "")
+    (OLet "l2" (PMkCtor "Cons" [AInt 1, AVar "l1"] "")
+    (OLet "m" (PCall "map_inc" [AVar "l2"])
+    (OLet "s" (PBi "show" [AVar "m"])
+    (g5cg_pb_str "s"
+    (OLet "t" (PCall "sum" [AVar "m"])
+    (ODrop "m"
+    (g5cg_pb_int "t" (ORet AUnit))))))))) in
+  OProg []
+    [ODef "map_inc" [PVar "xs"] map_body [true] true,
+     ODef "sum" [PVar "xs"] sum_body [false] true,
+     ODef "main" [PUnit] main_body [false] true]
+    [("map_inc", [true]), ("sum", [false]), ("main", [false])]
+
+-- ---------- closures: partial application, capture, non-direct levels ----------
+-- expected: 15 7 3 42 kept (2,1) [x] [y,x] 7 45  (one per line; strings unquoted as show prints them)
+let g5cg_probe_closures () =
+  -- add x y = x + y            direct, both borrowed
+  let add_body = OLet "s" (PBin "+" (AVar "x") (AVar "y")) (ORet (AVar "s")) in
+  -- make_adder n = fun x -> x + n      n owned (captured)
+  let adder_body =
+    OLet "f" (PLam (PVar "x") (OLet "s" (PBin "+" (AVar "x") (AVar "n")) (ORet (AVar "s"))) ["n"])
+      (ORet (AVar "f")) in
+  -- first2 a b = a             non-direct (closure path only): a owned, b borrowed
+  let first2_body = ORet (AVar "a") in
+  -- swap p = case p of (a, b) -> (b, a)     p owned, tuple reused
+  let swap_body =
+    OCase (AVar "p")
+      [(PTup [PVar "a", PVar "b"],
+         ODup "a" (ODup "b" (ODropReuse "p" "tok"
+           (OLet "r" (PMkTup [AVar "b", AVar "a"] "tok") (ORet (AVar "r"))))))] in
+  -- tval t = case t of Node _ v _ -> v | Leaf -> 0      t borrowed
+  let tval_body =
+    OCase (AVar "t")
+      [(PCtor "Node" [PWild, PVar "v", PWild], ORet (AVar "v")),
+       (PCtor "Leaf" [], ORet (AInt 0))] in
+  -- sum9 a1..a9 = a1 + ... + a9        nine parameters: closure path, all owned
+  let sum9_body =
+    OLet "s1" (PBin "+" (AVar "a1") (AVar "a2"))
+    (OLet "s2" (PBin "+" (AVar "s1") (AVar "a3"))
+    (OLet "s3" (PBin "+" (AVar "s2") (AVar "a4"))
+    (OLet "s4" (PBin "+" (AVar "s3") (AVar "a5"))
+    (OLet "s5" (PBin "+" (AVar "s4") (AVar "a6"))
+    (OLet "s6" (PBin "+" (AVar "s5") (AVar "a7"))
+    (OLet "s7" (PBin "+" (AVar "s6") (AVar "a8"))
+    (OLet "s8" (PBin "+" (AVar "s7") (AVar "a9"))
+    (ORet (AVar "s8"))))))))) in
+  -- names = ["x"]              global value definition
+  let names_body = OLet "l" (PMkCtor "Cons" [AStr "x", ANull "Nil"] "") (ORet (AVar "l")) in
+  let main_body =
+    -- add5 = add 5 ; add5 10                        -> 15
+    OLet "add5" (PApp (AGlob "add") (AInt 5))
+    (OLet "r1" (PApp (AVar "add5") (AInt 10))
+    (ODrop "add5" (g5cg_pb_int "r1"
+    -- (make_adder 3) 4                              -> 7
+    (OLet "a3" (PCall "make_adder" [AInt 3])
+    (OLet "r2" (PApp (AVar "a3") (AInt 4))
+    (ODrop "a3" (g5cg_pb_int "r2"
+    -- add via the closure path                      -> 3
+    (OLet "f1" (PApp (AGlob "add") (AInt 1))
+    (OLet "r3" (PApp (AVar "f1") (AInt 2))
+    (ODrop "f1" (g5cg_pb_int "r3"
+    -- direct call                                   -> 42
+    (OLet "r4" (PCall "add" [AInt 20, AInt 22])
+    (g5cg_pb_int "r4"
+    -- first2 "kept" "dropped" (non-direct)          -> kept
+    (OLet "g1" (PApp (AGlob "first2") (AStr "kept"))
+    (OLet "r5" (PApp (AVar "g1") (AStr "dropped"))
+    (ODrop "g1" (g5cg_pb_str "r5"
+    -- swap (1, 2)                                   -> (2,1)
+    (OLet "p" (PMkTup [AInt 1, AInt 2] "")
+    (OLet "q" (PCall "swap" [AVar "p"])
+    (OLet "s" (PBi "show" [AVar "q"])
+    (ODrop "q" (g5cg_pb_str "s"
+    -- show names                                    -> [x]
+    (OLet "s2" (PBi "show" [AGlob "names"])
+    (g5cg_pb_str "s2"
+    -- "y" :: names (global in a consumed position)  -> [y,x]
+    (OLet "nm2" (PAtom (AGlob "names"))
+    (OLet "l2" (PMkCtor "Cons" [AStr "y", AVar "nm2"] "")
+    (OLet "s3" (PBi "show" [AVar "l2"])
+    (ODrop "l2" (g5cg_pb_str "s3"
+    -- tree: Node Leaf 7 (Node Leaf 5 Leaf) via partial ctor closures  -> 7
+    (OLet "t1" (PMkCtor "Node" [ANull "Leaf", AInt 5, ANull "Leaf"] "")
+    (OLet "pc" (PApp (AGlob "Node") (ANull "Leaf"))
+    (OLet "pc2" (PApp (AVar "pc") (AInt 7))
+    (ODrop "pc"
+    (OLet "t2" (PApp (AVar "pc2") (AVar "t1"))
+    (ODrop "pc2"
+    (OLet "v" (PCall "tval" [AVar "t2"])
+    (ODrop "t2" (g5cg_pb_int "v"
+    -- sum9 1 .. 9                                   -> 45
+    (OLet "k1" (PApp (AGlob "sum9") (AInt 1))
+    (OLet "k2" (PApp (AVar "k1") (AInt 2)) (ODrop "k1"
+    (OLet "k3" (PApp (AVar "k2") (AInt 3)) (ODrop "k2"
+    (OLet "k4" (PApp (AVar "k3") (AInt 4)) (ODrop "k3"
+    (OLet "k5" (PApp (AVar "k4") (AInt 5)) (ODrop "k4"
+    (OLet "k6" (PApp (AVar "k5") (AInt 6)) (ODrop "k5"
+    (OLet "k7" (PApp (AVar "k6") (AInt 7)) (ODrop "k6"
+    (OLet "k8" (PApp (AVar "k7") (AInt 8)) (ODrop "k7"
+    (OLet "r9" (PApp (AVar "k8") (AInt 9)) (ODrop "k8"
+    (g5cg_pb_int "r9"
+    (ORet AUnit))))))))))))))))))))))))))))))))))))))))))))))))))))))))) in
+  OProg [("Leaf", 0), ("Node", 3)]
+    [ODef "add" [PVar "x", PVar "y"] add_body [false, false] true,
+     ODef "make_adder" [PVar "n"] adder_body [true] true,
+     ODef "first2" [PVar "a", PVar "b"] first2_body [true, false] false,
+     ODef "swap" [PVar "p"] swap_body [true] true,
+     ODef "tval" [PVar "t"] tval_body [false] true,
+     ODef "sum9" [PVar "a1", PVar "a2", PVar "a3", PVar "a4", PVar "a5", PVar "a6", PVar "a7", PVar "a8", PVar "a9"]
+       sum9_body [true, true, true, true, true, true, true, true, true] false,
+     ODef "names" [] names_body [] false,
+     ODef "main" [PUnit] main_body [false] true]
+    [("add", [false, false]), ("make_adder", [true]), ("swap", [true]), ("tval", [false]), ("main", [false])]
+
+-- ---------- letrec: local recursive closure (self capture, backpatch) ----------
+-- expected: "55\n"
+let g5cg_probe_letrec () =
+  -- let rec go n acc = if n == 0 then acc else go (n - 1) (acc + n)
+  let inner_body =
+    OLet "c" (PBin "==" (AVar "n") (AInt 0))
+      (OIf (AVar "c")
+        (ORet (AVar "acc"))
+        (OLet "n1" (PBin "-" (AVar "n") (AInt 1))
+          (OLet "a1" (PBin "+" (AVar "acc") (AVar "n"))
+            (ODrop "acc"
+              (OLet "f1" (PApp (AVar "go") (AVar "n1"))
+                (OLet "r" (PApp (AVar "f1") (AVar "a1"))
+                  (ODrop "f1" (ORet (AVar "r"))))))))) in
+  -- level 1 (param n, owned) returns the level-2 closure capturing n and go
+  let outer_body =
+    ODup "go" (OLet "inner" (PLam (PVar "acc") inner_body ["n", "go"]) (ORet (AVar "inner"))) in
+  let main_body =
+    OLetRec "go" (PLam (PVar "n") outer_body ["go"])
+      (OLet "f" (PApp (AVar "go") (AInt 10))
+        (OLet "r" (PApp (AVar "f") (AInt 0))
+          (ODrop "f" (ODrop "go" (g5cg_pb_int "r" (ORet AUnit)))))) in
+  OProg [] [ODef "main" [PUnit] main_body [false] true] [("main", [false])]
+
+-- ---------- strings: literal patterns, equality, concat, nested patterns ----------
+-- expected lines: 2 0 true true false 5 11 foobar 2 3 42 false false true 1 9
+let g5cg_probe_strings () =
+  -- classify s = case s of "a" -> 1 | "b" -> 2 | _ -> 0      s borrowed
+  let classify_body =
+    OCase (AVar "s")
+      [(PStr "a", ORet (AInt 1)),
+       (PStr "b", ORet (AInt 2)),
+       (PWild, ORet (AInt 0))] in
+  let main_body =
+    OLet "r1" (PCall "classify" [AStr "b"]) (g5cg_pb_int "r1"            -- 2
+    (OLet "r2" (PCall "classify" [AStr "zz"]) (g5cg_pb_int "r2"          -- 0
+    (OLet "e1" (PBin "==" (AStr "abc") (AStr "abc")) (g5cg_pb_bool "e1"  -- true
+    (OLet "e2" (PBin "!=" (AStr "abc") (AStr "abd")) (g5cg_pb_bool "e2"  -- true
+    (OLet "e3" (PBin "!=" (AInt 3) (AInt 3)) (g5cg_pb_bool "e3"          -- false
+    (OLet "n" (PBi "string_length" [AStr "hello"]) (g5cg_pb_int "n"      -- 5
+    (OLet "c" (PBin "<" (AInt 1) (AInt 2))
+    (OLet "v" (PBlock (OIf (AVar "c") (ORet (AInt 1)) (ORet (AInt 2))))
+    (OLet "w" (PBin "+" (AVar "v") (AInt 10)) (g5cg_pb_int "w"           -- 11
+    (OLet "cat" (PBin "++" (AStr "foo") (AStr "bar")) (g5cg_pb_str "cat" -- foobar
+    (OLet "m" (PBin "%" (AInt 17) (AInt 5)) (g5cg_pb_int "m"             -- 2
+    (OLet "d" (PBin "/" (AInt 17) (AInt 5)) (g5cg_pb_int "d"             -- 3
+    (OLet "mul" (PBin "*" (AInt 6) (AInt 7)) (g5cg_pb_int "mul"          -- 42
+    (OLet "ge" (PBin ">=" (AInt 6) (AInt 7)) (g5cg_pb_bool "ge"          -- false
+    (OLet "an" (PBin "&&" (ABool true) (ABool false)) (g5cg_pb_bool "an" -- false
+    (OLet "orr" (PBin "||" (ABool false) (ABool true)) (g5cg_pb_bool "orr" -- true
+    -- nested pattern on an owned tuple: (4, "q") matches (PInt, PStr)   -> 1
+    (OLet "pp" (PMkTup [AInt 4, AStr "q"] "")
+    (OLet "hit" (PBlock (OCase (AVar "pp")
+        [(PTup [PInt 4, PStr "q"], ODrop "pp" (ORet (AInt 1))),
+         (PWild, ODrop "pp" (ORet (AInt 0)))]))
+    (g5cg_pb_int "hit"
+    -- case on an immediate with Int / Bool patterns                     -> 9
+    (OLet "k" (PBlock (OCase (AInt 3)
+        [(PInt 1, ORet (AInt 7)),
+         (PInt 3, ORet (AInt 9)),
+         (PWild, ORet (AInt 0))]))
+    (g5cg_pb_int "k"
+    (ORet AUnit))))))))))))))))))))))))))))))))))) in
+  OProg []
+    [ODef "classify" [PVar "s"] classify_body [false] true,
+     ODef "main" [PUnit] main_body [false] true]
+    [("classify", [false]), ("main", [false])]
+
+let main () =
+  print_string "" ;
+  let dir0 = argv 1 in
+  let dir = if dir0 == "" then "." else dir0 in
+  g5cg_probe_write dir "hello" (g5cg_probe_hello ()) ;
+  g5cg_probe_write dir "fib" (g5cg_probe_fib ()) ;
+  g5cg_probe_write dir "list" (g5cg_probe_list ()) ;
+  g5cg_probe_write dir "closures" (g5cg_probe_closures ()) ;
+  g5cg_probe_write dir "letrec" (g5cg_probe_letrec ()) ;
+  g5cg_probe_write dir "strings" (g5cg_probe_strings ()) ;
+  print_string "probe_cg: done\n"
